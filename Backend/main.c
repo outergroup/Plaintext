@@ -24,6 +24,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -45,6 +46,8 @@ static const char *kBundleFilePathMacosX86 = "bundles/PlaintextContent.bundle.ma
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_backend_label[256] = "dev.outergroup.Plaintext";
+static char g_outerctl_path[PATH_MAX] = "";
+static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static int g_listen_port = -1;
 static bool g_systemd_socket_activation = false;
@@ -68,6 +71,14 @@ typedef struct {
 } Client;
 
 static int ensure_directory_exists(const char *path);
+
+static const char *kTextFileExtensions[] = {
+    "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "conf", "cfg",
+    "log", "c", "h", "cpp", "cxx", "cc", "hpp", "m", "mm", "swift", "rs", "go", "java", "kt", "kts", "js", "jsx",
+    "ts", "tsx", "mjs", "cjs", "css", "scss", "sass", "html", "htm", "py", "rb", "php", "sh", "bash", "zsh", "fish",
+    "pl", "pm", "lua", "sql", "r", "jl", "ex", "exs", "erl", "hrl", "clj", "cljs", "fs", "fsx", "cs", "vb", "ps1",
+    "bat", "cmd", "dockerfile", "makefile", "mk", "gradle", "gitignore", "gitattributes", "editorconfig"
+};
 
 static void handle_shutdown_signal(int signal_number) {
     (void)signal_number;
@@ -963,6 +974,86 @@ static void default_socket_path(char *out, size_t out_size) {
     snprintf(out, out_size, "/tmp/%s", g_backend_label);
 }
 
+static void run_outerctl_wait(const char *const *arguments) {
+    if (!g_outerctl_path[0]) return;
+    pid_t child = fork();
+    if (child == 0) {
+        execv(g_outerctl_path, (char *const *)arguments);
+        _exit(127);
+    }
+    if (child > 0) {
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    }
+}
+
+static void announce_plaintext_capabilities(void) {
+    if (!g_outerctl_path[0] || !g_backend_label[0]) return;
+
+    const char *backend_args[10];
+    size_t count = 0;
+    backend_args[count++] = g_outerctl_path;
+    backend_args[count++] = "backend";
+    backend_args[count++] = "upsert";
+    backend_args[count++] = "--backend";
+    backend_args[count++] = g_backend_label;
+    backend_args[count++] = "--name";
+    backend_args[count++] = "Plaintext";
+    if (g_app_icon_path[0]) {
+        backend_args[count++] = "--icon-path";
+        backend_args[count++] = g_app_icon_path;
+    }
+    backend_args[count] = NULL;
+    run_outerctl_wait(backend_args);
+
+    if (!g_listen_socket_path[0]) return;
+
+    const char *app_clear_args[] = {g_outerctl_path, "app", "clear", "--backend", g_backend_label, NULL};
+    run_outerctl_wait(app_clear_args);
+
+    const char *app_args[16];
+    count = 0;
+    app_args[count++] = g_outerctl_path;
+    app_args[count++] = "app";
+    app_args[count++] = "add";
+    app_args[count++] = "--backend";
+    app_args[count++] = g_backend_label;
+    app_args[count++] = "--socket-path";
+    app_args[count++] = g_listen_socket_path;
+    app_args[count++] = "--name";
+    app_args[count++] = "Plaintext";
+    app_args[count++] = "--url";
+    app_args[count++] = "/";
+    if (g_app_icon_path[0]) {
+        app_args[count++] = "--icon-path";
+        app_args[count++] = g_app_icon_path;
+    }
+    app_args[count] = NULL;
+    run_outerctl_wait(app_args);
+
+    const char *opener_clear_args[] = {g_outerctl_path, "opener", "clear", "--backend", g_backend_label, NULL};
+    run_outerctl_wait(opener_clear_args);
+    for (size_t i = 0; i < sizeof(kTextFileExtensions) / sizeof(kTextFileExtensions[0]); i++) {
+        const char *opener_args[] = {
+            g_outerctl_path,
+            "opener",
+            "add",
+            "--backend",
+            g_backend_label,
+            "--extension",
+            kTextFileExtensions[i],
+            "--socket-path",
+            g_listen_socket_path,
+            "--name",
+            "Plaintext",
+            "--url-template",
+            "?file={file}",
+            NULL
+        };
+        run_outerctl_wait(opener_args);
+    }
+}
+
 static int create_unix_listener(const char *requested_socket_path) {
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) fatal("socket");
@@ -1048,7 +1139,7 @@ static bool parse_port(const char *value, int *out) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--label LABEL] [--bundles-dir DIR]\n",
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n",
             program && program[0] ? program : "PlaintextBackend");
 }
 
@@ -1063,6 +1154,10 @@ int main(int argc, char **argv) {
 
     int requested_port = -1;
     char requested_socket_path[PATH_MAX] = "";
+    const char *outerctl_path = getenv("OUTERCTL_PATH");
+    if (outerctl_path && outerctl_path[0]) {
+        snprintf(g_outerctl_path, sizeof(g_outerctl_path), "%s", outerctl_path);
+    }
 #ifdef __APPLE__
     char launchd_socket_name[128] = "";
 #endif
@@ -1070,6 +1165,10 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
             snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--icon-file") == 0 && i + 1 < argc) {
+            snprintf(g_app_icon_path, sizeof(g_app_icon_path), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--outerctl-path") == 0 && i + 1 < argc) {
+            snprintf(g_outerctl_path, sizeof(g_outerctl_path), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
                      "%s/PlaintextContent.bundle.macos-arm.aar", argv[i + 1]);
@@ -1123,6 +1222,7 @@ int main(int argc, char **argv) {
     }
     fflush(stdout);
 
+    announce_plaintext_capabilities();
     run_reactor(listen_fd);
 
     close(listen_fd);
