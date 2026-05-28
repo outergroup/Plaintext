@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -32,10 +33,12 @@ extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 
 #define READ_CHUNK_SIZE 65536
 #define MAX_HEADER_SIZE 65536
+#define MAX_CLIENTS 256
+#define CLIENT_TIMEOUT_SECONDS 5
 
-static const char *kBundleUrlPath = "/bundles/PlaintextContent-v5";
-static const char *kBundleUrlPathMacosArm = "/bundles/PlaintextContent-v5/macos-arm";
-static const char *kBundleUrlPathMacosX86 = "/bundles/PlaintextContent-v5/macos-x86";
+static const char *kBundleUrlPath = "/bundles/PlaintextContent-v6";
+static const char *kBundleUrlPathMacosArm = "/bundles/PlaintextContent-v6/macos-arm";
+static const char *kBundleUrlPathMacosX86 = "/bundles/PlaintextContent-v6/macos-x86";
 static const char *kBundleFilePathMacosArm = "bundles/PlaintextContent.bundle.macos-arm.aar";
 static const char *kBundleFilePathMacosX86 = "bundles/PlaintextContent.bundle.macos-x86.aar";
 
@@ -54,6 +57,15 @@ typedef struct {
     size_t length;
     size_t capacity;
 } Buffer;
+
+typedef struct {
+    int fd;
+    Buffer request;
+    bool header_complete;
+    size_t header_length;
+    size_t content_length;
+    time_t last_activity;
+} Client;
 
 static int ensure_directory_exists(const char *path);
 
@@ -559,53 +571,14 @@ static size_t content_length_from_headers(const char *headers) {
     return 0;
 }
 
-static void handle_client(int fd) {
-    Buffer request = {0};
-    char chunk[READ_CHUNK_SIZE];
-    char *header_end = NULL;
-    size_t header_length = 0;
-    size_t content_length = 0;
-
-    while (!header_end) {
-        ssize_t n = read(fd, chunk, sizeof(chunk));
-        if (n < 0 && errno == EINTR && !g_shutdown_requested) continue;
-        if (n <= 0) {
-            buffer_free(&request);
-            return;
-        }
-        if (!buffer_append(&request, chunk, (size_t)n)) {
-            send_text_response(fd, 500, "out of memory\n");
-            buffer_free(&request);
-            return;
-        }
-        if (request.length > MAX_HEADER_SIZE && !find_header_end(request.data, request.length)) {
-            send_text_response(fd, 413, "headers too large\n");
-            buffer_free(&request);
-            return;
-        }
-        header_end = find_header_end(request.data, request.length);
-    }
-
-    header_length = (size_t)(header_end - request.data) + 4;
-    content_length = content_length_from_headers(request.data);
-    while (request.length < header_length + content_length) {
-        ssize_t n = read(fd, chunk, sizeof(chunk));
-        if (n < 0 && errno == EINTR && !g_shutdown_requested) continue;
-        if (n <= 0) break;
-        if (!buffer_append(&request, chunk, (size_t)n)) {
-            send_text_response(fd, 500, "out of memory\n");
-            buffer_free(&request);
-            return;
-        }
-    }
-
+static void process_client_request(int fd, Buffer *request, size_t header_length, size_t content_length) {
+    char *header_end = request->data + header_length - 4;
     *header_end = '\0';
     char method[16] = "";
     char target[2048] = "";
     char version[16] = "";
-    if (sscanf(request.data, "%15s %2047s %15s", method, target, version) != 3) {
+    if (sscanf(request->data, "%15s %2047s %15s", method, target, version) != 3) {
         send_text_response(fd, 400, "bad request\n");
-        buffer_free(&request);
         return;
     }
 
@@ -634,15 +607,198 @@ static void handle_client(int fd) {
     } else if (strcasecmp(method, "GET") == 0 && strcmp(target, "/api/file") == 0) {
         send_file_get_response(fd, query);
     } else if (strcasecmp(method, "POST") == 0 && strcmp(target, "/api/file") == 0) {
-        const char *body = request.data + header_length;
-        size_t body_length = request.length >= header_length ? request.length - header_length : 0;
+        const char *body = request->data + header_length;
+        size_t body_length = request->length >= header_length ? request->length - header_length : 0;
         if (body_length > content_length) body_length = content_length;
         send_file_save_response(fd, query, body, body_length);
     } else {
         send_text_response(fd, 404, "not found\n");
     }
+}
 
-    buffer_free(&request);
+static int set_fd_nonblocking(int fd, bool nonblocking) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    if (nonblocking) {
+        flags |= O_NONBLOCK;
+    } else {
+        flags &= ~O_NONBLOCK;
+    }
+    return fcntl(fd, F_SETFL, flags);
+}
+
+static void client_init(Client *client) {
+    memset(client, 0, sizeof(*client));
+    client->fd = -1;
+}
+
+static void client_close(Client *client) {
+    if (client->fd >= 0) {
+        close(client->fd);
+    }
+    buffer_free(&client->request);
+    client_init(client);
+}
+
+static bool client_parse_header(Client *client) {
+    if (client->header_complete) return true;
+    char *header_end = find_header_end(client->request.data, client->request.length);
+    if (!header_end) {
+        if (client->request.length > MAX_HEADER_SIZE) {
+            send_text_response(client->fd, 413, "headers too large\n");
+            return false;
+        }
+        return true;
+    }
+
+    client->header_length = (size_t)(header_end - client->request.data) + 4;
+    char saved = *header_end;
+    *header_end = '\0';
+    client->content_length = content_length_from_headers(client->request.data);
+    *header_end = saved;
+    client->header_complete = true;
+    return true;
+}
+
+static bool client_request_complete(const Client *client) {
+    return client->header_complete &&
+           client->request.length >= client->header_length + client->content_length;
+}
+
+static void handle_client_read(Client *client) {
+    char chunk[READ_CHUNK_SIZE];
+    while (true) {
+        ssize_t n = read(client->fd, chunk, sizeof(chunk));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            client_close(client);
+            return;
+        }
+        if (n == 0) {
+            client_close(client);
+            return;
+        }
+
+        client->last_activity = time(NULL);
+        if (!buffer_append(&client->request, chunk, (size_t)n)) {
+            set_fd_nonblocking(client->fd, false);
+            send_text_response(client->fd, 500, "out of memory\n");
+            client_close(client);
+            return;
+        }
+        if (!client_parse_header(client)) {
+            client_close(client);
+            return;
+        }
+        if (client_request_complete(client)) {
+            set_fd_nonblocking(client->fd, false);
+            process_client_request(client->fd,
+                                   &client->request,
+                                   client->header_length,
+                                   client->content_length);
+            client_close(client);
+            return;
+        }
+    }
+}
+
+static int add_client(Client *clients, int fd) {
+    for (size_t i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd >= 0) continue;
+        client_init(&clients[i]);
+        clients[i].fd = fd;
+        clients[i].last_activity = time(NULL);
+        set_client_timeouts(fd);
+        if (set_fd_nonblocking(fd, true) != 0) {
+            client_close(&clients[i]);
+            return -1;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+static void accept_ready_clients(int listen_fd, Client *clients) {
+    while (true) {
+        int client_fd = accept(listen_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+            perror("accept");
+            return;
+        }
+        if (add_client(clients, client_fd) != 0) {
+            send_text_response(client_fd, 503, "too many clients\n");
+            close(client_fd);
+        }
+    }
+}
+
+static void close_idle_clients(Client *clients) {
+    time_t now = time(NULL);
+    for (size_t i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].fd < 0) continue;
+        if (now - clients[i].last_activity > CLIENT_TIMEOUT_SECONDS) {
+            client_close(&clients[i]);
+        }
+    }
+}
+
+static void run_reactor(int listen_fd) {
+    Client clients[MAX_CLIENTS];
+    for (size_t i = 0; i < MAX_CLIENTS; i++) {
+        client_init(&clients[i]);
+    }
+    if (set_fd_nonblocking(listen_fd, true) != 0) {
+        fatal("fcntl");
+    }
+
+    while (!g_shutdown_requested) {
+        struct pollfd fds[MAX_CLIENTS + 1];
+        size_t client_indexes[MAX_CLIENTS];
+        nfds_t count = 1;
+        fds[0].fd = listen_fd;
+        fds[0].events = POLLIN;
+        fds[0].revents = 0;
+
+        for (size_t i = 0; i < MAX_CLIENTS; i++) {
+            if (clients[i].fd < 0) continue;
+            client_indexes[count - 1] = i;
+            fds[count].fd = clients[i].fd;
+            fds[count].events = POLLIN;
+            fds[count].revents = 0;
+            count++;
+        }
+
+        int ready = poll(fds, count, 1000);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+
+        if (ready > 0 && (fds[0].revents & POLLIN)) {
+            accept_ready_clients(listen_fd, clients);
+        }
+        for (nfds_t i = 1; i < count; i++) {
+            short revents = fds[i].revents;
+            if (!revents) continue;
+            size_t client_index = client_indexes[i - 1];
+            if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                client_close(&clients[client_index]);
+                continue;
+            }
+            if (revents & POLLIN) {
+                handle_client_read(&clients[client_index]);
+            }
+        }
+        close_idle_clients(clients);
+    }
+
+    for (size_t i = 0; i < MAX_CLIENTS; i++) {
+        client_close(&clients[i]);
+    }
 }
 
 static int ensure_directory_exists(const char *path) {
@@ -791,7 +947,6 @@ static void print_usage(const char *program) {
 
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGCHLD, SIG_IGN);
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = handle_shutdown_signal;
@@ -861,29 +1016,7 @@ int main(int argc, char **argv) {
     }
     fflush(stdout);
 
-    while (!g_shutdown_requested) {
-        int client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (g_shutdown_requested) break;
-            if (errno == EINTR) continue;
-            perror("accept");
-            break;
-        }
-        set_client_timeouts(client_fd);
-
-        pid_t child = fork();
-        if (child == 0) {
-            close(listen_fd);
-            handle_client(client_fd);
-            close(client_fd);
-            _exit(0);
-        }
-        if (child < 0) {
-            perror("fork");
-            handle_client(client_fd);
-        }
-        close(client_fd);
-    }
+    run_reactor(listen_fd);
 
     close(listen_fd);
     if (g_listen_socket_path[0] != '\0' && !g_systemd_socket_activation && !g_listen_socket_is_launchd_owned) {

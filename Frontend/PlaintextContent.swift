@@ -279,6 +279,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         case .systemAppearanceUpdate(let nextAppearance):
             appearance = nextAppearance
             updateColors()
+            updateTextContent(force: true)
         case .windowActiveUpdate(let isActive):
             windowIsActive = isActive
             updateSelectionLayers(force: true)
@@ -436,16 +437,34 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateColors() {
-        appearance.performAsCurrentDrawingAppearance {
-            backgroundLayer.backgroundColor = NSColor.textBackgroundColor.cgColor
-            headerLayer.backgroundColor = NSColor.controlBackgroundColor.cgColor
-            editorClipLayer.backgroundColor = NSColor.textBackgroundColor.cgColor
-            pathLayer.foregroundColor = NSColor.labelColor.cgColor
-            statusLayer.foregroundColor = (isSaving || isLoading ? NSColor.secondaryLabelColor : statusColor()).cgColor
-            cursorLayer.backgroundColor = NSColor.keyboardFocusIndicatorColor.cgColor
-            scrollbarController?.updateAppearance(appearance)
-        }
+        backgroundLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
+        headerLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+        editorClipLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
+        pathLayer.foregroundColor = resolvedCGColor(.labelColor)
+        statusLayer.foregroundColor = resolvedCGColor(isSaving || isLoading ? .secondaryLabelColor : statusColor())
+        cursorLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
+        scrollbarController?.updateAppearance(appearance)
         updateSelectionLayers(force: true)
+    }
+
+    private func withEffectiveAppearance(_ body: () -> Void) {
+        appearance.performAsCurrentDrawingAppearance(body)
+    }
+
+    private func resolvedCGColor(_ color: NSColor) -> CGColor {
+        var resolved = CGColor(gray: 0, alpha: 1)
+        withEffectiveAppearance {
+            resolved = color.cgColor
+        }
+        return resolved
+    }
+
+    private func resolvedNSColor(_ color: NSColor) -> NSColor {
+        var resolved = color
+        withEffectiveAppearance {
+            resolved = color.usingColorSpace(.deviceRGB) ?? color
+        }
+        return resolved
     }
 
     private func statusColor() -> NSColor {
@@ -645,7 +664,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             attributedText = NSAttributedString(string: displayText,
                                                 attributes: [
                                                     .font: textFont(),
-                                                    .foregroundColor: NSColor.labelColor,
+                                                    .foregroundColor: resolvedNSColor(.labelColor),
                                                     .paragraphStyle: paragraph
                                                 ])
             contentStorage.attributedString = attributedText
@@ -1353,8 +1372,4 @@ private func withoutImplicitAnimations(_ updates: () -> Void) {
     CATransaction.setDisableActions(true)
     updates()
     CATransaction.commit()
-}
-
-private func resolvedCGColor(_ color: NSColor) -> CGColor {
-    (color.usingColorSpace(.deviceRGB) ?? color).cgColor
 }
