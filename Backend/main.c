@@ -1022,8 +1022,6 @@ static void announce_plaintext_capabilities(void) {
     app_args[count++] = g_listen_socket_path;
     app_args[count++] = "--name";
     app_args[count++] = "Plaintext";
-    app_args[count++] = "--url";
-    app_args[count++] = "/";
     if (g_app_icon_path[0]) {
         app_args[count++] = "--icon-path";
         app_args[count++] = g_app_icon_path;
