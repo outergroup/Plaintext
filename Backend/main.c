@@ -36,9 +36,9 @@ extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 #define MAX_CLIENTS 256
 #define CLIENT_TIMEOUT_SECONDS 5
 
-static const char *kBundleUrlPath = "/bundles/PlaintextContent-v6";
-static const char *kBundleUrlPathMacosArm = "/bundles/PlaintextContent-v6/macos-arm";
-static const char *kBundleUrlPathMacosX86 = "/bundles/PlaintextContent-v6/macos-x86";
+static const char *kBundleUrlPath = "/bundles/PlaintextContent-v12";
+static const char *kBundleUrlPathMacosArm = "/bundles/PlaintextContent-v12/macos-arm";
+static const char *kBundleUrlPathMacosX86 = "/bundles/PlaintextContent-v12/macos-x86";
 static const char *kBundleFilePathMacosArm = "bundles/PlaintextContent.bundle.macos-arm.aar";
 static const char *kBundleFilePathMacosX86 = "bundles/PlaintextContent.bundle.macos-x86.aar";
 
@@ -494,10 +494,117 @@ static void send_file_get_response(int fd, const char *query) {
     free(contents);
 }
 
+static bool preserve_existing_draft(const char *draft_path, char *error_out, size_t error_out_size) {
+    if (access(draft_path, F_OK) != 0) {
+        return true;
+    }
+
+    for (int attempt = 0; attempt < 100; attempt++) {
+        char conflict_path[PATH_MAX] = "";
+        int written = snprintf(conflict_path, sizeof(conflict_path),
+                               "%s.conflict.%lld.%d",
+                               draft_path,
+                               (long long)time(NULL),
+                               attempt);
+        if (written < 0 || (size_t)written >= sizeof(conflict_path)) {
+            snprintf(error_out, error_out_size, "failed to preserve existing target draft");
+            return false;
+        }
+        if (rename(draft_path, conflict_path) == 0) {
+            return true;
+        }
+        if (errno != EEXIST) {
+            snprintf(error_out, error_out_size, "%s", strerror(errno));
+            return false;
+        }
+    }
+
+    snprintf(error_out, error_out_size, "failed to preserve existing target draft");
+    return false;
+}
+
+static void send_file_move_response(int fd, const char *path, const char *target_path) {
+    if (!target_path || target_path[0] == '\0') {
+        send_file_save_binary(fd, false, false, path, 0, 0, "missing move target");
+        return;
+    }
+    if (strcmp(path, target_path) == 0) {
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            send_file_save_binary(fd, true, false, path, (size_t)st.st_size, (double)st.st_mtime, "");
+        } else {
+            send_file_save_binary(fd, false, false, path, 0, 0, strerror(errno));
+        }
+        return;
+    }
+
+    char source_draft_path[PATH_MAX] = "";
+    char target_draft_path[PATH_MAX] = "";
+    if (!draft_path_for_file(path, source_draft_path, sizeof(source_draft_path)) ||
+        !draft_path_for_file(target_path, target_draft_path, sizeof(target_draft_path))) {
+        send_file_save_binary(fd, false, false, path, 0, 0, "failed to create drafts directory");
+        return;
+    }
+
+    if (access(target_path, F_OK) == 0) {
+        send_file_save_binary(fd, false, false, path, 0, 0, "target already exists");
+        return;
+    }
+
+    bool has_source_file = access(path, F_OK) == 0;
+    bool has_source_draft = access(source_draft_path, F_OK) == 0;
+    if (!has_source_file && !has_source_draft) {
+        send_file_save_binary(fd, false, false, path, 0, 0, "No such file or directory");
+        return;
+    }
+
+    if (has_source_file && rename(path, target_path) != 0) {
+        send_file_save_binary(fd, false, false, path, 0, 0, strerror(errno));
+        return;
+    }
+
+    char preserve_error[256] = "";
+    if (!preserve_existing_draft(target_draft_path, preserve_error, sizeof(preserve_error))) {
+        if (has_source_file) {
+            rename(target_path, path);
+        }
+        send_file_save_binary(fd, false, false, path, 0, 0, preserve_error);
+        return;
+    }
+
+    if (has_source_draft) {
+        if (rename(source_draft_path, target_draft_path) != 0) {
+            if (has_source_file) {
+                rename(target_path, path);
+            }
+            send_file_save_binary(fd, false, false, target_path, 0, 0, strerror(errno));
+            return;
+        }
+        struct stat draft_st;
+        if (stat(target_draft_path, &draft_st) == 0) {
+            send_file_save_binary(fd, true, true, target_path, (size_t)draft_st.st_size, (double)draft_st.st_mtime, "");
+            return;
+        }
+    }
+
+    struct stat st;
+    if (stat(target_path, &st) == 0) {
+        send_file_save_binary(fd, true, false, target_path, (size_t)st.st_size, (double)st.st_mtime, "");
+    } else {
+        send_file_save_binary(fd, true, false, target_path, 0, 0, "");
+    }
+}
+
 static void send_file_save_response(int fd, const char *query, const char *body, size_t body_length) {
     char path[PATH_MAX] = "";
     if (!copy_query_value(query, "file", path, sizeof(path)) || path[0] == '\0') {
         send_file_save_binary(fd, false, false, "", 0, 0, "missing file query parameter");
+        return;
+    }
+
+    char move_to_path[PATH_MAX] = "";
+    if (copy_query_value(query, "moveTo", move_to_path, sizeof(move_to_path))) {
+        send_file_move_response(fd, path, move_to_path);
         return;
     }
 

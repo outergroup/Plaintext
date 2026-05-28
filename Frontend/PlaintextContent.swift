@@ -195,6 +195,80 @@ private final class TextFragmentLayer: CALayer {
     }
 }
 
+private final class SymbolImageLayer: CALayer {
+    var symbolName: String {
+        didSet { setNeedsDisplay() }
+    }
+    var accessibilityTitle: String {
+        didSet { setNeedsDisplay() }
+    }
+    var tintColor: NSColor = .labelColor {
+        didSet { setNeedsDisplay() }
+    }
+
+    init(symbolName: String, accessibilityTitle: String) {
+        self.symbolName = symbolName
+        self.accessibilityTitle = accessibilityTitle
+        super.init()
+        contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        needsDisplayOnBoundsChange = true
+    }
+
+    override init(layer: Any) {
+        if let layer = layer as? SymbolImageLayer {
+            symbolName = layer.symbolName
+            accessibilityTitle = layer.accessibilityTitle
+            tintColor = layer.tintColor
+        } else {
+            symbolName = "circle"
+            accessibilityTitle = ""
+        }
+        super.init(layer: layer)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(in context: CGContext) {
+        guard let image = NSImage(systemSymbolName: symbolName,
+                                  accessibilityDescription: accessibilityTitle) else {
+            return
+        }
+        image.isTemplate = true
+        let configuredImage = image.withSymbolConfiguration(.init(pointSize: 9, weight: .medium)) ?? image
+        let imageSize = configuredImage.size
+        let maxSize = CGSize(width: min(bounds.width, 10), height: min(bounds.height, 7))
+        let scale = min(maxSize.width / max(imageSize.width, 1),
+                        maxSize.height / max(imageSize.height, 1))
+        let iconSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        let iconRect = CGRect(x: bounds.midX - iconSize.width / 2,
+                              y: bounds.midY - iconSize.height / 2,
+                              width: iconSize.width,
+                              height: iconSize.height)
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        tintColor.set()
+        configuredImage.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+}
+
+private enum PathPromptMode {
+    case open
+    case moveRename
+
+    var label: String {
+        switch self {
+        case .open:
+            return "Open"
+        case .moveRename:
+            return "Move/Rename"
+        }
+    }
+}
+
 @MainActor
 private final class PlaintextHandler: NSObject, OuterframeHostDelegate, ScrollbarControllerDelegate {
     private let outerframeHost: OuterframeHost
@@ -206,6 +280,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var windowIsActive = true
     private var viewIsFocused = true
     private var didRegisterLayer = false
+    private var currentURLString = ""
 
     private var urlSession: URLSession?
     private var fileEndpoint: URL?
@@ -221,12 +296,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private let rootLayer = CALayer()
     private let backgroundLayer = CALayer()
     private let headerLayer = CALayer()
+    private let toolbarDividerLayer = CALayer()
     private let statusLayer = CATextLayer()
     private let pathLayer = CATextLayer()
+    private let pathChevronLayer = SymbolImageLayer(symbolName: "chevron.down", accessibilityTitle: "File actions")
+    private let pathPromptCursorLayer = CALayer()
     private let editorClipLayer = CALayer()
     private let textContentLayer = CALayer()
     private let textSelectionLayer = CALayer()
-    private let cursorLayer = CALayer()
 
     private let contentStorage = NSTextContentStorage()
     private let textLayoutManager = NSTextLayoutManager()
@@ -248,9 +325,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var scrollOffset: CGFloat = 0
     private var scrollbarController: ScrollbarController<PlaintextHandler>?
     private var lastCursorUpdateRect = CGRect.null
+    private var pathControlFrame = CGRect.zero
+    private var pendingPathMenuIDs: Set<UUID> = []
+    private var pathPromptMode: PathPromptMode?
+    private var pathPromptText = ""
+    private var pathPromptCursorOffset = 0
 
     private let editorInputID = UUID()
-    private let headerHeight: CGFloat = 48
+    private let headerHeight: CGFloat = 42
     private let textInsetX: CGFloat = 14
     private let textInsetY: CGFloat = 12
     private let scrollLineHeight: CGFloat = 18
@@ -309,13 +391,19 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 updateCursor()
             }
         case .textInput(let input, let hasReplacementRange, let replacementLocation, let replacementLength):
-            if hasReplacementRange {
+            if pathPromptMode != nil {
+                insertPathPromptText(input)
+            } else if hasReplacementRange {
                 replace(range: NSRange(location: Int(replacementLocation), length: Int(replacementLength)), with: input)
             } else {
                 insertText(input)
             }
         case .textCommand(let command):
-            performTextCommand(command)
+            if pathPromptMode != nil {
+                performPathPromptTextCommand(command)
+            } else {
+                performTextCommand(command)
+            }
         case .setCursorPosition(let fieldID, let position, let modifySelection):
             guard fieldID == editorInputID else { return }
             setCursorOffset(Int(position), modifySelection: modifySelection)
@@ -324,7 +412,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         case .selectionToPasteboardCutRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: pasteboardItemsForCut())
         case .pasteboardContentPasted(let items):
-            paste(items)
+            if pathPromptMode != nil {
+                pastePathPrompt(items)
+            } else {
+                paste(items)
+            }
         case .pasteboardDropHitTestRequest(let requestID, let point, let pasteboardTypes, let operationMask, _):
             let accepts = isPointInEditor(point) && pasteboardTypes.contains(NSPasteboard.PasteboardType.string.rawValue)
             outerframeHost.sendPasteboardDropHitTestResponse(requestID: requestID,
@@ -334,12 +426,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             let offset = textOffset(atRootPoint: point)
             setCursorOffset(offset, modifySelection: false)
             paste(items)
-        case .contextMenuItemSelected(_, let itemID):
-            handleContextMenuItem(itemID)
+        case .contextMenuItemSelected(let menuID, let itemID):
+            handleContextMenuItem(menuID: menuID, itemID: itemID)
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: OuterframeAccessibilitySnapshot.notImplementedSnapshot())
         case .historyTraversal(_, let url):
+            currentURLString = url
             if let nextPath = filePath(from: url), nextPath != filePath {
                 filePath = nextPath
                 loadFile()
@@ -368,6 +461,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                  proxyPort: arguments.proxy?.port ?? 0,
                                  proxyUsername: arguments.proxy?.username,
                                  proxyPassword: arguments.proxy?.password)
+        currentURLString = arguments.url ?? ""
         appearance = arguments.appearance ?? .currentDrawing()
         windowIsActive = arguments.windowIsActive ?? true
         currentSize = arguments.contentSize ?? currentSize
@@ -415,9 +509,12 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         rootLayer.addSublayer(backgroundLayer)
         rootLayer.addSublayer(headerLayer)
         rootLayer.addSublayer(editorClipLayer)
+        headerLayer.addSublayer(toolbarDividerLayer)
+        headerLayer.addSublayer(pathChevronLayer)
+        headerLayer.addSublayer(pathPromptCursorLayer)
+        pathPromptCursorLayer.zPosition = 10
         editorClipLayer.addSublayer(textContentLayer)
         textContentLayer.addSublayer(textSelectionLayer)
-        textContentLayer.addSublayer(cursorLayer)
 
         editorClipLayer.masksToBounds = true
         for textLayer in [pathLayer, statusLayer] {
@@ -438,11 +535,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func updateColors() {
         backgroundLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
-        headerLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+        headerLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        toolbarDividerLayer.backgroundColor = resolvedCGColor(.separatorColor)
         editorClipLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
         pathLayer.foregroundColor = resolvedCGColor(.labelColor)
         statusLayer.foregroundColor = resolvedCGColor(isSaving || isLoading ? .secondaryLabelColor : statusColor())
-        cursorLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
+        pathChevronLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
+        pathPromptCursorLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
         scrollbarController?.updateAppearance(appearance)
         updateSelectionLayers(force: true)
     }
@@ -481,24 +580,58 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                        y: currentSize.height - headerHeight,
                                        width: currentSize.width,
                                        height: headerHeight)
+            toolbarDividerLayer.frame = CGRect(x: 0, y: 0, width: currentSize.width, height: 1)
             editorClipLayer.frame = CGRect(x: 0,
                                            y: 0,
                                            width: currentSize.width,
                                            height: max(currentSize.height - headerHeight, 0))
-            pathLayer.frame = CGRect(x: 14, y: 23, width: max(currentSize.width - 28, 1), height: 18)
-            statusLayer.frame = CGRect(x: 14, y: 6, width: max(currentSize.width - 28, 1), height: 16)
-            pathLayer.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
-            pathLayer.fontSize = 12
-            statusLayer.font = NSFont.systemFont(ofSize: 11, weight: .regular)
-            statusLayer.fontSize = 11
+            let isPrompting = pathPromptMode != nil
+            let pathFont = NSFont.systemFont(ofSize: 13, weight: isPrompting ? .regular : .semibold)
+            pathLayer.font = pathFont
+            pathLayer.fontSize = 13
+            statusLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            statusLayer.fontSize = 12
+            pathLayer.truncationMode = isPrompting ? .end : .middle
             renderHeader()
+            let pathX: CGFloat = 14
+            let renderedStatus = (statusLayer.string as? String) ?? ""
+            let statusWidth = renderedStatus.isEmpty ? CGFloat(0) : min(max(statusLayer.preferredFrameSize().width + 2, 58), 120)
+            let availablePathWidth = max(currentSize.width - pathX - statusWidth - 48, 42)
+            let pathWidth = min(max(pathLayer.preferredFrameSize().width + 2, 42), availablePathWidth)
+            let textY = floor((headerHeight - 18) / 2) + 1
+            pathLayer.frame = CGRect(x: pathX, y: textY, width: pathWidth, height: 18)
+            pathChevronLayer.frame = CGRect(x: pathLayer.frame.maxX + 2, y: textY, width: 12, height: 18)
+            pathControlFrame = pathLayer.frame.union(pathChevronLayer.frame).insetBy(dx: -6, dy: -6)
+            pathChevronLayer.isHidden = isPrompting
+            statusLayer.frame = CGRect(x: pathChevronLayer.frame.maxX + 8,
+                                       y: textY + 1,
+                                       width: max(currentSize.width - pathChevronLayer.frame.maxX - 18, 1),
+                                       height: 17)
+            if isPrompting {
+                let cursorX = pathLayer.frame.minX + pathPromptCursorX(font: pathFont, maxWidth: pathLayer.frame.width)
+                pathPromptCursorLayer.frame = CGRect(x: cursorX, y: textY, width: cursorWidth, height: 17)
+                pathPromptCursorLayer.isHidden = false
+            } else {
+                pathPromptCursorLayer.isHidden = true
+            }
             layoutText()
         }
     }
 
     private func renderHeader() {
-        pathLayer.string = filePath.isEmpty ? "No file" : filePath
-        statusLayer.string = statusText
+        withoutImplicitAnimations {
+            if let pathPromptMode {
+                pathLayer.string = pathPromptText.isEmpty ? " " : pathPromptText
+                statusLayer.string = pathPromptMode.label
+            } else {
+                pathLayer.string = documentDisplayName()
+                statusLayer.string = statusText
+            }
+        }
+    }
+
+    private func documentDisplayName() -> String {
+        filePath.isEmpty ? "No file" : filePath
     }
 
     private func loadFile() {
@@ -636,11 +769,266 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         saveTask?.resume()
     }
 
+    private func openPath(_ path: String) {
+        let nextPath = normalizedPath(path, relativeTo: filePath)
+        guard !nextPath.isEmpty else { return }
+        filePath = nextPath
+        updateURLForCurrentFile()
+        loadFile()
+    }
+
+    private func moveFile(to path: String) {
+        let targetPath = normalizedPath(path, relativeTo: filePath)
+        guard !filePath.isEmpty, !targetPath.isEmpty, targetPath != filePath,
+              let fileEndpoint,
+              let urlSession else {
+            return
+        }
+
+        isSaving = true
+        statusText = "Moving..."
+        renderHeader()
+        updateColors()
+
+        var components = URLComponents(url: fileEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "file", value: filePath),
+            URLQueryItem(name: "moveTo", value: targetPath)
+        ]
+        guard let url = components?.url else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data()
+
+        urlSession.dataTask(with: request) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isSaving = false
+                if let error {
+                    self.statusText = "Move failed: \(error.localizedDescription)"
+                } else if let data,
+                          let response = FileSaveResponse(data: data) {
+                    if response.ok {
+                        self.filePath = response.path
+                        self.loadedSize = response.size
+                        self.loadedModified = response.modified
+                        self.statusText = self.documentStatusText(dirty: response.dirty)
+                        self.updateURLForCurrentFile()
+                    } else {
+                        self.statusText = "Move failed: \(response.error)"
+                    }
+                } else {
+                    self.statusText = "Move failed: invalid response"
+                }
+                self.renderHeader()
+                self.layout()
+                self.updateColors()
+            }
+        }.resume()
+    }
+
+    private func normalizedPath(_ value: String, relativeTo basePath: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if trimmed.hasPrefix("/") {
+            return trimmed
+        }
+        let directory = (basePath as NSString).deletingLastPathComponent
+        guard !directory.isEmpty, directory != "." else { return trimmed }
+        return (directory as NSString).appendingPathComponent(trimmed)
+    }
+
+    private func updateURLForCurrentFile() {
+        guard !currentURLString.isEmpty,
+              var components = URLComponents(string: currentURLString) else {
+            return
+        }
+        var items = components.queryItems ?? []
+        items.removeAll { $0.name == "file" }
+        if !filePath.isEmpty {
+            items.append(URLQueryItem(name: "file", value: filePath))
+        }
+        components.queryItems = items.isEmpty ? nil : items
+        guard let url = components.url else { return }
+        currentURLString = url.absoluteString
+        outerframeHost.replaceHistoryEntry(url: url)
+    }
+
+    private func showOpenPrompt() {
+        beginPathPrompt(mode: .open, defaultValue: filePath)
+    }
+
+    private func showMoveRenamePrompt() {
+        guard !filePath.isEmpty else { return }
+        beginPathPrompt(mode: .moveRename, defaultValue: filePath)
+    }
+
+    private func beginPathPrompt(mode: PathPromptMode, defaultValue: String) {
+        pathPromptMode = mode
+        pathPromptText = defaultValue
+        pathPromptCursorOffset = (pathPromptText as NSString).length
+        renderHeader()
+        layout()
+    }
+
+    private func cancelPathPrompt() {
+        pathPromptMode = nil
+        pathPromptText = ""
+        pathPromptCursorOffset = 0
+        renderHeader()
+        layout()
+        updateColors()
+    }
+
+    private func confirmPathPrompt() {
+        guard let mode = pathPromptMode else { return }
+        let value = pathPromptText
+        cancelPathPrompt()
+        switch mode {
+        case .open:
+            openPath(value)
+        case .moveRename:
+            moveFile(to: value)
+        }
+    }
+
+    private func pathPromptCursorX(font: NSFont, maxWidth: CGFloat) -> CGFloat {
+        let nsString = pathPromptText as NSString
+        let cursor = min(max(pathPromptCursorOffset, 0), nsString.length)
+        let prefix = nsString.substring(to: cursor) as NSString
+        let width = prefix.size(withAttributes: [.font: font]).width
+        return min(max(width, 0), max(maxWidth - cursorWidth, 0))
+    }
+
+    private func setPathPromptCursor(atToolbarX toolbarX: CGFloat) {
+        guard pathPromptMode != nil else { return }
+        let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        let relativeX = max(toolbarX - pathLayer.frame.minX, 0)
+        let nsString = pathPromptText as NSString
+        var bestOffset = 0
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for offset in 0...nsString.length {
+            let prefix = nsString.substring(to: offset) as NSString
+            let width = prefix.size(withAttributes: [.font: font]).width
+            let distance = abs(width - relativeX)
+            if distance < bestDistance {
+                bestDistance = distance
+                bestOffset = offset
+            }
+        }
+        pathPromptCursorOffset = bestOffset
+        layout()
+    }
+
+    private func insertPathPromptText(_ value: String) {
+        replacePathPromptText(range: NSRange(location: pathPromptCursorOffset, length: 0), with: value)
+    }
+
+    private func replacePathPromptText(range: NSRange, with replacement: String) {
+        let nsString = pathPromptText as NSString
+        let safeLocation = min(max(range.location, 0), nsString.length)
+        let safeLength = min(max(range.length, 0), nsString.length - safeLocation)
+        pathPromptText = nsString.replacingCharacters(in: NSRange(location: safeLocation, length: safeLength),
+                                                      with: replacement)
+        pathPromptCursorOffset = safeLocation + (replacement as NSString).length
+        renderHeader()
+        layout()
+    }
+
+    private func deletePathPromptBackward() {
+        let nsString = pathPromptText as NSString
+        guard pathPromptCursorOffset > 0, nsString.length > 0 else { return }
+        replacePathPromptText(range: NSRange(location: pathPromptCursorOffset - 1, length: 1), with: "")
+    }
+
+    private func deletePathPromptForward() {
+        let nsString = pathPromptText as NSString
+        guard pathPromptCursorOffset < nsString.length else { return }
+        replacePathPromptText(range: NSRange(location: pathPromptCursorOffset, length: 1), with: "")
+    }
+
+    private func performPathPromptTextCommand(_ command: String) {
+        let nsString = pathPromptText as NSString
+        switch command {
+        case "insertNewline", "insertNewlineIgnoringFieldEditor":
+            confirmPathPrompt()
+        case "cancelOperation":
+            cancelPathPrompt()
+        case "deleteBackward":
+            deletePathPromptBackward()
+        case "deleteForward", "deleteForwardByDecomposingPreviousCharacter":
+            deletePathPromptForward()
+        case "moveLeft":
+            pathPromptCursorOffset = max(pathPromptCursorOffset - 1, 0)
+            layout()
+        case "moveRight":
+            pathPromptCursorOffset = min(pathPromptCursorOffset + 1, nsString.length)
+            layout()
+        case "moveToBeginningOfLine", "moveToBeginningOfDocument", "moveToLeftEndOfLine":
+            pathPromptCursorOffset = 0
+            layout()
+        case "moveToEndOfLine", "moveToEndOfDocument", "moveToRightEndOfLine":
+            pathPromptCursorOffset = nsString.length
+            layout()
+        default:
+            break
+        }
+    }
+
+    private func pastePathPrompt(_ items: [OuterframeContentPasteboardItem]) {
+        for item in items {
+            if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
+               let string = String(data: representation.data, encoding: .utf8) {
+                insertPathPromptText(string)
+                return
+            }
+        }
+    }
+
+    private func showPathMenu(at point: CGPoint) {
+        let menuID = UUID()
+        pendingPathMenuIDs.insert(menuID)
+        let hasFile = !filePath.isEmpty
+        let items = [
+            OuterframeContextMenuItem(id: "path-title",
+                                      title: hasFile ? filePath : "No file",
+                                      isEnabled: false),
+            OuterframeContextMenuItem(id: "path-separator-1",
+                                      title: "",
+                                      isEnabled: false,
+                                      isSeparator: true),
+            OuterframeContextMenuItem(id: "path-save",
+                                      title: "Save",
+                                      isEnabled: hasFile),
+            OuterframeContextMenuItem(id: "path-open",
+                                      title: "Open..."),
+            OuterframeContextMenuItem(id: "path-separator-2",
+                                      title: "",
+                                      isEnabled: false,
+                                      isSeparator: true),
+            OuterframeContextMenuItem(id: "path-move-rename",
+                                      title: "Move/Rename...",
+                                      isEnabled: hasFile),
+            OuterframeContextMenuItem(id: "path-copy",
+                                      title: "Copy Path",
+                                      isEnabled: hasFile)
+        ]
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+    }
+
+    private func copyCurrentPath() {
+        guard !filePath.isEmpty else { return }
+        let item = OuterframeContentPasteboardItem(representations: [
+            OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                      data: Data(filePath.utf8))
+        ])
+        outerframeHost.requestPasteboardWrite(items: [item])
+    }
+
     private func documentStatusText(dirty: Bool) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        let sizeText = formatter.string(fromByteCount: Int64(loadedSize))
-        return dirty ? "Modified - \(sizeText)" : "Saved - \(sizeText)"
+        dirty ? "Modified" : ""
     }
 
     private func textFont() -> NSFont {
@@ -965,10 +1353,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func updateCursor() {
         withoutImplicitAnimations {
             let visible = viewIsFocused && selectionRange == nil
-            cursorLayer.isHidden = !visible
             if visible {
                 let rect = cursorRect(for: cursorOffset)
-                cursorLayer.frame = rect
                 sendTextCursorUpdate(rect: rect)
             } else {
                 outerframeHost.sendTextCursorUpdate(cursors: [
@@ -1212,6 +1598,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func handleMouseDown(point: CGPoint, modifierFlags: NSEvent.ModifierFlags, clickCount: Int) {
+        let rootPoint = rootLayer.convert(point, to: rootLayer)
+        let headerPoint = headerLayer.convert(rootPoint, from: rootLayer)
+        if pathControlFrame.contains(headerPoint) {
+            if pathPromptMode != nil {
+                setPathPromptCursor(atToolbarX: headerPoint.x)
+            } else {
+                showPathMenu(at: point)
+            }
+            return
+        }
         if scrollbarController?.handleMouseDown(at: rootLayer.convert(point, to: editorClipLayer)) == true {
             return
         }
@@ -1243,6 +1639,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func handleRightMouseDown(point: CGPoint, clickCount: Int) {
+        let rootPoint = rootLayer.convert(point, to: rootLayer)
+        let headerPoint = headerLayer.convert(rootPoint, from: rootLayer)
+        if pathControlFrame.contains(headerPoint) {
+            if pathPromptMode == nil {
+                showPathMenu(at: point)
+            }
+            return
+        }
         guard isPointInEditor(point) else { return }
         let offset = textOffset(atRootPoint: point)
         if let selectionRange,
@@ -1302,7 +1706,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateCursorShape(at point: CGPoint) {
-        outerframeHost.setCursor(isPointInEditor(point) ? .iBeam : .arrow)
+        let rootPoint = rootLayer.convert(point, to: rootLayer)
+        let headerPoint = headerLayer.convert(rootPoint, from: rootLayer)
+        if pathControlFrame.contains(headerPoint) {
+            outerframeHost.setCursor(pathPromptMode == nil ? .pointingHand : .iBeam)
+        } else {
+            outerframeHost.setCursor(isPointInEditor(point) ? .iBeam : .arrow)
+        }
     }
 
     private func selectedString() -> String? {
@@ -1350,7 +1760,22 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         outerframeHost.setEditingCapabilities(canCopy: hasSelection, canCut: hasSelection)
     }
 
-    private func handleContextMenuItem(_ itemID: String) {
+    private func handleContextMenuItem(menuID: UUID, itemID: String) {
+        if pendingPathMenuIDs.remove(menuID) != nil {
+            switch itemID {
+            case "path-save":
+                saveNow()
+            case "path-open":
+                showOpenPrompt()
+            case "path-move-rename":
+                showMoveRenamePrompt()
+            case "path-copy":
+                copyCurrentPath()
+            default:
+                break
+            }
+            return
+        }
         switch itemID {
         case "save":
             saveNow()
@@ -1363,6 +1788,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let normalized = (charactersIgnoringModifiers.isEmpty ? characters : charactersIgnoringModifiers).lowercased()
         if modifierFlags.contains(.command), normalized == "s" {
             saveNow()
+        } else if pathPromptMode != nil, normalized == "\u{1b}" {
+            cancelPathPrompt()
+        } else if pathPromptMode != nil, normalized == "\r" || normalized == "\n" {
+            confirmPathPrompt()
         }
     }
 }
