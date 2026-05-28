@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode local state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+
+# Swift Package Manager local state
+.swiftpm/
+Package.resolved
+
+# Build products and intermediates
+build/
+DerivedData/
+*.dSYM/
+*.app/
+*.bundle/
+*.framework/
+*.xctest/
+
+# Packaged deploy artifacts
+*.aar
+
+# C / native build outputs
+*.o
+*.d
+*.so
+*.dylib
+*.a
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
