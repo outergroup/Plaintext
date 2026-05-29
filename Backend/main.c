@@ -72,14 +72,6 @@ typedef struct {
 
 static int ensure_directory_exists(const char *path);
 
-static const char *kTextFileExtensions[] = {
-    "txt", "text", "md", "markdown", "csv", "tsv", "json", "jsonl", "xml", "yaml", "yml", "toml", "ini", "conf", "cfg",
-    "log", "c", "h", "cpp", "cxx", "cc", "hpp", "m", "mm", "swift", "rs", "go", "java", "kt", "kts", "js", "jsx",
-    "ts", "tsx", "mjs", "cjs", "css", "scss", "sass", "html", "htm", "py", "rb", "php", "sh", "bash", "zsh", "fish",
-    "pl", "pm", "lua", "sql", "r", "jl", "ex", "exs", "erl", "hrl", "clj", "cljs", "fs", "fsx", "cs", "vb", "ps1",
-    "bat", "cmd", "dockerfile", "makefile", "mk", "gradle", "gitignore", "gitattributes", "editorconfig"
-};
-
 static void handle_shutdown_signal(int signal_number) {
     (void)signal_number;
     g_shutdown_requested = 1;
@@ -1031,25 +1023,23 @@ static void announce_plaintext_capabilities(void) {
 
     const char *opener_clear_args[] = {g_outerctl_path, "opener", "clear", "--backend", g_backend_label, NULL};
     run_outerctl_wait(opener_clear_args);
-    for (size_t i = 0; i < sizeof(kTextFileExtensions) / sizeof(kTextFileExtensions[0]); i++) {
-        const char *opener_args[] = {
-            g_outerctl_path,
-            "opener",
-            "add",
-            "--backend",
-            g_backend_label,
-            "--extension",
-            kTextFileExtensions[i],
-            "--socket-path",
-            g_listen_socket_path,
-            "--name",
-            "Plaintext",
-            "--url-template",
-            "?file={file}",
-            NULL
-        };
-        run_outerctl_wait(opener_args);
-    }
+    const char *opener_args[] = {
+        g_outerctl_path,
+        "opener",
+        "add",
+        "--backend",
+        g_backend_label,
+        "--kind",
+        "text",
+        "--socket-path",
+        g_listen_socket_path,
+        "--name",
+        "Plaintext",
+        "--url-template",
+        "?file={file}",
+        NULL
+    };
+    run_outerctl_wait(opener_args);
 }
 
 static int create_unix_listener(const char *requested_socket_path) {
