@@ -233,10 +233,10 @@ static const char *home_directory(void) {
 static void default_drafts_directory(char *out, size_t out_size) {
     const char *state_home = getenv("XDG_STATE_HOME");
     if (state_home && state_home[0] != '\0') {
-        snprintf(out, out_size, "%s/outerwebapps/plaintext-drafts", state_home);
+        snprintf(out, out_size, "%s/outershell/plaintext-drafts", state_home);
         return;
     }
-    snprintf(out, out_size, "%s/.local/state/outerwebapps/plaintext-drafts", home_directory());
+    snprintf(out, out_size, "%s/.local/state/outershell/plaintext-drafts", home_directory());
 }
 
 static bool draft_path_for_file(const char *path, char *out, size_t out_size) {
