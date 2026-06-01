@@ -982,29 +982,13 @@ static void run_outerctl_wait(const char *const *arguments) {
 static void announce_plaintext_capabilities(void) {
     if (!g_outerctl_path[0] || !g_backend_label[0]) return;
 
-    const char *backend_args[10];
-    size_t count = 0;
-    backend_args[count++] = g_outerctl_path;
-    backend_args[count++] = "backend";
-    backend_args[count++] = "upsert";
-    backend_args[count++] = "--backend";
-    backend_args[count++] = g_backend_label;
-    backend_args[count++] = "--name";
-    backend_args[count++] = "Plaintext";
-    if (g_app_icon_path[0]) {
-        backend_args[count++] = "--icon-path";
-        backend_args[count++] = g_app_icon_path;
-    }
-    backend_args[count] = NULL;
-    run_outerctl_wait(backend_args);
-
     if (!g_listen_socket_path[0]) return;
 
     const char *app_clear_args[] = {g_outerctl_path, "app", "clear", "--backend", g_backend_label, NULL};
     run_outerctl_wait(app_clear_args);
 
     const char *app_args[16];
-    count = 0;
+    size_t count = 0;
     app_args[count++] = g_outerctl_path;
     app_args[count++] = "app";
     app_args[count++] = "add";
