@@ -304,6 +304,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private let editorClipLayer = CALayer()
     private let textContentLayer = CALayer()
     private let textSelectionLayer = CALayer()
+    private let editorCaretLayer = CALayer()
 
     private let contentStorage = NSTextContentStorage()
     private let textLayoutManager = NSTextLayoutManager()
@@ -324,7 +325,6 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var selectionLayers: [CALayer] = []
     private var scrollOffset: CGFloat = 0
     private var scrollbarController: ScrollbarController<PlaintextHandler>?
-    private var lastCursorUpdateRect = CGRect.null
     private var pathControlFrame = CGRect.zero
     private var pendingPathMenuIDs: Set<UUID> = []
     private var pathPromptMode: PathPromptMode?
@@ -337,6 +337,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private let textInsetY: CGFloat = 12
     private let scrollLineHeight: CGFloat = 18
     private let cursorWidth: CGFloat = 1.5
+    private let caretBlinkAnimationKey = "caretBlink"
 
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
         self.outerframeHost = outerframeHost
@@ -392,7 +393,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             }
         case .textInput(let input, let hasReplacementRange, let replacementLocation, let replacementLength):
             if pathPromptMode != nil {
-                insertPathPromptText(input)
+                if hasReplacementRange {
+                    replacePathPromptText(range: NSRange(location: Int(replacementLocation),
+                                                         length: Int(replacementLength)),
+                                          with: input)
+                } else {
+                    insertPathPromptText(input)
+                }
             } else if hasReplacementRange {
                 replace(range: NSRange(location: Int(replacementLocation), length: Int(replacementLength)), with: input)
             } else {
@@ -406,7 +413,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             }
         case .setCursorPosition(let fieldID, let position, let modifySelection):
             guard fieldID == editorInputID else { return }
-            setCursorOffset(Int(position), modifySelection: modifySelection)
+            if pathPromptMode != nil {
+                let textLength = (pathPromptText as NSString).length
+                pathPromptCursorOffset = min(max(Int(position), 0), textLength)
+                layout()
+            } else {
+                setCursorOffset(Int(position), modifySelection: modifySelection)
+            }
         case .selectionToPasteboardCopyRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: pasteboardItemsForCopy())
         case .selectionToPasteboardCutRequest(let requestID):
@@ -515,6 +528,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         pathPromptCursorLayer.zPosition = 10
         editorClipLayer.addSublayer(textContentLayer)
         textContentLayer.addSublayer(textSelectionLayer)
+        textContentLayer.addSublayer(editorCaretLayer)
+        editorCaretLayer.zPosition = 20
+        editorCaretLayer.isHidden = true
 
         editorClipLayer.masksToBounds = true
         for textLayer in [pathLayer, statusLayer] {
@@ -542,6 +558,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         statusLayer.foregroundColor = resolvedCGColor(isSaving || isLoading ? .secondaryLabelColor : statusColor())
         pathChevronLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
         pathPromptCursorLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
+        editorCaretLayer.backgroundColor = resolvedCGColor(.textColor)
         scrollbarController?.updateAppearance(appearance)
         updateSelectionLayers(force: true)
     }
@@ -611,8 +628,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 let cursorX = pathLayer.frame.minX + pathPromptCursorX(font: pathFont, maxWidth: pathLayer.frame.width)
                 pathPromptCursorLayer.frame = CGRect(x: cursorX, y: textY, width: cursorWidth, height: 17)
                 pathPromptCursorLayer.isHidden = false
+                startBlinkingCaret(pathPromptCursorLayer)
             } else {
                 pathPromptCursorLayer.isHidden = true
+                stopBlinkingCaret(pathPromptCursorLayer)
             }
             layoutText()
         }
@@ -1352,29 +1371,58 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func updateCursor() {
         withoutImplicitAnimations {
-            let visible = viewIsFocused && selectionRange == nil
-            if visible {
+            if pathPromptMode != nil, viewIsFocused, windowIsActive {
+                editorCaretLayer.isHidden = true
+                stopBlinkingCaret(editorCaretLayer)
+                pathPromptCursorLayer.isHidden = false
+                startBlinkingCaret(pathPromptCursorLayer)
+                sendTextInputGeometryUpdate(rect: pathPromptCursorLayer.bounds, in: pathPromptCursorLayer)
+            } else if pathPromptMode != nil {
+                editorCaretLayer.isHidden = true
+                stopBlinkingCaret(editorCaretLayer)
+                stopBlinkingCaret(pathPromptCursorLayer)
+                outerframeHost.sendTextInputGeometryUpdate(nil)
+            } else if viewIsFocused && windowIsActive && selectionRange == nil {
                 let rect = cursorRect(for: cursorOffset)
-                sendTextCursorUpdate(rect: rect)
+                editorCaretLayer.frame = rect
+                editorCaretLayer.isHidden = false
+                startBlinkingCaret(editorCaretLayer)
+                sendTextInputGeometryUpdate(rect: rect, in: textContentLayer)
             } else {
-                outerframeHost.sendTextCursorUpdate(cursors: [
-                    OuterframeContentTextCursorSnapshot(fieldID: editorInputID, rect: .zero, visible: false)
-                ])
+                editorCaretLayer.isHidden = true
+                stopBlinkingCaret(editorCaretLayer)
+                outerframeHost.sendTextInputGeometryUpdate(nil)
             }
         }
     }
 
-    private func sendTextCursorUpdate(rect: CGRect) {
-        let rootRect = textContentLayer.convert(rect, to: rootLayer)
+    private func sendTextInputGeometryUpdate(rect: CGRect, in layer: CALayer) {
+        let rootRect = layer.convert(rect, to: rootLayer)
         let topLeftRect = CGRect(x: rootRect.minX,
                                  y: rootLayer.bounds.height - rootRect.maxY,
                                  width: rootRect.width,
                                  height: rootRect.height)
-        if topLeftRect.equalTo(lastCursorUpdateRect) { return }
-        lastCursorUpdateRect = topLeftRect
-        outerframeHost.sendTextCursorUpdate(cursors: [
-            OuterframeContentTextCursorSnapshot(fieldID: editorInputID, rect: topLeftRect, visible: true)
-        ])
+        outerframeHost.sendTextInputGeometryUpdate(OuterframeContentTextInputGeometry(fieldID: editorInputID,
+                                                                                     rect: topLeftRect))
+    }
+
+    private func startBlinkingCaret(_ layer: CALayer) {
+        layer.opacity = 1
+        if layer.animation(forKey: caretBlinkAnimationKey) != nil { return }
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 1
+        animation.toValue = 0
+        animation.duration = 0.55
+        animation.beginTime = CACurrentMediaTime() + 0.55
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        layer.add(animation, forKey: caretBlinkAnimationKey)
+    }
+
+    private func stopBlinkingCaret(_ layer: CALayer) {
+        layer.removeAnimation(forKey: caretBlinkAnimationKey)
+        layer.opacity = 1
     }
 
     private func ensureCursorVisible() {
