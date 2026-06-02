@@ -330,6 +330,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var pathPromptMode: PathPromptMode?
     private var pathPromptText = ""
     private var pathPromptCursorOffset = 0
+    private var accessibilityNotificationScheduled = false
 
     private let editorInputID = UUID()
     private let headerHeight: CGFloat = 42
@@ -443,7 +444,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             handleContextMenuItem(menuID: menuID, itemID: itemID)
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
-                                                             snapshot: OuterframeAccessibilitySnapshot.notImplementedSnapshot())
+                                                             snapshot: buildAccessibilitySnapshot())
         case .historyTraversal(_, let url):
             currentURLString = url
             if let nextPath = filePath(from: url), nextPath != filePath {
@@ -635,6 +636,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             }
             layoutText()
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func renderHeader() {
@@ -647,6 +649,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 statusLayer.string = statusText
             }
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func documentDisplayName() -> String {
@@ -1081,6 +1084,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             layoutText()
             updateEditingCapabilities()
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func layoutText() {
@@ -1175,6 +1179,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 textFragmentLayers[id] = nil
             }
         }
+        notifyAccessibilityLayoutChanged()
     }
 
     private func clearTextFragmentLayers() {
@@ -1840,6 +1845,89 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             cancelPathPrompt()
         } else if pathPromptMode != nil, normalized == "\r" || normalized == "\n" {
             confirmPathPrompt()
+        }
+    }
+
+    private func buildAccessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
+        var nextIdentifier: UInt32 = 1
+        var children: [OuterframeAccessibilityNode] = []
+
+        if let pathPromptMode {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                             role: .textField,
+                                             frame: headerLayer.convert(pathControlFrame, to: rootLayer),
+                                             label: "\(pathPromptMode.label) path",
+                                             value: pathPromptText,
+                                             hint: "Insertion point at character \(pathPromptCursorOffset)"))
+        } else {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                             role: .button,
+                                             frame: headerLayer.convert(pathControlFrame, to: rootLayer),
+                                             label: "File actions",
+                                             value: documentDisplayName(),
+                                             hint: "Open file actions menu"))
+        }
+
+        if let status = statusLayer.string as? String, !status.isEmpty {
+            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                             role: .staticText,
+                                             frame: headerLayer.convert(statusLayer.frame, to: rootLayer),
+                                             label: status))
+        }
+
+        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
+                                         role: .textField,
+                                         frame: editorClipLayer.frame,
+                                         label: filePath.isEmpty ? "Text editor" : "Text editor, \(filePath)",
+                                         value: text,
+                                         hint: editorAccessibilityHint()))
+
+        let rootNode = OuterframeAccessibilityNode(identifier: 0,
+                                                   role: .container,
+                                                   frame: rootLayer.bounds,
+                                                   label: "Plaintext",
+                                                   children: children)
+        return OuterframeAccessibilitySnapshot(rootNodes: [rootNode])
+    }
+
+    private func editorAccessibilityHint() -> String {
+        let lineCount = max(visualLineMetrics().lines.count, 1)
+        if let selectionRange {
+            return "\(lineCount) visual lines, \(selectionRange.length) selected characters"
+        }
+        return "\(lineCount) visual lines, insertion point at character \(cursorOffset)"
+    }
+
+    private func accessibilityNode(nextIdentifier: inout UInt32,
+                                   role: OuterframeAccessibilityRole,
+                                   frame: CGRect,
+                                   label: String? = nil,
+                                   value: String? = nil,
+                                   hint: String? = nil,
+                                   children: [OuterframeAccessibilityNode] = [],
+                                   rowCount: Int? = nil,
+                                   columnCount: Int? = nil,
+                                   isEnabled: Bool = true) -> OuterframeAccessibilityNode {
+        let identifier = nextIdentifier
+        nextIdentifier = nextIdentifier == UInt32.max ? 1 : nextIdentifier + 1
+        return OuterframeAccessibilityNode(identifier: identifier,
+                                           role: role,
+                                           frame: frame,
+                                           label: label,
+                                           value: value,
+                                           hint: hint,
+                                           children: children,
+                                           rowCount: rowCount,
+                                           columnCount: columnCount,
+                                           isEnabled: isEnabled)
+    }
+
+    private func notifyAccessibilityLayoutChanged() {
+        guard didRegisterLayer, !accessibilityNotificationScheduled else { return }
+        accessibilityNotificationScheduled = true
+        Task { @MainActor in
+            accessibilityNotificationScheduled = false
+            outerframeHost.notifyAccessibilityTreeChanged(.layoutChanged)
         }
     }
 }
