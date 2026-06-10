@@ -480,6 +480,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                  proxyPort: arguments.proxy?.port ?? 0,
                                  proxyUsername: arguments.proxy?.username,
                                  proxyPassword: arguments.proxy?.password)
+        outerframeHost.setTitle("Plaintext")
+        outerframeHost.setIcon(.bundleResource(path: "Contents/Resources/app-icon.png"))
         currentURLString = arguments.url ?? ""
         appearance = arguments.appearance ?? .currentDrawing()
         windowIsActive = arguments.windowIsActive ?? true
