@@ -425,6 +425,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: pasteboardItemsForCopy())
         case .selectionToPasteboardCutRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: pasteboardItemsForCut())
+        case .editCommandValidationRequest(let requestID, let commands):
+            outerframeHost.sendEditCommandValidationResponse(
+                requestID: requestID,
+                enabledCommands: enabledEditCommands(in: commands)
+            )
         case .pasteboardContentPasted(let items):
             if pathPromptMode != nil {
                 pastePathPrompt(items)
@@ -1019,8 +1024,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                       isEnabled: false),
             OuterframeContextMenuItem(id: "path-separator-1",
                                       title: "",
-                                      isEnabled: false,
-                                      isSeparator: true),
+                                      kind: .separator,
+                                      isEnabled: false),
             OuterframeContextMenuItem(id: "path-save",
                                       title: "Save",
                                       isEnabled: hasFile),
@@ -1028,8 +1033,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                       title: "Open..."),
             OuterframeContextMenuItem(id: "path-separator-2",
                                       title: "",
-                                      isEnabled: false,
-                                      isSeparator: true),
+                                      kind: .separator,
+                                      isEnabled: false),
             OuterframeContextMenuItem(id: "path-move-rename",
                                       title: "Move/Rename...",
                                       isEnabled: hasFile),
@@ -1704,7 +1709,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let offset = textOffset(atRootPoint: point)
         if let selectionRange,
            NSLocationInRange(offset, selectionRange) {
-            outerframeHost.showContextMenu(for: attributedSelection() ?? NSAttributedString(string: ""), at: point)
+            showEditorContextMenu(at: point)
             return
         }
         if clickCount >= 2 {
@@ -1712,7 +1717,48 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         } else {
             setCursorOffset(offset, modifySelection: false)
         }
-        outerframeHost.showContextMenu(for: attributedSelection() ?? NSAttributedString(string: ""), at: point)
+        showEditorContextMenu(at: point)
+    }
+
+    private func showEditorContextMenu(at point: CGPoint) {
+        let hasSelection = selectionRange?.length ?? 0 > 0
+        let selectedText = selectedString() ?? ""
+        var items: [OuterframeContextMenuItem] = []
+        if !selectedText.isEmpty {
+            let displayText = selectedText.count > 80 ? String(selectedText.prefix(80)) + "..." : selectedText
+            let lookupTitle = "Look Up \"\(displayText)\""
+            items.append(OuterframeContextMenuItem(id: "lookup",
+                                                   title: lookupTitle,
+                                                   action: .standardLookUp))
+            items.append(OuterframeContextMenuItem(id: "lookup-separator",
+                                                   title: "",
+                                                   kind: .separator,
+                                                   isEnabled: false))
+        }
+        items.append(OuterframeContextMenuItem(id: "cut",
+                                               title: "Cut",
+                                               action: .standardCut,
+                                               isEnabled: hasSelection))
+        items.append(OuterframeContextMenuItem(id: "copy",
+                                               title: "Copy",
+                                               action: .standardCopy,
+                                               isEnabled: hasSelection))
+        items.append(OuterframeContextMenuItem(id: "paste",
+                                               title: "Paste",
+                                               action: .standardPaste))
+        if !selectedText.isEmpty {
+            items.append(OuterframeContextMenuItem(id: "services-separator",
+                                                   title: "",
+                                                   kind: .separator,
+                                                   isEnabled: false))
+            items.append(OuterframeContextMenuItem(id: "services",
+                                                   title: "Services",
+                                                   action: .standardServices))
+        }
+        outerframeHost.showContextMenu(menuID: UUID(),
+                                       items: items,
+                                       at: point,
+                                       attributedText: attributedSelection())
     }
 
     private func selectWord(at offset: Int) {
@@ -1809,8 +1855,26 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateEditingCapabilities() {
+    }
+
+    private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        var enabledCommands: OuterframeEditCommandSet = []
         let hasSelection = selectionRange?.length ?? 0 > 0
-        outerframeHost.setEditingCapabilities(canCopy: hasSelection, canCut: hasSelection)
+        if hasSelection {
+            if requestedCommands.contains(.copy) {
+                enabledCommands.insert(.copy)
+            }
+            if requestedCommands.contains(.cut) {
+                enabledCommands.insert(.cut)
+            }
+        }
+        if requestedCommands.contains(.paste) {
+            enabledCommands.insert(.paste)
+        }
+        if requestedCommands.contains(.selectAll), !text.isEmpty {
+            enabledCommands.insert(.selectAll)
+        }
+        return enabledCommands
     }
 
     private func handleContextMenuItem(menuID: UUID, itemID: String) {
