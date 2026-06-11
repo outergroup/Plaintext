@@ -277,6 +277,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private var appearance: NSAppearance = .currentDrawing()
     private var currentSize = CGSize(width: 900, height: 640)
+    private var resizeLayoutUpdateScheduled = false
     private var windowIsActive = true
     private var viewIsFocused = true
     private var didRegisterLayer = false
@@ -315,7 +316,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var text = ""
     private var attributedText = NSAttributedString(string: "")
     private var generation = 0
-    private var estimatedContentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
+    private var contentHeightCache: (generation: Int, textWidth: CGFloat, height: CGFloat)?
     private var visualLineCache: (generation: Int, textWidth: CGFloat, metrics: EditorVisualLineMetrics)?
     private var textLayoutWidth: CGFloat = 0
 
@@ -336,6 +337,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private let headerHeight: CGFloat = 42
     private let textInsetX: CGFloat = 14
     private let textInsetY: CGFloat = 12
+    private let textMeasurementHeight: CGFloat = 10_000_000
     private let scrollLineHeight: CGFloat = 18
     private let cursorWidth: CGFloat = 1.5
     private let caretBlinkAnimationKey = "caretBlink"
@@ -359,7 +361,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             configure(with: arguments)
         case .resizeContent(let size):
             currentSize = size
-            layout()
+            scheduleResizeLayoutUpdate()
         case .systemAppearanceUpdate(let nextAppearance):
             appearance = nextAppearance
             updateColors()
@@ -644,6 +646,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             layoutText()
         }
         notifyAccessibilityLayoutChanged()
+    }
+
+    private func scheduleResizeLayoutUpdate() {
+        guard !resizeLayoutUpdateScheduled else { return }
+        resizeLayoutUpdateScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            resizeLayoutUpdateScheduled = false
+            layout()
+        }
     }
 
     private func renderHeader() {
@@ -1070,7 +1082,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
         withoutImplicitAnimations {
             generation += 1
-            estimatedContentHeightCache = nil
+            contentHeightCache = nil
             visualLineCache = nil
             fragmentCoverage = nil
             clearTextFragmentLayers()
@@ -1100,7 +1112,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if abs(textWidth - textLayoutWidth) > 0.5 {
             textLayoutWidth = textWidth
             clearTextFragmentLayers()
-            estimatedContentHeightCache = nil
+            contentHeightCache = nil
             visualLineCache = nil
         }
         textContainer.size = CGSize(width: textWidth,
@@ -1200,18 +1212,22 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func contentHeight() -> CGFloat {
         guard editorClipLayer.bounds.width > 0, editorClipLayer.bounds.height > 0 else { return 0 }
         let textWidth = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
-        return max(estimatedContentHeight(textWidth: textWidth), editorClipLayer.bounds.height)
+        return contentHeight(textWidth: textWidth)
     }
 
-    private func estimatedContentHeight(textWidth: CGFloat) -> CGFloat {
-        if let cache = estimatedContentHeightCache,
+    private func contentHeight(textWidth: CGFloat) -> CGFloat {
+        if let cache = contentHeightCache,
            cache.generation == generation,
            abs(cache.textWidth - textWidth) <= 0.5 {
             return cache.height
         }
-        let metrics = visualLineMetrics(textWidth: textWidth)
-        let height = CGFloat(max(metrics.lines.count, 1)) * metrics.lineHeight + textInsetY * 2
-        estimatedContentHeightCache = (generation: generation, textWidth: textWidth, height: height)
+
+        textContainer.size = CGSize(width: textWidth,
+                                    height: max(textMeasurementHeight, editorClipLayer.bounds.height))
+        textLayoutManager.ensureLayout(for: textLayoutManager.documentRange)
+        let height = max(textLayoutManager.usageBoundsForTextContainer.maxY + textInsetY * 2,
+                         editorClipLayer.bounds.height)
+        contentHeightCache = (generation: generation, textWidth: textWidth, height: height)
         return height
     }
 
