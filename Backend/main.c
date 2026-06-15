@@ -45,7 +45,7 @@ static const char *kBundleFilePathMacosX86 = "bundles/PlaintextContent.bundle.ma
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
-static char g_backend_label[256] = "dev.outergroup.Plaintext";
+static char g_backend_label[256] = "org.outershell.Plaintext";
 static char g_outerctl_path[PATH_MAX] = "";
 static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";

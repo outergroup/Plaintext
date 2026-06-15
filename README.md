@@ -17,7 +17,7 @@ The development server listens on `http://127.0.0.1:7355/` by default. For
 Unix socket testing:
 
 ```bash
-SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)dev.outergroup.Plaintext"
+SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.Plaintext"
 ./build/macos/Release/PlaintextBackend \
   --socket-path "$SOCKET_PATH" \
   --bundles-dir ./build/run/bundles
