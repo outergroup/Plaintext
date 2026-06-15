@@ -43,16 +43,24 @@ echo "==> Archiving PlaintextContent bundles"
 STAGING_ROOT="$(mktemp -d)"
 trap 'rm -rf "${STAGING_ROOT}"' EXIT
 
-APP_ROOT="${STAGING_ROOT}/Plaintext"
-mkdir -p \
-    "${APP_ROOT}/RemoteLinuxBinaries/aarch64" \
-    "${APP_ROOT}/RemoteLinuxBinaries/x86_64" \
-    "${APP_ROOT}/bundles"
+OUTPUT_APP_ROOT="${OUTPUT_ROOT}/Plaintext"
+rm -rf "${OUTPUT_APP_ROOT}"
+mkdir -p "${OUTPUT_APP_ROOT}"
 
-install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/PlaintextBackend" "${APP_ROOT}/RemoteLinuxBinaries/aarch64/PlaintextBackend"
-install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/PlaintextBackend" "${APP_ROOT}/RemoteLinuxBinaries/x86_64/PlaintextBackend"
-install -m 0644 "${PACKAGE_ROOT}/bundles/PlaintextContent.bundle.macos-arm.aar" "${APP_ROOT}/bundles/PlaintextContent.bundle.macos-arm.aar"
-install -m 0644 "${PACKAGE_ROOT}/bundles/PlaintextContent.bundle.macos-x86.aar" "${APP_ROOT}/bundles/PlaintextContent.bundle.macos-x86.aar"
+package_linux_variant() {
+    local arch="$1"
+    local output_name="$2"
+    local app_root="${STAGING_ROOT}/Plaintext"
+    rm -rf "${app_root}"
+    mkdir -p \
+        "${app_root}/RemoteLinuxBinaries/${arch}" \
+        "${app_root}/bundles"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/PlaintextBackend" "${app_root}/RemoteLinuxBinaries/${arch}/PlaintextBackend"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/PlaintextContent.bundle.macos-arm.aar" "${app_root}/bundles/PlaintextContent.bundle.macos-arm.aar"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/PlaintextContent.bundle.macos-x86.aar" "${app_root}/bundles/PlaintextContent.bundle.macos-x86.aar"
+    tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Plaintext
+    echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
+}
 
-tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_ROOT}/Plaintext.tar.gz" Plaintext
-echo "Packaged ${OUTPUT_ROOT}/Plaintext.tar.gz"
+package_linux_variant aarch64 linux-aarch64
+package_linux_variant x86_64 linux-x86_64
