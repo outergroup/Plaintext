@@ -23,7 +23,7 @@ SOCKET_PATH="$(getconf DARWIN_USER_TEMP_DIR)org.outershell.Plaintext"
   --bundles-dir ./build/run/bundles
 ```
 
-Open the socket URL from Outer Shell or Outerframe with a `file` query. When
-`OUTERCTL_PATH` is set, the backend announces Plaintext and registers itself as
-an opener for `public.text` on startup. Opener URLs use `?file={file}`, where
-outershelld replaces `{file}` with the percent-encoded path.
+Open the socket URL from Outer Shell or Outerframe with a `file` query.
+Plaintext is registered as an opener for `public.text` when it is installed
+through Outer Shell. Opener URLs use `?file={file}`, where outershelld replaces
+`{file}` with the percent-encoded path.

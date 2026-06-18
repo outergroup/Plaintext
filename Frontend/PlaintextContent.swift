@@ -2799,20 +2799,28 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         case "moveDownAndModifySelection":
             moveVertical(delta: 1, modifySelection: true)
         case "moveToBeginningOfLine", "moveToLeftEndOfLine":
-            move(to: lineStart(for: cursorOffset), modifySelection: false)
+            move(to: visualLineStart(for: cursorOffset), modifySelection: false)
         case "moveToEndOfLine", "moveToRightEndOfLine":
-            move(to: lineEnd(for: cursorOffset), modifySelection: false)
+            move(to: visualLineEnd(for: cursorOffset), modifySelection: false)
         case "moveToBeginningOfLineAndModifySelection", "moveToLeftEndOfLineAndModifySelection":
-            move(to: lineStart(for: cursorOffset), modifySelection: true)
+            move(to: visualLineStart(for: cursorOffset), modifySelection: true)
         case "moveToEndOfLineAndModifySelection", "moveToRightEndOfLineAndModifySelection":
+            move(to: visualLineEnd(for: cursorOffset), modifySelection: true)
+        case "moveToBeginningOfParagraph":
+            move(to: lineStart(for: cursorOffset), modifySelection: false)
+        case "moveToEndOfParagraph":
+            move(to: lineEnd(for: cursorOffset), modifySelection: false)
+        case "moveToBeginningOfParagraphAndModifySelection":
+            move(to: lineStart(for: cursorOffset), modifySelection: true)
+        case "moveToEndOfParagraphAndModifySelection":
             move(to: lineEnd(for: cursorOffset), modifySelection: true)
-        case "moveToBeginningOfDocument", "moveToBeginningOfParagraph":
+        case "moveToBeginningOfDocument":
             move(to: 0, modifySelection: false)
-        case "moveToEndOfDocument", "moveToEndOfParagraph":
+        case "moveToEndOfDocument":
             move(to: (text as NSString).length, modifySelection: false)
-        case "moveToBeginningOfDocumentAndModifySelection", "moveToBeginningOfParagraphAndModifySelection":
+        case "moveToBeginningOfDocumentAndModifySelection":
             move(to: 0, modifySelection: true)
-        case "moveToEndOfDocumentAndModifySelection", "moveToEndOfParagraphAndModifySelection":
+        case "moveToEndOfDocumentAndModifySelection":
             move(to: (text as NSString).length, modifySelection: true)
         case "pageUp":
             scrollOffset = clampedScrollOffset(scrollOffset - editorClipLayer.bounds.height)
@@ -2905,6 +2913,44 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             }
         }
         return end
+    }
+
+    private func visualLineRange(for offset: Int) -> NSRange {
+        let clamped = clampedOffset(offset)
+        guard let caretRect = caretTopDownRect(for: clamped) else {
+            return NSRange(location: lineStart(for: clamped), length: lineEnd(for: clamped) - lineStart(for: clamped))
+        }
+
+        let point = CGPoint(x: max(caretRect.midX, 0), y: max(caretRect.midY, 0))
+        textLayoutManager.ensureLayout(for: textLayoutManager.documentRange)
+        guard let fragment = textLayoutManager.textLayoutFragment(for: point) else {
+            return NSRange(location: lineStart(for: clamped), length: lineEnd(for: clamped) - lineStart(for: clamped))
+        }
+
+        let localY = point.y - fragment.layoutFragmentFrame.minY
+        guard let line = fragment.textLineFragment(forVerticalOffset: localY, requiresExactMatch: false) else {
+            let fragmentStart = utf16Offset(for: fragment.rangeInElement.location)
+            let fragmentEnd = fragmentStart + textLayoutManager.offset(from: fragment.rangeInElement.location,
+                                                                        to: fragment.rangeInElement.endLocation)
+            return NSRange(location: clampedOffset(fragmentStart),
+                           length: max(clampedOffset(fragmentEnd) - clampedOffset(fragmentStart), 0))
+        }
+
+        let fragmentStart = utf16Offset(for: fragment.rangeInElement.location)
+        let start = clampedOffset(fragmentStart + line.characterRange.location)
+        let paragraphEnd = lineEnd(for: clamped)
+        let end = min(clampedOffset(fragmentStart + line.characterRange.location + line.characterRange.length),
+                      paragraphEnd)
+        return NSRange(location: start, length: max(end - start, 0))
+    }
+
+    private func visualLineStart(for offset: Int) -> Int {
+        visualLineRange(for: offset).location
+    }
+
+    private func visualLineEnd(for offset: Int) -> Int {
+        let range = visualLineRange(for: offset)
+        return range.location + range.length
     }
 
     private func handleMouseDown(point: CGPoint, modifierFlags: NSEvent.ModifierFlags, clickCount: Int) {
