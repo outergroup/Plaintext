@@ -420,6 +420,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private let findTextLayer = CATextLayer()
     private let findPlaceholderLayer = CATextLayer()
     private let findSelectionLayer = CALayer()
+    private let findMarkedUnderlineLayer = CALayer()
     private let findCaretLayer = CALayer()
     private let findPreviousButtonLayer = CALayer()
     private let findPreviousIconLayer = SymbolImageLayer(symbolName: "chevron.left", accessibilityTitle: "Find Previous")
@@ -487,6 +488,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var isFindVisible = false
     private var findMatches: [NSRange] = []
     private var activeFindMatchIndex: Int?
+    private var markedTextRange: NSRange?
+    private var pendingMarkedTextReplacementRange: NSRange?
     private var findBarFrame = CGRect.zero
     private var findFieldFrame = CGRect.zero
     private var findPreviousButtonFrame = CGRect.zero
@@ -614,6 +617,41 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 replace(range: NSRange(location: Int(replacementLocation), length: Int(replacementLength)), with: input)
             } else {
                 insertText(input)
+            }
+        case .setMarkedText(let input, let selectedLocation, let selectedLength, let hasReplacementRange, let replacementLocation, let replacementLength):
+            if pendingFilePicker != nil {
+                _ = input
+            } else if findInputController.isFocused {
+                let replacementRange: Range<Int>? = hasReplacementRange
+                    ? Int(replacementLocation)..<(Int(replacementLocation) + Int(replacementLength))
+                    : nil
+                findInputController.setMarkedText(input,
+                                                  selectedLocation: Int(selectedLocation),
+                                                  selectedLength: Int(selectedLength),
+                                                  replacementRange: replacementRange)
+            } else if pathPromptMode != nil {
+                if hasReplacementRange {
+                    replacePathPromptText(range: NSRange(location: Int(replacementLocation),
+                                                         length: Int(replacementLength)),
+                                          with: input)
+                } else {
+                    insertPathPromptText(input)
+                }
+            } else {
+                setMarkedText(input,
+                              selectedLocation: Int(selectedLocation),
+                              selectedLength: Int(selectedLength),
+                              hasReplacementRange: hasReplacementRange,
+                              replacementLocation: Int(replacementLocation),
+                              replacementLength: Int(replacementLength))
+            }
+        case .unmarkText:
+            if findInputController.isFocused {
+                findInputController.unmarkText()
+            } else if pathPromptMode != nil {
+                _ = pathPromptMode
+            } else {
+                unmarkText()
             }
         case .textCommand(let command):
             if pendingFilePicker != nil {
@@ -767,6 +805,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         findFieldLayer.addSublayer(findSelectionLayer)
         findFieldLayer.addSublayer(findPlaceholderLayer)
         findFieldLayer.addSublayer(findTextLayer)
+        findFieldLayer.addSublayer(findMarkedUnderlineLayer)
         findFieldLayer.addSublayer(findCaretLayer)
         findPreviousButtonLayer.addSublayer(findPreviousIconLayer)
         findNextButtonLayer.addSublayer(findNextIconLayer)
@@ -788,6 +827,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         findNextIconLayer.maxSymbolSize = CGSize(width: 12, height: 14)
         findSelectionLayer.isHidden = true
         findSelectionLayer.cornerRadius = 2
+        findMarkedUnderlineLayer.isHidden = true
         findCaretLayer.isHidden = true
         findCaretLayer.zPosition = 10
         editorClipLayer.addSublayer(textContentLayer)
@@ -849,6 +889,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         findStatusLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
         findDoneTextLayer.foregroundColor = resolvedCGColor(.labelColor)
         findSelectionLayer.backgroundColor = resolvedCGColor(.selectedTextBackgroundColor)
+        findMarkedUnderlineLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
         findCaretLayer.backgroundColor = resolvedCGColor(.textColor)
         let buttonTint = resolvedNSColor(findInputController.text.isEmpty ? .tertiaryLabelColor : .secondaryLabelColor)
         findPreviousIconLayer.tintColor = buttonTint
@@ -1579,6 +1620,18 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 findSelectionLayer.isHidden = true
             }
 
+            if let range = findInputController.markedRange {
+                let lower = findTextX(for: range.lowerBound, font: font, textFrame: textFrame)
+                let upper = findTextX(for: range.upperBound, font: font, textFrame: textFrame)
+                findMarkedUnderlineLayer.frame = CGRect(x: textFrame.minX + min(lower, upper),
+                                                        y: textFrame.minY + 1,
+                                                        width: max(abs(upper - lower), 1),
+                                                        height: 2)
+                findMarkedUnderlineLayer.isHidden = false
+            } else {
+                findMarkedUnderlineLayer.isHidden = true
+            }
+
             let caretX = findTextX(for: findInputController.cursorPosition, font: font, textFrame: textFrame)
             findCaretLayer.frame = CGRect(x: textFrame.minX + caretX,
                                           y: textFrame.minY + 1,
@@ -2155,12 +2208,20 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineBreakMode = .byCharWrapping
             paragraph.lineSpacing = 2
-            attributedText = NSAttributedString(string: displayText,
-                                                attributes: [
-                                                    .font: textFont(),
-                                                    .foregroundColor: resolvedNSColor(.labelColor),
-                                                    .paragraphStyle: paragraph
-                                                ])
+            let updatedText = NSMutableAttributedString(string: displayText,
+                                                        attributes: [
+                                                            .font: textFont(),
+                                                            .foregroundColor: resolvedNSColor(.labelColor),
+                                                            .paragraphStyle: paragraph
+                                                        ])
+            if let markedRange = normalizedRange(markedTextRange),
+               markedRange.location + markedRange.length <= updatedText.length {
+                updatedText.addAttributes([
+                    .underlineStyle: NSUnderlineStyle.single.rawValue,
+                    .underlineColor: resolvedNSColor(.keyboardFocusIndicatorColor)
+                ], range: markedRange)
+            }
+            attributedText = updatedText
             contentStorage.attributedString = attributedText
             textContainer.size = CGSize(width: max(textLayoutWidth, 1), height: max(contentHeight() - textInsetY * 2, editorClipLayer.bounds.height))
             cursorOffset = clampedOffset(cursorOffset)
@@ -2390,6 +2451,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         return NSRange(location: lower, length: upper - lower)
     }
 
+    private func normalizedReplacementRange(_ range: NSRange) -> NSRange? {
+        normalizedRange(range) ?? (range.length == 0 ? NSRange(location: clampedOffset(range.location), length: 0) : nil)
+    }
+
     private func updateSelectionLayers(force: Bool = false) {
         _ = force
         withoutImplicitAnimations {
@@ -2555,6 +2620,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func setCursorOffset(_ offset: Int, modifySelection: Bool) {
+        clearMarkedTextState()
         let clamped = clampedOffset(offset)
         if modifySelection {
             if selectionAnchor == nil {
@@ -2572,27 +2638,82 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         updateEditingCapabilities()
     }
 
-    private func replace(range: NSRange, with replacement: String) {
-        guard let normalized = normalizedRange(range) ?? (range.length == 0 ? NSRange(location: clampedOffset(range.location), length: 0) : nil),
+    private func replace(range: NSRange, with replacement: String, scheduleSave shouldScheduleSave: Bool = true, clearsMarkedText: Bool = true) {
+        guard let normalized = normalizedReplacementRange(range),
               let swiftRange = Range(normalized, in: text) else {
             return
         }
         withoutImplicitAnimations {
+            if clearsMarkedText {
+                markedTextRange = nil
+                pendingMarkedTextReplacementRange = nil
+            }
             text.replaceSubrange(swiftRange, with: replacement)
             cursorOffset = normalized.location + (replacement as NSString).length
             selectionAnchor = nil
             updateTextContent(force: true)
             ensureCursorVisible()
-            scheduleSave()
+            if shouldScheduleSave {
+                scheduleSave()
+            }
         }
     }
 
     private func insertText(_ value: String) {
+        if let range = markedTextRange ?? pendingMarkedTextReplacementRange {
+            replace(range: range, with: value)
+            return
+        }
         if let selectionRange {
             replace(range: selectionRange, with: value)
             return
         }
         replace(range: NSRange(location: cursorOffset, length: 0), with: value)
+    }
+
+    private func setMarkedText(_ value: String,
+                               selectedLocation: Int,
+                               selectedLength: Int,
+                               hasReplacementRange: Bool,
+                               replacementLocation: Int,
+                               replacementLength: Int) {
+        let requestedRange = hasReplacementRange
+            ? NSRange(location: replacementLocation, length: replacementLength)
+            : (markedTextRange ?? selectionRange ?? NSRange(location: cursorOffset, length: 0))
+        guard let replacementRange = normalizedReplacementRange(requestedRange) else { return }
+
+        let markedLength = (value as NSString).length
+        markedTextRange = markedLength > 0 ? NSRange(location: replacementRange.location, length: markedLength) : nil
+        pendingMarkedTextReplacementRange = nil
+        replace(range: replacementRange, with: value, scheduleSave: false, clearsMarkedText: false)
+
+        let selectedLower = min(max(selectedLocation, 0), markedLength)
+        let selectedUpper = min(max(selectedLower + selectedLength, selectedLower), markedLength)
+        if selectedUpper > selectedLower {
+            selectionAnchor = replacementRange.location + selectedLower
+            cursorOffset = replacementRange.location + selectedUpper
+        } else {
+            selectionAnchor = nil
+            cursorOffset = replacementRange.location + selectedLower
+        }
+        ensureCursorVisible()
+        updateViewport()
+        updateSelectionLayers(force: true)
+        updateCursor()
+        updateEditingCapabilities()
+    }
+
+    private func unmarkText() {
+        pendingMarkedTextReplacementRange = markedTextRange
+        markedTextRange = nil
+        updateTextContent(force: true)
+        updateSelectionLayers(force: true)
+        updateCursor()
+    }
+
+    private func clearMarkedTextState() {
+        markedTextRange = nil
+        pendingMarkedTextReplacementRange = nil
     }
 
     private func deleteBackward() {
@@ -2689,6 +2810,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             scrollOffset = clampedScrollOffset(scrollOffset + editorClipLayer.bounds.height)
             updateViewport()
         case "selectAll":
+            clearMarkedTextState()
             selectionAnchor = 0
             cursorOffset = (text as NSString).length
             updateSelectionLayers(force: true)
@@ -2806,8 +2928,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let offset = textOffset(atRootPoint: point)
         dragAnchorOffset = offset
         if clickCount == 2 {
+            clearMarkedTextState()
             selectWord(at: offset)
         } else if clickCount >= 3 {
+            clearMarkedTextState()
             selectLine(at: offset)
         } else {
             setCursorOffset(offset, modifySelection: modifierFlags.contains(.shift))
@@ -2820,6 +2944,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
         guard let dragAnchorOffset else { return }
         let offset = textOffset(atRootPoint: point)
+        clearMarkedTextState()
         selectionAnchor = dragAnchorOffset
         cursorOffset = clampedOffset(offset)
         ensureCursorVisible()
