@@ -2455,6 +2455,41 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         normalizedRange(range) ?? (range.length == 0 ? NSRange(location: clampedOffset(range.location), length: 0) : nil)
     }
 
+    private func textLocation(forUTF16Offset offset: Int) -> (any NSTextLocation)? {
+        textLayoutManager.location(textLayoutManager.documentRange.location,
+                                   offsetBy: clampedOffset(offset))
+    }
+
+    private func utf16Offset(for location: any NSTextLocation) -> Int {
+        clampedOffset(textLayoutManager.offset(from: textLayoutManager.documentRange.location, to: location))
+    }
+
+    private func textRange(for range: NSRange) -> NSTextRange? {
+        let lower = clampedOffset(range.location)
+        let upper = clampedOffset(range.location + range.length)
+        guard let start = textLocation(forUTF16Offset: min(lower, upper)),
+              let end = textLocation(forUTF16Offset: max(lower, upper)) else {
+            return nil
+        }
+        return NSTextRange(location: start, end: end)
+    }
+
+    private func textSegmentRects(for range: NSRange, type: NSTextLayoutManager.SegmentType) -> [CGRect] {
+        guard let textRange = textRange(for: range) else { return [] }
+        textLayoutManager.ensureLayout(for: textRange)
+        var rects: [CGRect] = []
+        textLayoutManager.enumerateTextSegments(in: textRange, type: type, options: []) { _, rect, _, _ in
+            rects.append(rect)
+            return true
+        }
+        return rects
+    }
+
+    private func caretTopDownRect(for offset: Int) -> CGRect? {
+        let insertionRange = NSRange(location: clampedOffset(offset), length: 0)
+        return textSegmentRects(for: insertionRange, type: .standard).first
+    }
+
     private func updateSelectionLayers(force: Bool = false) {
         _ = force
         withoutImplicitAnimations {
@@ -2467,37 +2502,21 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             let selectionColor = resolvedCGColor(windowIsActive
                                                  ? NSColor.selectedTextBackgroundColor.withAlphaComponent(0.78)
                                                  : NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.78))
-            let textWidth = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
-            let contentHeight = max(self.contentHeight() - textInsetY * 2, editorClipLayer.bounds.height)
-            let selectionRect = expandedTextContentRect(containing: visibleTextContentRect(), contentHeight: contentHeight)
-            let metrics = visualLineMetrics(textWidth: textWidth)
-            guard !metrics.lines.isEmpty else { return }
+            let contentHeight = textSelectionLayer.bounds.height
+            let visibleRect = expandedTextContentRect(containing: visibleTextContentRect(), contentHeight: contentHeight)
 
-            let firstLine = max(Int(floor(max(selectionRect.minY, 0) / metrics.lineHeight)), 0)
-            let lastLine = min(Int(floor(max(selectionRect.maxY - 0.001, 0) / metrics.lineHeight)), metrics.lines.count - 1)
-            guard firstLine <= lastLine else { return }
-
-            for lineIndex in firstLine...lastLine {
-                let line = metrics.lines[lineIndex]
-                let intersection = NSIntersectionRange(selectionRange, line.range)
-                let selectsEmptyLine = line.range.length == 0 &&
-                    selectionRange.location <= line.range.location &&
-                    selectionRange.location + selectionRange.length > line.range.location
-                guard intersection.length > 0 || selectsEmptyLine else { continue }
-
-                let startColumn = selectsEmptyLine ? 0 : max(intersection.location - line.range.location, 0)
-                let selectedColumnCount = selectsEmptyLine ? 1 : max(intersection.length, 1)
-                let x = min(CGFloat(startColumn) * metrics.charWidth, textWidth)
-                let width = max(min(CGFloat(selectedColumnCount) * metrics.charWidth, textWidth - x), 1)
-                let topDownY = CGFloat(lineIndex) * metrics.lineHeight
-                let rect = CGRect(x: x, y: topDownY, width: width, height: metrics.lineHeight)
-                guard rect.intersects(selectionRect) else { continue }
+            for rect in textSegmentRects(for: selectionRange, type: .selection) {
+                guard rect.intersects(visibleRect) else { continue }
+                let normalizedRect = CGRect(x: rect.minX,
+                                            y: rect.minY,
+                                            width: max(rect.width, 1),
+                                            height: max(rect.height, 1))
 
                 let highlight = CALayer()
-                highlight.frame = CGRect(x: rect.minX,
-                                         y: textSelectionLayer.bounds.height - rect.maxY,
-                                         width: rect.width,
-                                         height: rect.height)
+                highlight.frame = CGRect(x: normalizedRect.minX,
+                                         y: contentHeight - normalizedRect.maxY,
+                                         width: normalizedRect.width,
+                                         height: normalizedRect.height)
                 highlight.backgroundColor = selectionColor
                 highlight.cornerRadius = 2
                 textSelectionLayer.addSublayer(highlight)
@@ -2507,25 +2526,17 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func cursorRect(for offset: Int) -> CGRect {
-        let metrics = visualLineMetrics()
-        guard !metrics.lines.isEmpty else {
-            return CGRect(x: 0, y: textSelectionLayer.bounds.height - metrics.lineHeight, width: cursorWidth, height: metrics.lineHeight)
+        guard let topDownRect = caretTopDownRect(for: offset) else {
+            let lineHeight = ceil(textFont().ascender - textFont().descender + textFont().leading + 2)
+            return CGRect(x: 0,
+                          y: textSelectionLayer.bounds.height - lineHeight,
+                          width: cursorWidth,
+                          height: lineHeight)
         }
-        var lineIndex = metrics.lines.firstIndex { line in
-            offset >= line.range.location && offset <= line.range.location + line.range.length
-        } ?? max(metrics.lines.count - 1, 0)
-        if offset == (text as NSString).length,
-           let lastIndex = metrics.lines.indices.last {
-            lineIndex = lastIndex
-        }
-        let line = metrics.lines[lineIndex]
-        let column = min(max(offset - line.range.location, 0), max(line.range.length, 0))
-        let x = min(CGFloat(column) * metrics.charWidth, metrics.textWidth)
-        let topDownY = CGFloat(lineIndex) * metrics.lineHeight
-        return CGRect(x: x,
-                      y: textSelectionLayer.bounds.height - topDownY - metrics.lineHeight,
+        return CGRect(x: topDownRect.minX,
+                      y: textSelectionLayer.bounds.height - topDownRect.maxY,
                       width: cursorWidth,
-                      height: metrics.lineHeight)
+                      height: max(topDownRect.height, 1))
     }
 
     private func updateCursor() {
@@ -2599,9 +2610,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func ensureCursorVisible() {
-        let metrics = visualLineMetrics()
-        let cursorTop = CGFloat(lineIndex(for: cursorOffset, metrics: metrics)) * metrics.lineHeight + textInsetY
-        let cursorBottom = cursorTop + metrics.lineHeight
+        guard let rect = caretTopDownRect(for: cursorOffset) else { return }
+        let cursorTop = rect.minY + textInsetY
+        let cursorBottom = rect.maxY + textInsetY
         if cursorTop < scrollOffset + 4 {
             scrollOffset = clampedScrollOffset(max(cursorTop - 4, 0))
         } else if cursorBottom > scrollOffset + editorClipLayer.bounds.height - 4 {
@@ -2850,13 +2861,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func moveVertical(delta: Int, modifySelection: Bool) {
-        let metrics = visualLineMetrics()
-        let currentLine = lineIndex(for: cursorOffset, metrics: metrics)
-        let line = metrics.lines[currentLine]
-        let column = cursorOffset - line.range.location
-        let targetLine = min(max(currentLine + delta, 0), metrics.lines.count - 1)
-        let target = metrics.lines[targetLine]
-        setCursorOffset(target.range.location + min(max(column, 0), target.range.length), modifySelection: modifySelection)
+        guard let rect = caretTopDownRect(for: cursorOffset) else { return }
+        let target = textOffset(atTextPoint: CGPoint(x: rect.minX, y: rect.midY + CGFloat(delta) * max(rect.height, 1)))
+        setCursorOffset(target, modifySelection: modifySelection)
     }
 
     private func previousWordBoundary(from offset: Int) -> Int {
@@ -3129,12 +3136,25 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func textOffset(atTextPoint textPoint: CGPoint) -> Int {
-        let metrics = visualLineMetrics()
-        guard !metrics.lines.isEmpty else { return 0 }
-        let lineIndex = min(max(Int(floor(max(textPoint.y, 0) / metrics.lineHeight)), 0), metrics.lines.count - 1)
-        let line = metrics.lines[lineIndex]
-        let column = min(max(Int(floor(max(textPoint.x, 0) / metrics.charWidth)), 0), line.range.length)
-        return clampedOffset(line.range.location + column)
+        let point = CGPoint(x: max(textPoint.x, 0), y: max(textPoint.y, 0))
+        textLayoutManager.ensureLayout(for: textLayoutManager.documentRange)
+        guard let fragment = textLayoutManager.textLayoutFragment(for: point) else {
+            return point.y <= 0 ? 0 : (text as NSString).length
+        }
+        let fragmentFrame = fragment.layoutFragmentFrame
+        let localY = point.y - fragmentFrame.minY
+        guard let line = fragment.textLineFragment(forVerticalOffset: localY, requiresExactMatch: false) else {
+            return utf16Offset(for: fragment.rangeInElement.location)
+        }
+
+        let fragmentStart = utf16Offset(for: fragment.rangeInElement.location)
+        let linePoint = CGPoint(x: point.x - fragmentFrame.minX - line.typographicBounds.minX,
+                                y: localY - line.typographicBounds.minY)
+        let localIndex = line.characterIndex(for: linePoint)
+        let lineLower = line.characterRange.location
+        let lineUpper = line.characterRange.location + line.characterRange.length
+        let clampedLocalIndex = min(max(localIndex, lineLower), lineUpper)
+        return clampedOffset(fragmentStart + clampedLocalIndex)
     }
 
     private func updateCursorShape(at point: CGPoint) {
