@@ -15,13 +15,16 @@ import QuartzCore
 
 private struct PlaintextConfiguration {
     let fileAPIPath: String
+    let filesAPIPath: String
 
     init?(data: Data) {
-        guard PlaintextBinary.version(in: data) == 1,
-              let fileAPIPath = PlaintextBinary.stringRef64(in: data, at: 4) else {
+        guard PlaintextBinary.version(in: data) == 2,
+              let fileAPIPath = PlaintextBinary.stringRef64(in: data, at: 4),
+              let filesAPIPath = PlaintextBinary.stringRef64(in: data, at: 20) else {
             return nil
         }
         self.fileAPIPath = fileAPIPath
+        self.filesAPIPath = filesAPIPath
     }
 }
 
@@ -138,6 +141,93 @@ private enum PlaintextBinary {
     }
 }
 
+private enum BinaryPayloadError: Error {
+    case outOfBounds
+    case invalidString
+}
+
+private struct BinaryPayloadReader {
+    let data: Data
+
+    func uint32(at offset: Int) throws -> UInt32 {
+        guard let value = PlaintextBinary.uint32(in: data, at: offset) else { throw BinaryPayloadError.outOfBounds }
+        return value
+    }
+
+    func uint64(at offset: Int) throws -> UInt64 {
+        guard let value = PlaintextBinary.uint64(in: data, at: offset) else { throw BinaryPayloadError.outOfBounds }
+        return value
+    }
+
+    func double(at offset: Int) throws -> Double {
+        Double(bitPattern: try uint64(at: offset))
+    }
+
+    func dataRef(at offset: Int) throws -> Data {
+        let start = Int(try uint32(at: offset))
+        let length = Int(try uint32(at: offset + 4))
+        guard start >= 0, length >= 0, start <= data.count, length <= data.count - start else {
+            throw BinaryPayloadError.outOfBounds
+        }
+        return Data(data[start..<(start + length)])
+    }
+
+    func stringRef(at offset: Int) throws -> String {
+        let bytes = try dataRef(at: offset)
+        guard !bytes.isEmpty else { return "" }
+        guard let string = String(data: bytes, encoding: .utf8) else {
+            throw BinaryPayloadError.invalidString
+        }
+        return string
+    }
+
+    func child(at offset: Int) throws -> BinaryPayloadReader {
+        BinaryPayloadReader(data: try dataRef(at: offset))
+    }
+}
+
+private struct FilePickerResponse {
+    let path: String
+    let parent: String
+    let entries: [FilePickerEntryRecord]
+
+    static func decodeBinary(_ data: Data) throws -> FilePickerResponse {
+        let reader = BinaryPayloadReader(data: data)
+        let count = Int(try reader.uint32(at: 16))
+        var entries: [FilePickerEntryRecord] = []
+        entries.reserveCapacity(count)
+        for index in 0..<count {
+            entries.append(try FilePickerEntryRecord.decodeBinary(try reader.child(at: 20 + index * 8)))
+        }
+        return FilePickerResponse(path: try reader.stringRef(at: 0),
+                                  parent: try reader.stringRef(at: 8),
+                                  entries: entries)
+    }
+}
+
+private struct FilePickerEntryRecord {
+    let name: String
+    let path: String
+    let isDirectory: Bool
+    let size: UInt64
+    let modified: Double
+
+    static func decodeBinary(_ reader: BinaryPayloadReader) throws -> FilePickerEntryRecord {
+        FilePickerEntryRecord(name: try reader.stringRef(at: 0),
+                              path: try reader.stringRef(at: 8),
+                              isDirectory: (try reader.uint32(at: 16) & 0x01) != 0,
+                              size: try reader.uint64(at: 20),
+                              modified: try reader.double(at: 28))
+    }
+}
+
+private struct PendingFilePicker {
+    var directory: String
+    var entries: [FilePickerEntryRecord]
+    var isLoading: Bool
+    var error: String
+}
+
 private struct EditorVisualLine {
     let range: NSRange
 }
@@ -205,6 +295,15 @@ private final class SymbolImageLayer: CALayer {
     var tintColor: NSColor = .labelColor {
         didSet { setNeedsDisplay() }
     }
+    var symbolPointSize: CGFloat = 9 {
+        didSet { setNeedsDisplay() }
+    }
+    var symbolWeight: NSFont.Weight = .medium {
+        didSet { setNeedsDisplay() }
+    }
+    var maxSymbolSize = CGSize(width: 10, height: 7) {
+        didSet { setNeedsDisplay() }
+    }
 
     init(symbolName: String, accessibilityTitle: String) {
         self.symbolName = symbolName
@@ -219,6 +318,9 @@ private final class SymbolImageLayer: CALayer {
             symbolName = layer.symbolName
             accessibilityTitle = layer.accessibilityTitle
             tintColor = layer.tintColor
+            symbolPointSize = layer.symbolPointSize
+            symbolWeight = layer.symbolWeight
+            maxSymbolSize = layer.maxSymbolSize
         } else {
             symbolName = "circle"
             accessibilityTitle = ""
@@ -236,9 +338,10 @@ private final class SymbolImageLayer: CALayer {
             return
         }
         image.isTemplate = true
-        let configuredImage = image.withSymbolConfiguration(.init(pointSize: 9, weight: .medium)) ?? image
+        let configuredImage = image.withSymbolConfiguration(.init(pointSize: symbolPointSize, weight: symbolWeight)) ?? image
         let imageSize = configuredImage.size
-        let maxSize = CGSize(width: min(bounds.width, 10), height: min(bounds.height, 7))
+        let maxSize = CGSize(width: min(bounds.width, maxSymbolSize.width),
+                             height: min(bounds.height, maxSymbolSize.height))
         let scale = min(maxSize.width / max(imageSize.width, 1),
                         maxSize.height / max(imageSize.height, 1))
         let iconSize = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
@@ -270,7 +373,7 @@ private enum PathPromptMode {
 }
 
 @MainActor
-private final class PlaintextHandler: NSObject, OuterframeHostDelegate, ScrollbarControllerDelegate {
+private final class PlaintextHandler: NSObject, OuterframeHostDelegate, ScrollbarControllerDelegate, SingleLineTextInputControllerDelegate {
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: PlaintextHandler?
@@ -285,6 +388,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private var urlSession: URLSession?
     private var fileEndpoint: URL?
+    private var filesEndpoint: URL?
     private var filePath = ""
     private var loadedModified: Double = 0
     private var loadedSize: UInt64 = 0
@@ -306,6 +410,24 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private let textContentLayer = CALayer()
     private let textSelectionLayer = CALayer()
     private let editorCaretLayer = CALayer()
+    private let filePickerOverlayLayer = CALayer()
+    private let filePickerListLayer = CALayer()
+    private let filePickerRowsContentLayer = CALayer()
+    private let filePickerStatusLayer = CALayer()
+    private let filePickerBreadcrumbLayer = CALayer()
+    private let findBarLayer = CALayer()
+    private let findFieldLayer = CALayer()
+    private let findTextLayer = CATextLayer()
+    private let findPlaceholderLayer = CATextLayer()
+    private let findSelectionLayer = CALayer()
+    private let findCaretLayer = CALayer()
+    private let findPreviousButtonLayer = CALayer()
+    private let findPreviousIconLayer = SymbolImageLayer(symbolName: "chevron.left", accessibilityTitle: "Find Previous")
+    private let findNextButtonLayer = CALayer()
+    private let findNextIconLayer = SymbolImageLayer(symbolName: "chevron.right", accessibilityTitle: "Find Next")
+    private let findStatusLayer = CATextLayer()
+    private let findDoneButtonLayer = CALayer()
+    private let findDoneTextLayer = CATextLayer()
 
     private let contentStorage = NSTextContentStorage()
     private let textLayoutManager = NSTextLayoutManager()
@@ -326,19 +448,60 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var selectionLayers: [CALayer] = []
     private var scrollOffset: CGFloat = 0
     private var scrollbarController: ScrollbarController<PlaintextHandler>?
+    private lazy var filePickerScrollbarDelegate = FilePickerScrollbarDelegate(owner: self)
+    private var filePickerScrollbarController: ScrollbarController<FilePickerScrollbarDelegate>?
     private var pathControlFrame = CGRect.zero
     private var pendingPathMenuIDs: Set<UUID> = []
+    private var pendingFindMenuIDs: Set<UUID> = []
     private var pathPromptMode: PathPromptMode?
     private var pathPromptText = ""
     private var pathPromptCursorOffset = 0
+    private var pendingFilePicker: PendingFilePicker?
+    private var filePickerPanelFrame = CGRect.zero
+    private var filePickerListFrame = CGRect.zero
+    private var filePickerBreadcrumbFrame = CGRect.zero
+    private var filePickerCancelFrame = CGRect.zero
+    private var filePickerOpenFrame = CGRect.zero
+    private var filePickerBreadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
+    private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntryRecord, index: Int)] = []
+    private var filePickerVisibleRowLayers: [Int: CALayer] = [:]
+    private var filePickerReusableRowLayers: [CALayer] = []
+    private var filePickerSelectedIndex: Int?
+    private var filePickerScroll: CGFloat = 0
+    private var filePickerContentHeight: CGFloat = 0
+    private var filePickerTypeaheadBuffer = ""
+    private var filePickerTypeaheadDeadline: Date?
+    private var filePickerFadeToken = UUID()
+    private var isFilePickerFadingOut = false
+    private lazy var findInputController: SingleLineTextInputController<PlaintextHandler> = {
+        let controller = SingleLineTextInputController<PlaintextHandler>(
+            identifier: findInputID,
+            acceptedPasteboardTypeIdentifiers: [NSPasteboard.PasteboardType.string.rawValue]
+        )
+        controller.delegate = self
+        controller.onSubmit = { [weak self] in
+            self?.findNext()
+        }
+        return controller
+    }()
+    private var isFindVisible = false
+    private var findMatches: [NSRange] = []
+    private var activeFindMatchIndex: Int?
+    private var findBarFrame = CGRect.zero
+    private var findFieldFrame = CGRect.zero
+    private var findPreviousButtonFrame = CGRect.zero
+    private var findNextButtonFrame = CGRect.zero
+    private var findDoneButtonFrame = CGRect.zero
     private var accessibilityNotificationScheduled = false
 
     private let editorInputID = UUID()
+    private let findInputID = UUID()
     private let headerHeight: CGFloat = 42
     private let textInsetX: CGFloat = 14
     private let textInsetY: CGFloat = 12
     private let textMeasurementHeight: CGFloat = 10_000_000
     private let scrollLineHeight: CGFloat = 18
+    private let filePickerRowHeight: CGFloat = 28
     private let cursorWidth: CGFloat = 1.5
     private let caretBlinkAnimationKey = "caretBlink"
 
@@ -374,28 +537,72 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             viewIsFocused = isFocused
             updateCursor()
         case .mouseDown(let point, let modifierFlags, let clickCount):
+            if modifierFlags.contains(.control) {
+                if pendingFilePicker != nil {
+                    _ = handleFilePickerMouseDown(point: point, clickCount: clickCount)
+                    return
+                }
+                handleRightMouseDown(point: point, clickCount: clickCount)
+                return
+            }
+            if pendingFilePicker != nil {
+                _ = handleFilePickerMouseDown(point: point, clickCount: clickCount)
+                _ = modifierFlags
+                return
+            }
             handleMouseDown(point: point, modifierFlags: modifierFlags, clickCount: clickCount)
         case .mouseDragged(let point, _):
+            if pendingFilePicker != nil {
+                _ = filePickerScrollbarController?.handleMouseDragged(to: filePickerListLayer.convert(rootLayer.convert(point, to: rootLayer), from: rootLayer))
+                return
+            }
             handleMouseDragged(point: point)
         case .mouseUp(let point, _):
+            if pendingFilePicker != nil {
+                _ = filePickerScrollbarController?.handleMouseUp(at: filePickerListLayer.convert(rootLayer.convert(point, to: rootLayer), from: rootLayer))
+                return
+            }
             _ = scrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: editorClipLayer))
             dragAnchorOffset = nil
         case .mouseMoved(let point, _):
             updateCursorShape(at: point)
         case .rightMouseDown(let point, _, let clickCount):
+            if pendingFilePicker != nil {
+                _ = handleFilePickerMouseDown(point: point, clickCount: clickCount)
+                return
+            }
             handleRightMouseDown(point: point, clickCount: clickCount)
         case .keyDown(_, let characters, let charactersIgnoringModifiers, let modifierFlags, _):
+            if pendingFilePicker != nil,
+               handleFilePickerKeyDown(characters: characters,
+                                       charactersIgnoringModifiers: charactersIgnoringModifiers,
+                                       modifierFlags: modifierFlags) {
+                return
+            }
             handleKeyDown(characters: characters,
                           charactersIgnoringModifiers: charactersIgnoringModifiers,
                           modifierFlags: modifierFlags)
         case .scrollWheelEvent(let point, let delta, _, _, _, let precise):
-            if editorClipLayer.frame.contains(rootLayer.convert(point, to: rootLayer)) {
+            let rootPoint = rootLayer.convert(point, to: rootLayer)
+            if pendingFilePicker != nil, filePickerListFrame.contains(rootPoint) {
+                setFilePickerScroll(filePickerScroll - delta.y * (precise ? 1 : filePickerRowHeight))
+            } else if editorClipLayer.frame.contains(rootPoint) {
                 scrollOffset = clampedScrollOffset(scrollOffset - delta.y * (precise ? 1 : scrollLineHeight))
                 updateViewport()
                 updateCursor()
             }
         case .textInput(let input, let hasReplacementRange, let replacementLocation, let replacementLength):
-            if pathPromptMode != nil {
+            if pendingFilePicker != nil {
+                _ = input
+            } else if findInputController.isFocused {
+                if hasReplacementRange {
+                    let lower = min(max(Int(replacementLocation), 0), findInputController.text.count)
+                    let upper = min(max(lower + Int(replacementLength), lower), findInputController.text.count)
+                    findInputController.replaceText(range: lower..<upper, with: input)
+                } else {
+                    findInputController.insertText(input)
+                }
+            } else if pathPromptMode != nil {
                 if hasReplacementRange {
                     replacePathPromptText(range: NSRange(location: Int(replacementLocation),
                                                          length: Int(replacementLength)),
@@ -409,14 +616,21 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 insertText(input)
             }
         case .textCommand(let command):
-            if pathPromptMode != nil {
+            if pendingFilePicker != nil {
+                _ = command
+            } else if findInputController.isFocused {
+                performFindTextCommand(command)
+            } else if pathPromptMode != nil {
                 performPathPromptTextCommand(command)
             } else {
                 performTextCommand(command)
             }
         case .setCursorPosition(let fieldID, let position, let modifySelection):
-            guard fieldID == editorInputID else { return }
-            if pathPromptMode != nil {
+            if fieldID == findInputID {
+                findInputController.setCursorPosition(Int(position), modifySelection: modifySelection)
+            } else if fieldID != editorInputID {
+                return
+            } else if pathPromptMode != nil {
                 let textLength = (pathPromptText as NSString).length
                 pathPromptCursorOffset = min(max(Int(position), 0), textLength)
                 layout()
@@ -433,17 +647,20 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 enabledCommands: enabledEditCommands(in: commands)
             )
         case .pasteboardContentPasted(let items):
-            if pathPromptMode != nil {
+            if pendingFilePicker != nil {
+                _ = items
+            } else if pathPromptMode != nil {
                 pastePathPrompt(items)
             } else {
                 paste(items)
             }
         case .pasteboardDropHitTestRequest(let requestID, let point, let pasteboardTypes, let operationMask, _):
-            let accepts = isPointInEditor(point) && pasteboardTypes.contains(NSPasteboard.PasteboardType.string.rawValue)
+            let accepts = pendingFilePicker == nil && isPointInEditor(point) && pasteboardTypes.contains(NSPasteboard.PasteboardType.string.rawValue)
             outerframeHost.sendPasteboardDropHitTestResponse(requestID: requestID,
                                                              operationMask: accepts ? NSDragOperation.copy : [])
             _ = operationMask
         case .pasteboardContentDropped(let point, let items):
+            guard pendingFilePicker == nil else { return }
             let offset = textOffset(atRootPoint: point)
             setCursorOffset(offset, modifySelection: false)
             paste(items)
@@ -493,8 +710,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
            let configuration = PlaintextConfiguration(data: data),
            let base = outerframeHost.pluginBaseURL() {
             fileEndpoint = URL(string: configuration.fileAPIPath, relativeTo: base)?.absoluteURL
+            filesEndpoint = URL(string: configuration.filesAPIPath, relativeTo: base)?.absoluteURL
         } else if let base = outerframeHost.pluginBaseURL() {
             fileEndpoint = URL(string: "/api/file", relativeTo: base)?.absoluteURL
+            filesEndpoint = URL(string: "/api/files", relativeTo: base)?.absoluteURL
         }
         filePath = filePath(from: arguments.url) ?? ""
 
@@ -532,10 +751,45 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         rootLayer.addSublayer(backgroundLayer)
         rootLayer.addSublayer(headerLayer)
         rootLayer.addSublayer(editorClipLayer)
+        rootLayer.addSublayer(filePickerOverlayLayer)
         headerLayer.addSublayer(toolbarDividerLayer)
         headerLayer.addSublayer(pathChevronLayer)
         headerLayer.addSublayer(pathPromptCursorLayer)
+        headerLayer.addSublayer(findBarLayer)
         pathPromptCursorLayer.zPosition = 10
+        findBarLayer.zPosition = 20
+        findBarLayer.isHidden = true
+        findBarLayer.addSublayer(findFieldLayer)
+        findBarLayer.addSublayer(findPreviousButtonLayer)
+        findBarLayer.addSublayer(findNextButtonLayer)
+        findBarLayer.addSublayer(findStatusLayer)
+        findBarLayer.addSublayer(findDoneButtonLayer)
+        findFieldLayer.addSublayer(findSelectionLayer)
+        findFieldLayer.addSublayer(findPlaceholderLayer)
+        findFieldLayer.addSublayer(findTextLayer)
+        findFieldLayer.addSublayer(findCaretLayer)
+        findPreviousButtonLayer.addSublayer(findPreviousIconLayer)
+        findNextButtonLayer.addSublayer(findNextIconLayer)
+        findDoneButtonLayer.addSublayer(findDoneTextLayer)
+        findPreviousButtonLayer.cornerRadius = 5
+        findNextButtonLayer.cornerRadius = 5
+        findDoneButtonLayer.cornerRadius = 5
+        findPreviousButtonLayer.borderWidth = 1
+        findNextButtonLayer.borderWidth = 1
+        findDoneButtonLayer.borderWidth = 1
+        findPreviousButtonLayer.masksToBounds = true
+        findNextButtonLayer.masksToBounds = true
+        findDoneButtonLayer.masksToBounds = true
+        findPreviousIconLayer.symbolPointSize = 13
+        findNextIconLayer.symbolPointSize = 13
+        findPreviousIconLayer.symbolWeight = .semibold
+        findNextIconLayer.symbolWeight = .semibold
+        findPreviousIconLayer.maxSymbolSize = CGSize(width: 12, height: 14)
+        findNextIconLayer.maxSymbolSize = CGSize(width: 12, height: 14)
+        findSelectionLayer.isHidden = true
+        findSelectionLayer.cornerRadius = 2
+        findCaretLayer.isHidden = true
+        findCaretLayer.zPosition = 10
         editorClipLayer.addSublayer(textContentLayer)
         textContentLayer.addSublayer(textSelectionLayer)
         textContentLayer.addSublayer(editorCaretLayer)
@@ -543,18 +797,36 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         editorCaretLayer.isHidden = true
 
         editorClipLayer.masksToBounds = true
-        for textLayer in [pathLayer, statusLayer] {
+        filePickerOverlayLayer.isHidden = false
+        filePickerOverlayLayer.opacity = 0
+        filePickerOverlayLayer.zPosition = 100
+        filePickerListLayer.masksToBounds = true
+        filePickerBreadcrumbLayer.masksToBounds = true
+        for textLayer in [pathLayer, statusLayer, findTextLayer, findPlaceholderLayer, findStatusLayer] {
             textLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
             textLayer.truncationMode = .middle
             textLayer.alignmentMode = .left
-            headerLayer.addSublayer(textLayer)
         }
+        headerLayer.addSublayer(pathLayer)
+        headerLayer.addSublayer(statusLayer)
+        findTextLayer.truncationMode = .end
+        findPlaceholderLayer.truncationMode = .end
+        findDoneTextLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        findDoneTextLayer.alignmentMode = .center
+        findDoneTextLayer.truncationMode = .end
+        findDoneTextLayer.string = "Done"
 
         scrollbarController = ScrollbarController(appConnection: outerframeHost,
                                                   viewportLayer: editorClipLayer,
                                                   appearance: appearance,
                                                   scrollOffsetOrigin: .bottom)
         scrollbarController?.delegate = self
+        filePickerScrollbarController = ScrollbarController(appConnection: outerframeHost,
+                                                            viewportLayer: filePickerListLayer,
+                                                            appearance: appearance,
+                                                            width: 8,
+                                                            inset: 4)
+        filePickerScrollbarController?.delegate = filePickerScrollbarDelegate
         updateColors()
         layout()
     }
@@ -569,8 +841,29 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         pathChevronLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
         pathPromptCursorLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
         editorCaretLayer.backgroundColor = resolvedCGColor(.textColor)
+        findBarLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        findFieldLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+        findFieldLayer.borderColor = resolvedCGColor(findInputController.isFocused ? .keyboardFocusIndicatorColor : .separatorColor)
+        findTextLayer.foregroundColor = resolvedCGColor(.labelColor)
+        findPlaceholderLayer.foregroundColor = resolvedCGColor(.placeholderTextColor)
+        findStatusLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
+        findDoneTextLayer.foregroundColor = resolvedCGColor(.labelColor)
+        findSelectionLayer.backgroundColor = resolvedCGColor(.selectedTextBackgroundColor)
+        findCaretLayer.backgroundColor = resolvedCGColor(.textColor)
+        let buttonTint = resolvedNSColor(findInputController.text.isEmpty ? .tertiaryLabelColor : .secondaryLabelColor)
+        findPreviousIconLayer.tintColor = buttonTint
+        findNextIconLayer.tintColor = buttonTint
+        findPreviousButtonLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+        findNextButtonLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+        findDoneButtonLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+        findPreviousButtonLayer.borderColor = resolvedCGColor(.separatorColor)
+        findNextButtonLayer.borderColor = resolvedCGColor(.separatorColor)
+        findDoneButtonLayer.borderColor = resolvedCGColor(.separatorColor)
         scrollbarController?.updateAppearance(appearance)
+        filePickerScrollbarController?.updateAppearance(appearance)
         updateSelectionLayers(force: true)
+        updateFindDisplay()
+        renderFilePicker()
     }
 
     private func withEffectiveAppearance(_ body: () -> Void) {
@@ -634,6 +927,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                        y: textY + 1,
                                        width: max(currentSize.width - pathChevronLayer.frame.maxX - 18, 1),
                                        height: 17)
+            layoutFindBar()
             if isPrompting {
                 let cursorX = pathLayer.frame.minX + pathPromptCursorX(font: pathFont, maxWidth: pathLayer.frame.width)
                 pathPromptCursorLayer.frame = CGRect(x: cursorX, y: textY, width: cursorWidth, height: 17)
@@ -644,8 +938,570 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 stopBlinkingCaret(pathPromptCursorLayer)
             }
             layoutText()
+            renderFilePicker()
         }
         notifyAccessibilityLayoutChanged()
+    }
+
+    private func layoutFindBar() {
+        let desiredWidth = min(max(currentSize.width * 0.48, 330), 470)
+        let width = min(desiredWidth, max(currentSize.width - 20, 1))
+        findBarFrame = CGRect(x: max(currentSize.width - width - 10, 10),
+                              y: 7,
+                              width: width,
+                              height: 28)
+        findBarLayer.frame = findBarFrame
+        findBarLayer.isHidden = !isFindVisible
+
+        let statusWidth: CGFloat = 54
+        let doneWidth: CGFloat = 54
+        let buttonSize: CGFloat = 26
+        let buttonGap: CGFloat = 4
+        let buttonsWidth = buttonSize * 2 + buttonGap
+        findFieldFrame = CGRect(x: 0,
+                                y: 0,
+                                width: max(findBarFrame.width - statusWidth - buttonsWidth - doneWidth - 24, 80),
+                                height: 28)
+        findFieldLayer.frame = findFieldFrame
+        findFieldLayer.cornerRadius = 6
+        findFieldLayer.borderWidth = findInputController.isFocused ? 1.5 : 1
+        findPreviousButtonFrame = CGRect(x: findFieldFrame.maxX + 6, y: 1, width: buttonSize, height: buttonSize)
+        findNextButtonFrame = CGRect(x: findPreviousButtonFrame.maxX + buttonGap, y: 1, width: buttonSize, height: buttonSize)
+        findPreviousButtonLayer.frame = findPreviousButtonFrame
+        findNextButtonLayer.frame = findNextButtonFrame
+        findPreviousIconLayer.frame = findPreviousButtonLayer.bounds
+        findNextIconLayer.frame = findNextButtonLayer.bounds
+        findStatusLayer.frame = CGRect(x: findNextButtonFrame.maxX + 7, y: 6, width: statusWidth, height: 16)
+        findDoneButtonFrame = CGRect(x: findStatusLayer.frame.maxX + 7, y: 1, width: doneWidth, height: buttonSize)
+        findDoneButtonLayer.frame = findDoneButtonFrame
+        findDoneTextLayer.frame = CGRect(x: 6, y: 6, width: max(doneWidth - 12, 1), height: 16)
+        updateFindDisplay()
+    }
+
+    private func makeTextLayer(size: CGFloat,
+                               weight: NSFont.Weight,
+                               color: NSColor,
+                               alignment: CATextLayerAlignmentMode = .left) -> CATextLayer {
+        let layer = CATextLayer()
+        layer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+        layer.font = NSFont.systemFont(ofSize: size, weight: weight)
+        layer.fontSize = size
+        layer.foregroundColor = resolvedCGColor(color)
+        layer.truncationMode = .middle
+        layer.alignmentMode = alignment
+        return layer
+    }
+
+    private func makeButtonLayer(title: String, emphasized: Bool) -> CALayer {
+        let layer = CALayer()
+        layer.cornerRadius = 6
+        layer.masksToBounds = true
+        layer.backgroundColor = resolvedCGColor(emphasized ? .controlAccentColor : .controlBackgroundColor)
+        layer.borderWidth = emphasized ? 0 : 1
+        layer.borderColor = resolvedCGColor(.separatorColor)
+        let text = makeTextLayer(size: 12,
+                                 weight: .semibold,
+                                 color: emphasized ? .white : .labelColor,
+                                 alignment: .center)
+        text.string = title
+        text.frame = CGRect(x: 6, y: 7, width: 58, height: 16)
+        layer.addSublayer(text)
+        return layer
+    }
+
+    private func renderFilePicker() {
+        guard let picker = pendingFilePicker else {
+            guard !isFilePickerFadingOut else { return }
+            setFilePickerOverlayOpacity(0)
+            filePickerOverlayLayer.isHidden = false
+            filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            filePickerEntryFrames.removeAll()
+            return
+        }
+
+        withoutImplicitAnimations {
+            renderFilePickerContents(picker)
+        }
+    }
+
+    private func renderFilePickerContents(_ picker: PendingFilePicker) {
+        filePickerOverlayLayer.isHidden = false
+        filePickerOverlayLayer.frame = rootLayer.bounds
+        filePickerOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
+        filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+
+        let width = rootLayer.bounds.width
+        let height = rootLayer.bounds.height
+        let panelWidth = min(max(width - 48, 460), 760)
+        let panelHeight = min(max(height - 48, 340), 540)
+        let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
+                                y: floor((height - panelHeight) / 2),
+                                width: panelWidth,
+                                height: panelHeight)
+        filePickerPanelFrame = panelFrame
+
+        let panel = CALayer()
+        panel.frame = panelFrame
+        panel.cornerRadius = 8
+        panel.borderWidth = 1
+        panel.borderColor = resolvedCGColor(.separatorColor)
+        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        filePickerOverlayLayer.addSublayer(panel)
+
+        let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
+        title.string = "Open File"
+        title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
+        panel.addSublayer(title)
+
+        let breadcrumbFrame = CGRect(x: 18,
+                                     y: panelHeight - 78,
+                                     width: panelWidth - 36,
+                                     height: FilePickerBreadcrumbBar.height)
+        filePickerBreadcrumbFrame = breadcrumbFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        filePickerBreadcrumbLayer.frame = breadcrumbFrame
+        FilePickerBreadcrumbBar.render(path: picker.directory,
+                                       in: filePickerBreadcrumbLayer,
+                                       segmentFrames: &filePickerBreadcrumbSegmentFrames,
+                                       appearance: appearance)
+        panel.addSublayer(filePickerBreadcrumbLayer)
+
+        let bottomControlsHeight: CGFloat = 72
+        let listFrame = CGRect(x: 18,
+                               y: bottomControlsHeight,
+                               width: panelWidth - 36,
+                               height: max(breadcrumbFrame.minY - bottomControlsHeight - 12, 80))
+        filePickerListFrame = listFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        filePickerListLayer.frame = listFrame
+        filePickerListLayer.cornerRadius = 6
+        filePickerListLayer.borderWidth = 1
+        filePickerListLayer.borderColor = resolvedCGColor(.separatorColor)
+        filePickerListLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.35))
+        panel.addSublayer(filePickerListLayer)
+
+        if filePickerRowsContentLayer.superlayer !== filePickerListLayer {
+            filePickerListLayer.addSublayer(filePickerRowsContentLayer)
+        }
+        if filePickerStatusLayer.superlayer !== filePickerListLayer {
+            filePickerListLayer.addSublayer(filePickerStatusLayer)
+        }
+        filePickerStatusLayer.frame = filePickerListLayer.bounds
+        filePickerStatusLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+
+        filePickerContentHeight = CGFloat(picker.entries.count) * filePickerRowHeight
+        filePickerScroll = min(max(filePickerScroll, 0), max(filePickerContentHeight - listFrame.height, 0))
+        if picker.isLoading {
+            resetFilePickerRowLayers()
+            let loading = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor, alignment: .center)
+            loading.string = "Loading..."
+            loading.frame = CGRect(x: 0, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width, height: 18)
+            filePickerStatusLayer.addSublayer(loading)
+        } else if !picker.error.isEmpty {
+            resetFilePickerRowLayers()
+            let message = makeTextLayer(size: 12, weight: .regular, color: .systemRed, alignment: .center)
+            message.string = picker.error
+            message.frame = CGRect(x: 10, y: max((listFrame.height - 18) / 2, 0), width: listFrame.width - 20, height: 18)
+            filePickerStatusLayer.addSublayer(message)
+        } else {
+            updateFilePickerVisibleRows(rebuild: true)
+        }
+        updateFilePickerScrollbarLayout()
+
+        let openLocal = CGRect(x: panelWidth - 84, y: 28, width: 66, height: 30)
+        let cancelLocal = CGRect(x: openLocal.minX - 78, y: 28, width: 70, height: 30)
+        filePickerOpenFrame = openLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        filePickerCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        let cancel = makeButtonLayer(title: "Cancel", emphasized: false)
+        cancel.frame = cancelLocal
+        panel.addSublayer(cancel)
+        let open = makeButtonLayer(title: "Open", emphasized: true)
+        open.frame = openLocal
+        panel.addSublayer(open)
+    }
+
+    private func setFilePickerOverlayOpacity(_ opacity: Float) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        filePickerOverlayLayer.opacity = opacity
+        CATransaction.commit()
+    }
+
+    private func animateFilePickerOverlayOpacity(to targetOpacity: Float, from startOpacity: Float? = nil) {
+        let startOpacity = startOpacity ?? filePickerOverlayLayer.presentation()?.opacity ?? filePickerOverlayLayer.opacity
+        setFilePickerOverlayOpacity(targetOpacity)
+
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = startOpacity
+        animation.toValue = targetOpacity
+        animation.duration = 0.14
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        filePickerOverlayLayer.add(animation, forKey: "filePickerOpacity")
+    }
+
+    private func prepareFilePickerOverlayForPresentation(animated: Bool) {
+        filePickerFadeToken = UUID()
+        isFilePickerFadingOut = false
+        filePickerOverlayLayer.removeAnimation(forKey: "filePickerOpacity")
+        if animated {
+            setFilePickerOverlayOpacity(0)
+        } else {
+            setFilePickerOverlayOpacity(1)
+        }
+    }
+
+    private func fadeInFilePickerOverlayIfNeeded(_ animated: Bool) {
+        guard animated else { return }
+        animateFilePickerOverlayOpacity(to: 1, from: 0)
+    }
+
+    private func fadeOutAndHideFilePickerOverlay() {
+        let token = UUID()
+        filePickerFadeToken = token
+        isFilePickerFadingOut = true
+        filePickerOverlayLayer.removeAnimation(forKey: "filePickerOpacity")
+        animateFilePickerOverlayOpacity(to: 0)
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 160_000_000)
+            guard let self,
+                  self.filePickerFadeToken == token,
+                  self.pendingFilePicker == nil else { return }
+            withoutImplicitAnimations {
+                self.isFilePickerFadingOut = false
+                self.filePickerOverlayLayer.isHidden = false
+                self.filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+                self.filePickerOverlayLayer.opacity = 0
+                self.filePickerEntryFrames.removeAll()
+            }
+        }
+    }
+
+    private func makeFilePickerRowLayer() -> CALayer {
+        let row = CALayer()
+        row.addSublayer(SymbolImageLayer(symbolName: "doc", accessibilityTitle: "File"))
+        row.addSublayer(makeTextLayer(size: 12, weight: .regular, color: .labelColor))
+        return row
+    }
+
+    private func configureFilePickerRowLayer(_ row: CALayer,
+                                             entry: FilePickerEntryRecord,
+                                             index: Int,
+                                             frame: CGRect) {
+        row.frame = frame
+        let isSelected = filePickerSelectedIndex == index
+        row.backgroundColor = isSelected ? resolvedCGColor(.selectedContentBackgroundColor) : nil
+        if row.sublayers?.count != 2 {
+            row.sublayers?.forEach { $0.removeFromSuperlayer() }
+            row.addSublayer(SymbolImageLayer(symbolName: "doc", accessibilityTitle: "File"))
+            row.addSublayer(makeTextLayer(size: 12, weight: .regular, color: .labelColor))
+        }
+        if let icon = row.sublayers?[0] as? SymbolImageLayer {
+            icon.symbolName = entry.isDirectory ? "folder" : "doc"
+            icon.accessibilityTitle = entry.isDirectory ? "Folder" : "File"
+            icon.tintColor = isSelected ? .white : .secondaryLabelColor
+            icon.frame = CGRect(x: 22, y: 6, width: 16, height: 16)
+        }
+        if let name = row.sublayers?[1] as? CATextLayer {
+            name.string = entry.name
+            name.foregroundColor = resolvedCGColor(isSelected ? .white : .labelColor)
+            name.frame = CGRect(x: 58, y: 6, width: max(frame.width - 70, 1), height: 16)
+        }
+    }
+
+    private func resetFilePickerRowLayers() {
+        withoutImplicitAnimations {
+            filePickerRowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            filePickerVisibleRowLayers.removeAll()
+            filePickerReusableRowLayers.removeAll()
+            filePickerEntryFrames.removeAll()
+            filePickerRowsContentLayer.frame = CGRect(origin: .zero,
+                                                      size: CGSize(width: filePickerListLayer.bounds.width,
+                                                                   height: 0))
+        }
+    }
+
+    fileprivate func setFilePickerScroll(_ value: CGFloat) {
+        let maxScroll = max(filePickerContentHeight - filePickerListFrame.height, 0)
+        let clamped = min(max(value, 0), maxScroll)
+        guard abs(clamped - filePickerScroll) > 0.001 else {
+            updateFilePickerScrollbarLayout()
+            return
+        }
+        filePickerScroll = clamped
+        updateFilePickerVisibleRows(rebuild: false)
+    }
+
+    private func updateFilePickerVisibleRows(rebuild: Bool) {
+        guard let picker = pendingFilePicker else {
+            resetFilePickerRowLayers()
+            return
+        }
+
+        let entries = picker.isLoading || !picker.error.isEmpty ? [] : picker.entries
+        let viewportHeight = max(filePickerListLayer.bounds.height, 0)
+        let viewportWidth = max(filePickerListLayer.bounds.width, 1)
+        filePickerContentHeight = CGFloat(entries.count) * filePickerRowHeight
+        filePickerScroll = min(max(filePickerScroll, 0), max(filePickerContentHeight - viewportHeight, 0))
+
+        withoutImplicitAnimations {
+            filePickerEntryFrames.removeAll()
+            let contentY = viewportHeight - filePickerContentHeight + filePickerScroll
+            filePickerRowsContentLayer.frame = CGRect(x: 0,
+                                                      y: contentY,
+                                                      width: viewportWidth,
+                                                      height: max(filePickerContentHeight, 0))
+            guard !entries.isEmpty, viewportHeight > 0 else {
+                resetFilePickerRowLayers()
+                return
+            }
+
+            let visibleStart = max(Int(floor(filePickerScroll / filePickerRowHeight)), 0)
+            let visibleEnd = min(entries.count, visibleStart + Int(ceil(viewportHeight / filePickerRowHeight)) + 2)
+            let visibleRange = visibleStart..<visibleEnd
+
+            for index in filePickerVisibleRowLayers.keys.filter({ !visibleRange.contains($0) }) {
+                if let layer = filePickerVisibleRowLayers.removeValue(forKey: index) {
+                    layer.removeFromSuperlayer()
+                    filePickerReusableRowLayers.append(layer)
+                }
+            }
+
+            for index in visibleRange {
+                let row: CALayer
+                if let existing = filePickerVisibleRowLayers[index] {
+                    row = existing
+                } else if let reusable = filePickerReusableRowLayers.popLast() {
+                    row = reusable
+                    filePickerRowsContentLayer.addSublayer(row)
+                    filePickerVisibleRowLayers[index] = row
+                } else {
+                    row = makeFilePickerRowLayer()
+                    filePickerRowsContentLayer.addSublayer(row)
+                    filePickerVisibleRowLayers[index] = row
+                }
+                let rowFrame = CGRect(x: 0,
+                                      y: filePickerContentHeight - CGFloat(index + 1) * filePickerRowHeight,
+                                      width: viewportWidth,
+                                      height: filePickerRowHeight)
+                configureFilePickerRowLayer(row, entry: entries[index], index: index, frame: rowFrame)
+                let visibleFrame = rowFrame.offsetBy(dx: filePickerRowsContentLayer.frame.minX,
+                                                     dy: filePickerRowsContentLayer.frame.minY)
+                filePickerEntryFrames.append((visibleFrame.offsetBy(dx: filePickerListFrame.minX,
+                                                                    dy: filePickerListFrame.minY),
+                                              entries[index],
+                                              index))
+            }
+        }
+        updateFilePickerScrollbarLayout()
+        _ = rebuild
+    }
+
+    private func updateFilePickerScrollbarLayout() {
+        filePickerScrollbarController?.updateLayout(metrics: ScrollbarController.Metrics(viewportSize: filePickerListLayer.bounds.size,
+                                                                                         contentHeight: filePickerContentHeight,
+                                                                                         scrollOffset: filePickerScroll))
+    }
+
+    private func showOpenFilePicker() {
+        cancelPathPrompt()
+        let shouldAnimate = pendingFilePicker == nil || filePickerOverlayLayer.isHidden
+        prepareFilePickerOverlayForPresentation(animated: shouldAnimate)
+        let directory: String
+        if filePath.isEmpty {
+            directory = "~"
+        } else {
+            let parent = (filePath as NSString).deletingLastPathComponent
+            directory = parent.isEmpty ? "~" : parent
+        }
+        pendingFilePicker = PendingFilePicker(directory: directory,
+                                              entries: [],
+                                              isLoading: true,
+                                              error: "")
+        filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
+        renderFilePicker()
+        fadeInFilePickerOverlayIfNeeded(shouldAnimate)
+        fetchFilePickerDirectory(path: directory)
+    }
+
+    private func fetchFilePickerDirectory(path: String) {
+        guard let filesEndpoint, let urlSession else { return }
+        pendingFilePicker?.directory = path
+        pendingFilePicker?.entries = []
+        pendingFilePicker?.isLoading = true
+        pendingFilePicker?.error = ""
+        filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
+        renderFilePicker()
+
+        var components = URLComponents(url: filesEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else {
+            pendingFilePicker?.isLoading = false
+            pendingFilePicker?.error = "Could not build file request."
+            renderFilePicker()
+            return
+        }
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
+            Task { @MainActor in
+                guard let self, self.pendingFilePicker != nil else { return }
+                self.pendingFilePicker?.isLoading = false
+                if let error {
+                    self.pendingFilePicker?.error = error.localizedDescription
+                    self.renderFilePicker()
+                    return
+                }
+                guard let data else {
+                    self.pendingFilePicker?.error = "No directory response."
+                    self.renderFilePicker()
+                    return
+                }
+                do {
+                    let response = try FilePickerResponse.decodeBinary(data)
+                    self.pendingFilePicker?.directory = response.path
+                    self.pendingFilePicker?.entries = response.entries
+                    self.filePickerSelectedIndex = nil
+                } catch {
+                    self.pendingFilePicker?.error = "Could not decode directory."
+                }
+                self.renderFilePicker()
+            }
+        }.resume()
+    }
+
+    private func dismissFilePicker() {
+        pendingFilePicker = nil
+        filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
+        fadeOutAndHideFilePickerOverlay()
+    }
+
+    private func activateFilePickerEntry(_ entry: FilePickerEntryRecord) {
+        if entry.isDirectory {
+            fetchFilePickerDirectory(path: entry.path)
+        } else {
+            dismissFilePicker()
+            openPath(entry.path)
+        }
+    }
+
+    private func activateSelectedFilePickerEntry() {
+        guard let selectedIndex = filePickerSelectedIndex,
+              let entries = pendingFilePicker?.entries,
+              entries.indices.contains(selectedIndex) else { return }
+        activateFilePickerEntry(entries[selectedIndex])
+    }
+
+    private func moveFilePickerSelection(delta: Int) {
+        guard let entries = pendingFilePicker?.entries, !entries.isEmpty else { return }
+        let nextIndex = min(max((filePickerSelectedIndex ?? (delta > 0 ? -1 : entries.count)) + delta, 0), entries.count - 1)
+        selectFilePickerIndex(nextIndex)
+    }
+
+    private func selectFilePickerIndex(_ index: Int) {
+        guard let entries = pendingFilePicker?.entries, entries.indices.contains(index) else { return }
+        filePickerSelectedIndex = index
+        ensureFilePickerSelectionVisible()
+        updateFilePickerVisibleRows(rebuild: true)
+    }
+
+    private func ensureFilePickerSelectionVisible() {
+        guard let selectedIndex = filePickerSelectedIndex else { return }
+        let rowTop = CGFloat(selectedIndex) * filePickerRowHeight
+        let viewportHeight = max(filePickerListFrame.height, 1)
+        if rowTop < filePickerScroll {
+            filePickerScroll = rowTop
+        } else if rowTop + filePickerRowHeight > filePickerScroll + viewportHeight {
+            filePickerScroll = rowTop + filePickerRowHeight - viewportHeight
+        }
+    }
+
+    private func resetFilePickerTypeahead() {
+        filePickerTypeaheadBuffer = ""
+        filePickerTypeaheadDeadline = nil
+    }
+
+    private func handleFilePickerTypeahead(_ text: String) {
+        let now = Date()
+        if let deadline = filePickerTypeaheadDeadline, deadline < now {
+            filePickerTypeaheadBuffer = ""
+        }
+        filePickerTypeaheadDeadline = now.addingTimeInterval(1.0)
+        filePickerTypeaheadBuffer += text.lowercased()
+        guard let entries = pendingFilePicker?.entries, !filePickerTypeaheadBuffer.isEmpty else { return }
+        let start = (filePickerSelectedIndex ?? -1) + 1
+        let split = min(max(start, 0), entries.count)
+        let ordered = Array(entries.indices.dropFirst(split)) + Array(entries.indices.prefix(split))
+        if let match = ordered.first(where: { entries[$0].name.lowercased().hasPrefix(filePickerTypeaheadBuffer) }) {
+            selectFilePickerIndex(match)
+        }
+    }
+
+    private func handleFilePickerMouseDown(point: CGPoint, clickCount: Int) -> Bool {
+        let rootPoint = rootLayer.convert(point, to: rootLayer)
+        if filePickerCancelFrame.contains(rootPoint) {
+            dismissFilePicker()
+            return true
+        }
+        if filePickerOpenFrame.contains(rootPoint) {
+            activateSelectedFilePickerEntry()
+            return true
+        }
+        if let path = FilePickerBreadcrumbBar.hitPath(at: rootPoint,
+                                                      breadcrumbFrame: filePickerBreadcrumbFrame,
+                                                      segmentFrames: filePickerBreadcrumbSegmentFrames) {
+            fetchFilePickerDirectory(path: path)
+            return true
+        }
+        if filePickerListFrame.contains(rootPoint),
+           filePickerScrollbarController?.handleMouseDown(at: filePickerListLayer.convert(rootPoint, from: rootLayer)) == true {
+            return true
+        }
+        if filePickerListFrame.contains(rootPoint),
+           let hit = filePickerEntryFrames.first(where: { $0.frame.contains(rootPoint) }) {
+            filePickerSelectedIndex = hit.index
+            resetFilePickerTypeahead()
+            updateFilePickerVisibleRows(rebuild: true)
+            if clickCount >= 2 {
+                activateFilePickerEntry(hit.entry)
+            }
+            return true
+        }
+        return filePickerPanelFrame.contains(rootPoint)
+    }
+
+    private func handleFilePickerKeyDown(characters: String,
+                                         charactersIgnoringModifiers: String,
+                                         modifierFlags: NSEvent.ModifierFlags) -> Bool {
+        let normalized = (charactersIgnoringModifiers.isEmpty ? characters : charactersIgnoringModifiers).lowercased()
+        switch normalized {
+        case "\u{1b}":
+            dismissFilePicker()
+            return true
+        case "\r", "\n":
+            activateSelectedFilePickerEntry()
+            return true
+        default:
+            break
+        }
+        if charactersIgnoringModifiers == "\u{F700}" {
+            moveFilePickerSelection(delta: -1)
+            return true
+        }
+        if charactersIgnoringModifiers == "\u{F701}" {
+            moveFilePickerSelection(delta: 1)
+            return true
+        }
+        let disallowed: NSEvent.ModifierFlags = [.command, .control, .option]
+        if modifierFlags.intersection(disallowed).isEmpty,
+           !characters.isEmpty,
+           characters.rangeOfCharacter(from: .newlines) == nil {
+            handleFilePickerTypeahead(characters)
+            return true
+        }
+        return true
     }
 
     private func scheduleResizeLayoutUpdate() {
@@ -671,6 +1527,215 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         notifyAccessibilityLayoutChanged()
     }
 
+    func textInputControllerDidChangeState() {
+        recomputeFindMatches(selectNearestMatch: true)
+        updateFindDisplay()
+        updateCursor()
+        updateEditingCapabilities()
+    }
+
+    private func updateFindDisplay() {
+        withoutImplicitAnimations {
+            findBarLayer.isHidden = !isFindVisible
+            findFieldLayer.borderColor = resolvedCGColor(findInputController.isFocused ? .keyboardFocusIndicatorColor : .separatorColor)
+            findFieldLayer.borderWidth = findInputController.isFocused ? 1.5 : 1
+            let buttonTint = resolvedNSColor(findInputController.text.isEmpty ? .tertiaryLabelColor : .secondaryLabelColor)
+            findPreviousIconLayer.tintColor = buttonTint
+            findNextIconLayer.tintColor = buttonTint
+            findPreviousButtonLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+            findNextButtonLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+            findDoneButtonLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
+            findPreviousButtonLayer.borderColor = resolvedCGColor(.separatorColor)
+            findNextButtonLayer.borderColor = resolvedCGColor(.separatorColor)
+            findDoneButtonLayer.borderColor = resolvedCGColor(.separatorColor)
+            findDoneTextLayer.foregroundColor = resolvedCGColor(.labelColor)
+
+            let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+            findTextLayer.font = font
+            findTextLayer.fontSize = 13
+            findPlaceholderLayer.font = font
+            findPlaceholderLayer.fontSize = 13
+            findStatusLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            findStatusLayer.fontSize = 12
+            findDoneTextLayer.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+            findDoneTextLayer.fontSize = 12
+
+            let textFrame = findTextFrame()
+            findTextLayer.frame = textFrame
+            findPlaceholderLayer.frame = textFrame
+            findTextLayer.string = findInputController.text
+            findPlaceholderLayer.string = "Find"
+            findPlaceholderLayer.isHidden = !findInputController.text.isEmpty
+
+            if let range = findInputController.selectionRange {
+                let lower = findTextX(for: range.lowerBound, font: font, textFrame: textFrame)
+                let upper = findTextX(for: range.upperBound, font: font, textFrame: textFrame)
+                findSelectionLayer.frame = CGRect(x: textFrame.minX + min(lower, upper),
+                                                  y: textFrame.minY + 1,
+                                                  width: max(abs(upper - lower), 1),
+                                                  height: max(textFrame.height - 2, 1))
+                findSelectionLayer.isHidden = false
+            } else {
+                findSelectionLayer.isHidden = true
+            }
+
+            let caretX = findTextX(for: findInputController.cursorPosition, font: font, textFrame: textFrame)
+            findCaretLayer.frame = CGRect(x: textFrame.minX + caretX,
+                                          y: textFrame.minY + 1,
+                                          width: cursorWidth,
+                                          height: max(textFrame.height - 2, 1))
+            findCaretLayer.isHidden = !(isFindVisible && findInputController.isFocused && windowIsActive && viewIsFocused)
+            if findCaretLayer.isHidden {
+                stopBlinkingCaret(findCaretLayer)
+            } else {
+                startBlinkingCaret(findCaretLayer)
+            }
+
+            if findInputController.text.isEmpty {
+                findStatusLayer.string = ""
+            } else if let activeFindMatchIndex {
+                findStatusLayer.string = "\(activeFindMatchIndex + 1) / \(findMatches.count)"
+            } else if !findMatches.isEmpty {
+                findStatusLayer.string = "\(findMatches.count) results"
+            } else {
+                findStatusLayer.string = "No results"
+            }
+        }
+    }
+
+    private func findTextFrame() -> CGRect {
+        CGRect(x: 9, y: 6, width: max(findFieldFrame.width - 18, 1), height: 16)
+    }
+
+    private func findTextX(for characterIndex: Int, font: NSFont, textFrame: CGRect) -> CGFloat {
+        let clamped = min(max(characterIndex, 0), findInputController.text.count)
+        let endIndex = findInputController.text.index(findInputController.text.startIndex, offsetBy: clamped)
+        let prefix = String(findInputController.text[..<endIndex]) as NSString
+        return min(max(prefix.size(withAttributes: [.font: font]).width, 0), max(textFrame.width - cursorWidth, 0))
+    }
+
+    private func showFind(selectCurrentSelection: Bool) {
+        if selectCurrentSelection, let selected = selectedString(), !selected.isEmpty {
+            findInputController.setText(selected)
+        }
+        isFindVisible = true
+        findInputController.focus(selectAll: true)
+        recomputeFindMatches(selectNearestMatch: true)
+        layout()
+        updateCursor()
+    }
+
+    private func hideFind() {
+        guard isFindVisible else { return }
+        findInputController.blur()
+        isFindVisible = false
+        layout()
+        updateCursor()
+    }
+
+    private func useSelectionForFind() {
+        if let selected = selectedString(), !selected.isEmpty {
+            findInputController.setText(selected)
+        }
+        showFind(selectCurrentSelection: false)
+    }
+
+    private func recomputeFindMatches(selectNearestMatch: Bool) {
+        findMatches.removeAll()
+        activeFindMatchIndex = nil
+        let query = findInputController.text
+        guard !query.isEmpty else { return }
+
+        let haystack = text as NSString
+        let queryLength = (query as NSString).length
+        guard queryLength > 0 else { return }
+
+        var searchRange = NSRange(location: 0, length: haystack.length)
+        while searchRange.length > 0 {
+            let match = haystack.range(of: query, options: [.caseInsensitive, .diacriticInsensitive], range: searchRange)
+            if match.location == NSNotFound { break }
+            findMatches.append(match)
+            let nextLocation = match.location + max(match.length, 1)
+            if nextLocation >= haystack.length { break }
+            searchRange = NSRange(location: nextLocation, length: haystack.length - nextLocation)
+        }
+
+        if selectNearestMatch {
+            activateFindMatch(nearestTo: cursorOffset, forward: true, allowBeep: false)
+        }
+    }
+
+    private func activateFindMatch(nearestTo offset: Int, forward: Bool, allowBeep: Bool) {
+        guard !findMatches.isEmpty else {
+            if allowBeep { NSSound.beep() }
+            return
+        }
+        let clamped = clampedOffset(offset)
+        let index: Int
+        if forward {
+            index = findMatches.firstIndex { $0.location + max($0.length, 1) > clamped } ?? 0
+        } else {
+            index = findMatches.lastIndex { $0.location < clamped } ?? (findMatches.count - 1)
+        }
+        activateFindMatch(at: index)
+    }
+
+    private func activateFindMatch(at index: Int) {
+        guard findMatches.indices.contains(index) else { return }
+        let match = findMatches[index]
+        activeFindMatchIndex = index
+        selectionAnchor = match.location
+        cursorOffset = match.location + match.length
+        ensureCursorVisible()
+        updateViewport()
+        updateSelectionLayers(force: true)
+        updateCursor()
+        updateFindDisplay()
+        updateEditingCapabilities()
+    }
+
+    private func currentFindMatchIndex() -> Int? {
+        if let activeFindMatchIndex, findMatches.indices.contains(activeFindMatchIndex) {
+            return activeFindMatchIndex
+        }
+        guard let selectionRange else { return nil }
+        return findMatches.firstIndex {
+            $0.location == selectionRange.location && $0.length == selectionRange.length
+        }
+    }
+
+    private func findNext() {
+        if !isFindVisible {
+            showFind(selectCurrentSelection: false)
+            return
+        }
+        recomputeFindMatches(selectNearestMatch: false)
+        guard !findMatches.isEmpty else {
+            updateFindDisplay()
+            NSSound.beep()
+            return
+        }
+        let nextIndex = currentFindMatchIndex().map { ($0 + 1) % findMatches.count }
+            ?? (findMatches.firstIndex { $0.location >= cursorOffset } ?? 0)
+        activateFindMatch(at: nextIndex)
+    }
+
+    private func findPrevious() {
+        if !isFindVisible {
+            showFind(selectCurrentSelection: false)
+            return
+        }
+        recomputeFindMatches(selectNearestMatch: false)
+        guard !findMatches.isEmpty else {
+            updateFindDisplay()
+            NSSound.beep()
+            return
+        }
+        let previousIndex = currentFindMatchIndex().map { ($0 - 1 + findMatches.count) % findMatches.count }
+            ?? (findMatches.lastIndex { $0.location < cursorOffset } ?? (findMatches.count - 1))
+        activateFindMatch(at: previousIndex)
+    }
+
     private func documentDisplayName() -> String {
         filePath.isEmpty ? "No file" : filePath
     }
@@ -682,13 +1747,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             cursorOffset = 0
             selectionAnchor = nil
             updateTextContent(force: true)
-            renderHeader()
+            layout()
             return
         }
         guard let fileEndpoint, let urlSession else { return }
         isLoading = true
         statusText = "Loading..."
-        renderHeader()
+        layout()
 
         var components = URLComponents(url: fileEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [URLQueryItem(name: "file", value: filePath)]
@@ -728,7 +1793,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 } else {
                     self.statusText = "Load failed: invalid response"
                 }
-                self.renderHeader()
+                self.layout()
                 self.updateColors()
             }
         }.resume()
@@ -898,7 +1963,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func showOpenPrompt() {
-        beginPathPrompt(mode: .open, defaultValue: filePath)
+        showOpenFilePicker()
     }
 
     private func showMoveRenamePrompt() {
@@ -1100,6 +2165,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             textContainer.size = CGSize(width: max(textLayoutWidth, 1), height: max(contentHeight() - textInsetY * 2, editorClipLayer.bounds.height))
             cursorOffset = clampedOffset(cursorOffset)
             selectionAnchor = selectionAnchor.map(clampedOffset)
+            recomputeFindMatches(selectNearestMatch: false)
             layoutText()
             updateEditingCapabilities()
         }
@@ -1399,12 +2465,26 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func updateCursor() {
         withoutImplicitAnimations {
-            if pathPromptMode != nil, viewIsFocused, windowIsActive {
+            if findInputController.isFocused, viewIsFocused, windowIsActive {
+                editorCaretLayer.isHidden = true
+                stopBlinkingCaret(editorCaretLayer)
+                pathPromptCursorLayer.isHidden = true
+                stopBlinkingCaret(pathPromptCursorLayer)
+                updateFindDisplay()
+                sendTextInputGeometryUpdate(rect: findCaretLayer.bounds, in: findCaretLayer, fieldID: findInputID)
+            } else if findInputController.isFocused {
+                editorCaretLayer.isHidden = true
+                stopBlinkingCaret(editorCaretLayer)
+                pathPromptCursorLayer.isHidden = true
+                stopBlinkingCaret(pathPromptCursorLayer)
+                updateFindDisplay()
+                outerframeHost.sendTextInputGeometryUpdate(nil)
+            } else if pathPromptMode != nil, viewIsFocused, windowIsActive {
                 editorCaretLayer.isHidden = true
                 stopBlinkingCaret(editorCaretLayer)
                 pathPromptCursorLayer.isHidden = false
                 startBlinkingCaret(pathPromptCursorLayer)
-                sendTextInputGeometryUpdate(rect: pathPromptCursorLayer.bounds, in: pathPromptCursorLayer)
+                sendTextInputGeometryUpdate(rect: pathPromptCursorLayer.bounds, in: pathPromptCursorLayer, fieldID: editorInputID)
             } else if pathPromptMode != nil {
                 editorCaretLayer.isHidden = true
                 stopBlinkingCaret(editorCaretLayer)
@@ -1415,7 +2495,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 editorCaretLayer.frame = rect
                 editorCaretLayer.isHidden = false
                 startBlinkingCaret(editorCaretLayer)
-                sendTextInputGeometryUpdate(rect: rect, in: textContentLayer)
+                sendTextInputGeometryUpdate(rect: rect, in: textContentLayer, fieldID: editorInputID)
             } else {
                 editorCaretLayer.isHidden = true
                 stopBlinkingCaret(editorCaretLayer)
@@ -1424,13 +2504,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
     }
 
-    private func sendTextInputGeometryUpdate(rect: CGRect, in layer: CALayer) {
+    private func sendTextInputGeometryUpdate(rect: CGRect, in layer: CALayer, fieldID: UUID) {
         let rootRect = layer.convert(rect, to: rootLayer)
         let topLeftRect = CGRect(x: rootRect.minX,
                                  y: rootLayer.bounds.height - rootRect.maxY,
                                  width: rootRect.width,
                                  height: rootRect.height)
-        outerframeHost.sendTextInputGeometryUpdate(OuterframeContentTextInputGeometry(fieldID: editorInputID,
+        outerframeHost.sendTextInputGeometryUpdate(OuterframeContentTextInputGeometry(fieldID: fieldID,
                                                                                      rect: topLeftRect))
     }
 
@@ -1535,6 +2615,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func performTextCommand(_ command: String) {
         switch command {
+        case "find":
+            showFind(selectCurrentSelection: true)
+        case "findNext":
+            findNext()
+        case "findPrevious":
+            findPrevious()
+        case "useSelectionForFind":
+            useSelectionForFind()
         case "insertNewline":
             insertText("\n")
         case "insertTab":
@@ -1613,6 +2701,23 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
     }
 
+    private func performFindTextCommand(_ command: String) {
+        switch command {
+        case "find":
+            showFind(selectCurrentSelection: false)
+        case "findNext":
+            findNext()
+        case "findPrevious":
+            findPrevious()
+        case "useSelectionForFind":
+            useSelectionForFind()
+        case "cancelOperation":
+            hideFind()
+        default:
+            findInputController.performCommand(command)
+        }
+    }
+
     private func move(to offset: Int, modifySelection: Bool) {
         if !modifySelection, let selectionRange {
             let target = offset < cursorOffset ? selectionRange.location : selectionRange.location + selectionRange.length
@@ -1676,6 +2781,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func handleMouseDown(point: CGPoint, modifierFlags: NSEvent.ModifierFlags, clickCount: Int) {
         let rootPoint = rootLayer.convert(point, to: rootLayer)
         let headerPoint = headerLayer.convert(rootPoint, from: rootLayer)
+        if isFindVisible, findBarFrame.contains(headerPoint) {
+            if handleFindBarButtonClick(atHeaderPoint: headerPoint) {
+                return
+            }
+            if findFieldFrame.contains(findBarPoint(fromHeaderPoint: headerPoint)) {
+                focusFindField(atHeaderPoint: headerPoint, clickCount: clickCount, modifySelection: modifierFlags.contains(.shift))
+            }
+            return
+        }
+        findInputController.blur()
         if pathControlFrame.contains(headerPoint) {
             if pathPromptMode != nil {
                 setPathPromptCursor(atToolbarX: headerPoint.x)
@@ -1717,6 +2832,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func handleRightMouseDown(point: CGPoint, clickCount: Int) {
         let rootPoint = rootLayer.convert(point, to: rootLayer)
         let headerPoint = headerLayer.convert(rootPoint, from: rootLayer)
+        if isFindVisible, findBarFrame.contains(headerPoint) {
+            if findFieldFrame.contains(findBarPoint(fromHeaderPoint: headerPoint)) {
+                focusFindField(atHeaderPoint: headerPoint, clickCount: clickCount, modifySelection: false)
+                showFindContextMenu(at: point)
+            }
+            return
+        }
         if pathControlFrame.contains(headerPoint) {
             if pathPromptMode == nil {
                 showPathMenu(at: point)
@@ -1736,6 +2858,54 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             setCursorOffset(offset, modifySelection: false)
         }
         showEditorContextMenu(at: point)
+    }
+
+    private func focusFindField(atHeaderPoint headerPoint: CGPoint, clickCount: Int, modifySelection: Bool) {
+        let localX = headerPoint.x - findBarFrame.minX - findTextFrame().minX
+        let position = findCharacterIndex(atX: localX)
+        findInputController.focus(selectAll: false)
+        if clickCount >= 2 {
+            findInputController.selectWord(at: position)
+        } else {
+            findInputController.setCursorPosition(position, modifySelection: modifySelection)
+        }
+        updateCursor()
+    }
+
+    private func findBarPoint(fromHeaderPoint headerPoint: CGPoint) -> CGPoint {
+        CGPoint(x: headerPoint.x - findBarFrame.minX,
+                y: headerPoint.y - findBarFrame.minY)
+    }
+
+    private func handleFindBarButtonClick(atHeaderPoint headerPoint: CGPoint) -> Bool {
+        let point = findBarPoint(fromHeaderPoint: headerPoint)
+        if findPreviousButtonFrame.contains(point) {
+            findPrevious()
+            return true
+        }
+        if findNextButtonFrame.contains(point) {
+            findNext()
+            return true
+        }
+        if findDoneButtonFrame.contains(point) {
+            hideFind()
+            return true
+        }
+        return false
+    }
+
+    private func findCharacterIndex(atX x: CGFloat) -> Int {
+        let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        var bestIndex = 0
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for index in 0...findInputController.text.count {
+            let distance = abs(findTextX(for: index, font: font, textFrame: findTextFrame()) - max(x, 0))
+            if distance < bestDistance {
+                bestDistance = distance
+                bestIndex = index
+            }
+        }
+        return bestIndex
     }
 
     private func showEditorContextMenu(at point: CGPoint) {
@@ -1777,6 +2947,26 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                        items: items,
                                        at: point,
                                        attributedText: attributedSelection())
+    }
+
+    private func showFindContextMenu(at point: CGPoint) {
+        let menuID = UUID()
+        pendingFindMenuIDs.insert(menuID)
+        let hasSelection = findInputController.hasSelection
+        let items = [
+            OuterframeContextMenuItem(id: "find-cut",
+                                      title: "Cut",
+                                      action: .standardCut,
+                                      isEnabled: hasSelection),
+            OuterframeContextMenuItem(id: "find-copy",
+                                      title: "Copy",
+                                      action: .standardCopy,
+                                      isEnabled: hasSelection),
+            OuterframeContextMenuItem(id: "find-paste",
+                                      title: "Paste",
+                                      action: .standardPaste)
+        ]
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
     }
 
     private func selectWord(at offset: Int) {
@@ -1823,9 +3013,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateCursorShape(at point: CGPoint) {
+        if pendingFilePicker != nil {
+            outerframeHost.setCursor(.arrow)
+            return
+        }
         let rootPoint = rootLayer.convert(point, to: rootLayer)
         let headerPoint = headerLayer.convert(rootPoint, from: rootLayer)
-        if pathControlFrame.contains(headerPoint) {
+        if isFindVisible, findBarFrame.contains(headerPoint) {
+            let findPoint = findBarPoint(fromHeaderPoint: headerPoint)
+            outerframeHost.setCursor(findFieldFrame.contains(findPoint) ? .iBeam : .arrow)
+        } else if pathControlFrame.contains(headerPoint) {
             outerframeHost.setCursor(pathPromptMode == nil ? .pointingHand : .iBeam)
         } else {
             outerframeHost.setCursor(isPointInEditor(point) ? .iBeam : .arrow)
@@ -1847,14 +3044,25 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
+        if findInputController.isFocused {
+            return pasteboardItems(for: findInputController.selectedTextContent())
+        }
         guard let selected = selectedString(), !selected.isEmpty else { return [] }
+        return pasteboardItems(for: selected)
+    }
+
+    private func pasteboardItems(for text: String?) -> [OuterframeContentPasteboardItem] {
+        guard let text, !text.isEmpty else { return [] }
         return [OuterframeContentPasteboardItem(representations: [
             OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
-                                                      data: Data(selected.utf8))
+                                                      data: Data(text.utf8))
         ])]
     }
 
     private func pasteboardItemsForCut() -> [OuterframeContentPasteboardItem] {
+        if findInputController.isFocused {
+            return pasteboardItems(for: findInputController.cutSelectedTextContent())
+        }
         let items = pasteboardItemsForCopy()
         if selectionRange != nil {
             insertText("")
@@ -1866,6 +3074,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         for item in items {
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
                let string = String(data: representation.data, encoding: .utf8) {
+                if findInputController.isFocused {
+                    findInputController.insertText(string)
+                    return
+                }
                 insertText(string)
                 return
             }
@@ -1876,6 +3088,20 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        if findInputController.isFocused {
+            var commands = findInputController.enabledEditCommands(in: requestedCommands)
+            if requestedCommands.contains(.find) {
+                commands.insert(.find)
+            }
+            if requestedCommands.contains(.findNext), !findInputController.text.isEmpty {
+                commands.insert(.findNext)
+            }
+            if requestedCommands.contains(.findPrevious), !findInputController.text.isEmpty {
+                commands.insert(.findPrevious)
+            }
+            return commands
+        }
+
         var enabledCommands: OuterframeEditCommandSet = []
         let hasSelection = selectionRange?.length ?? 0 > 0
         if hasSelection {
@@ -1892,10 +3118,22 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if requestedCommands.contains(.selectAll), !text.isEmpty {
             enabledCommands.insert(.selectAll)
         }
+        if requestedCommands.contains(.find) {
+            enabledCommands.insert(.find)
+        }
+        if requestedCommands.contains(.findNext), !findInputController.text.isEmpty {
+            enabledCommands.insert(.findNext)
+        }
+        if requestedCommands.contains(.findPrevious), !findInputController.text.isEmpty {
+            enabledCommands.insert(.findPrevious)
+        }
         return enabledCommands
     }
 
     private func handleContextMenuItem(menuID: UUID, itemID: String) {
+        if pendingFindMenuIDs.remove(menuID) != nil {
+            return
+        }
         if pendingPathMenuIDs.remove(menuID) != nil {
             switch itemID {
             case "path-save":
@@ -1921,8 +3159,20 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func handleKeyDown(characters: String, charactersIgnoringModifiers: String, modifierFlags: NSEvent.ModifierFlags) {
         let normalized = (charactersIgnoringModifiers.isEmpty ? characters : charactersIgnoringModifiers).lowercased()
-        if modifierFlags.contains(.command), normalized == "s" {
+        if modifierFlags.contains(.command), normalized == "f" {
+            showFind(selectCurrentSelection: true)
+        } else if modifierFlags.contains(.command), normalized == "g" {
+            if modifierFlags.contains(.shift) {
+                findPrevious()
+            } else {
+                findNext()
+            }
+        } else if modifierFlags.contains(.command), normalized == "e" {
+            useSelectionForFind()
+        } else if modifierFlags.contains(.command), normalized == "s" {
             saveNow()
+        } else if findInputController.isFocused, normalized == "\u{1b}" {
+            hideFind()
         } else if pathPromptMode != nil, normalized == "\u{1b}" {
             cancelPathPrompt()
         } else if pathPromptMode != nil, normalized == "\r" || normalized == "\n" {
@@ -2011,6 +3261,19 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             accessibilityNotificationScheduled = false
             outerframeHost.notifyAccessibilityTreeChanged(.layoutChanged)
         }
+    }
+}
+
+@MainActor
+private final class FilePickerScrollbarDelegate: ScrollbarControllerDelegate {
+    private weak var owner: PlaintextHandler?
+
+    init(owner: PlaintextHandler) {
+        self.owner = owner
+    }
+
+    func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        owner?.setFilePickerScroll(offset)
     }
 }
 

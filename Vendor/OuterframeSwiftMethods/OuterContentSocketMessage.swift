@@ -1545,7 +1545,10 @@ public struct OuterframeEditCommandSet: OptionSet, Sendable {
     public static let cut = OuterframeEditCommandSet(rawValue: 1 << 1)
     public static let paste = OuterframeEditCommandSet(rawValue: 1 << 2)
     public static let selectAll = OuterframeEditCommandSet(rawValue: 1 << 3)
-    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll]
+    public static let find = OuterframeEditCommandSet(rawValue: 1 << 4)
+    public static let findNext = OuterframeEditCommandSet(rawValue: 1 << 5)
+    public static let findPrevious = OuterframeEditCommandSet(rawValue: 1 << 6)
+    public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll, .find, .findNext, .findPrevious]
 }
 
 public enum OuterframeContextMenuItemAction: UInt8, Sendable {

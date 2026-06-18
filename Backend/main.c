@@ -6,6 +6,7 @@
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -42,6 +43,7 @@ static const char *kBundleUrlPathMacosArm = "/bundles/PlaintextContent-v12/macos
 static const char *kBundleUrlPathMacosX86 = "/bundles/PlaintextContent-v12/macos-x86";
 static const char *kBundleFilePathMacosArm = "bundles/PlaintextContent.bundle.macos-arm.aar";
 static const char *kBundleFilePathMacosX86 = "bundles/PlaintextContent.bundle.macos-x86.aar";
+enum { FILE_PICKER_FLAG_IS_DIRECTORY = 0x01 };
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
@@ -69,6 +71,14 @@ typedef struct {
     size_t content_length;
     time_t last_activity;
 } Client;
+
+typedef struct {
+    char name[NAME_MAX + 1];
+    char path[PATH_MAX];
+    bool is_directory;
+    uint64_t size;
+    double modified;
+} FilePickerEntry;
 
 static int ensure_directory_exists(const char *path);
 
@@ -313,9 +323,11 @@ static void write_double_le(unsigned char *bytes, double value) {
 
 static void send_outer_descriptor(int fd) {
     const char *file_api_path = "/api/file";
-    size_t plugin_header_length = 20;
+    const char *files_api_path = "/api/files";
+    size_t plugin_header_length = 36;
     size_t file_api_path_length = strlen(file_api_path);
-    size_t plugin_length = plugin_header_length + file_api_path_length;
+    size_t files_api_path_length = strlen(files_api_path);
+    size_t plugin_length = plugin_header_length + file_api_path_length + files_api_path_length;
     size_t path_length = strlen(kBundleUrlPath);
     size_t header_length = 40;
     size_t data_offset = header_length + path_length;
@@ -335,17 +347,21 @@ static void send_outer_descriptor(int fd) {
     write_uint64_le(payload + 24, (uint64_t)data_offset);
     write_uint64_le(payload + 32, (uint64_t)plugin_length);
     memcpy(payload + header_length, kBundleUrlPath, path_length);
-    write_uint32_le(payload + data_offset, 1);
+    write_uint32_le(payload + data_offset, 2);
     write_uint64_le(payload + data_offset + 4, (uint64_t)plugin_header_length);
     write_uint64_le(payload + data_offset + 12, (uint64_t)file_api_path_length);
+    write_uint64_le(payload + data_offset + 20, (uint64_t)(plugin_header_length + file_api_path_length));
+    write_uint64_le(payload + data_offset + 28, (uint64_t)files_api_path_length);
     memcpy(payload + data_offset + plugin_header_length, file_api_path, file_api_path_length);
+    memcpy(payload + data_offset + plugin_header_length + file_api_path_length, files_api_path, files_api_path_length);
     send_response(fd, 200, "OK", "application/vnd.outerframe", payload, total_length);
     free(payload);
 }
 
 static void send_outer_descriptor_head(int fd) {
     const char *file_api_path = "/api/file";
-    size_t plugin_length = 20 + strlen(file_api_path);
+    const char *files_api_path = "/api/files";
+    size_t plugin_length = 36 + strlen(file_api_path) + strlen(files_api_path);
     size_t path_length = strlen(kBundleUrlPath);
     size_t header_length = 40;
     size_t data_offset = header_length + path_length;
@@ -397,6 +413,213 @@ static void send_bundle_file(int fd, const char *path) {
 static void write_ref64(unsigned char *bytes, uint64_t offset, uint64_t length) {
     write_uint64_le(bytes, offset);
     write_uint64_le(bytes + 8, length);
+}
+
+static bool binary_append_zero(Buffer *buffer, size_t length) {
+    size_t old_length = buffer->length;
+    if (!buffer_reserve(buffer, old_length + length + 1)) return false;
+    buffer->length += length;
+    buffer->data[buffer->length] = '\0';
+    memset(buffer->data + old_length, 0, length);
+    return true;
+}
+
+static bool binary_write_u32_at(Buffer *buffer, size_t offset, uint32_t value) {
+    if (offset + 4 > buffer->length) return false;
+    write_uint32_le((unsigned char *)buffer->data + offset, value);
+    return true;
+}
+
+static bool binary_write_u64_at(Buffer *buffer, size_t offset, uint64_t value) {
+    if (offset + 8 > buffer->length) return false;
+    write_uint64_le((unsigned char *)buffer->data + offset, value);
+    return true;
+}
+
+static bool binary_write_f64_at(Buffer *buffer, size_t offset, double value) {
+    if (offset + 8 > buffer->length) return false;
+    write_double_le((unsigned char *)buffer->data + offset, value);
+    return true;
+}
+
+static bool binary_append_string_ref_at(Buffer *buffer, size_t offset, const char *value) {
+    size_t value_length = value ? strlen(value) : 0;
+    size_t value_offset = buffer->length;
+    if (!buffer_append(buffer, value ? value : "", value_length)) return false;
+    return binary_write_u32_at(buffer, offset, (uint32_t)value_offset) &&
+           binary_write_u32_at(buffer, offset + 4, (uint32_t)value_length);
+}
+
+static bool binary_append_child_ref_at(Buffer *buffer, size_t offset, const Buffer *child) {
+    size_t child_offset = buffer->length;
+    if (!buffer_append(buffer, child->data, child->length)) return false;
+    return binary_write_u32_at(buffer, offset, (uint32_t)child_offset) &&
+           binary_write_u32_at(buffer, offset + 4, (uint32_t)child->length);
+}
+
+static void expand_tilde_path(const char *path, char *out, size_t out_size) {
+    if (!path || path[0] == '\0') {
+        snprintf(out, out_size, "%s", home_directory());
+    } else if (strcmp(path, "~") == 0) {
+        snprintf(out, out_size, "%s", home_directory());
+    } else if (path[0] == '~' && path[1] == '/') {
+        snprintf(out, out_size, "%s/%s", home_directory(), path + 2);
+    } else {
+        snprintf(out, out_size, "%s", path);
+    }
+}
+
+static void parent_path_for(const char *path, char *parent, size_t parent_size) {
+    if (!path || !path[0] || strcmp(path, "/") == 0) {
+        snprintf(parent, parent_size, "/");
+        return;
+    }
+    char copy[PATH_MAX];
+    snprintf(copy, sizeof(copy), "%s", path);
+    size_t length = strlen(copy);
+    while (length > 1 && copy[length - 1] == '/') {
+        copy[--length] = '\0';
+    }
+    char *slash = strrchr(copy, '/');
+    if (!slash) {
+        snprintf(parent, parent_size, ".");
+        return;
+    }
+    if (slash == copy) {
+        snprintf(parent, parent_size, "/");
+        return;
+    }
+    *slash = '\0';
+    snprintf(parent, parent_size, "%s", copy);
+}
+
+static bool join_child_path(const char *directory, const char *name, char *out, size_t out_size) {
+    int written = strcmp(directory, "/") == 0
+        ? snprintf(out, out_size, "/%s", name)
+        : snprintf(out, out_size, "%s/%s", directory, name);
+    return written >= 0 && (size_t)written < out_size;
+}
+
+static int compare_file_picker_entries(const void *lhs, const void *rhs) {
+    const FilePickerEntry *a = (const FilePickerEntry *)lhs;
+    const FilePickerEntry *b = (const FilePickerEntry *)rhs;
+    if (a->is_directory != b->is_directory) {
+        return a->is_directory ? -1 : 1;
+    }
+    return strcasecmp(a->name, b->name);
+}
+
+static bool build_file_picker_entry_payload(const FilePickerEntry *entry, Buffer *payload) {
+    if (!binary_append_zero(payload, 40)) return false;
+    return binary_append_string_ref_at(payload, 0, entry->name) &&
+           binary_append_string_ref_at(payload, 8, entry->path) &&
+           binary_write_u32_at(payload, 16, entry->is_directory ? FILE_PICKER_FLAG_IS_DIRECTORY : 0) &&
+           binary_write_u64_at(payload, 20, entry->size) &&
+           binary_write_f64_at(payload, 28, entry->modified);
+}
+
+static void send_binary_buffer_response(int fd, int status, Buffer *buffer) {
+    const char *status_text = status == 200 ? "OK" :
+                              status == 404 ? "Not Found" :
+                              status == 500 ? "Internal Server Error" : "Error";
+    send_response(fd, status, status_text, "application/octet-stream", buffer->data, buffer->length);
+}
+
+static void send_file_picker_response(int fd, const char *query) {
+    char requested[PATH_MAX] = "";
+    char path[PATH_MAX] = "";
+    copy_query_value(query, "path", requested, sizeof(requested));
+    expand_tilde_path(requested[0] ? requested : "~", path, sizeof(path));
+
+    DIR *dir = opendir(path);
+    if (!dir) {
+        char message[PATH_MAX + 64];
+        snprintf(message, sizeof(message), "failed to open %s: %s\n", path, strerror(errno));
+        send_text_response(fd, 404, message);
+        return;
+    }
+
+    FilePickerEntry *entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char child_path[PATH_MAX];
+        if (!join_child_path(path, entry->d_name, child_path, sizeof(child_path))) {
+            continue;
+        }
+
+        struct stat st;
+        if (stat(child_path, &st) != 0 && lstat(child_path, &st) != 0) {
+            continue;
+        }
+
+        if (count == capacity) {
+            size_t new_capacity = capacity ? capacity * 2 : 64;
+            FilePickerEntry *new_entries = realloc(entries, new_capacity * sizeof(FilePickerEntry));
+            if (!new_entries) {
+                free(entries);
+                closedir(dir);
+                send_text_response(fd, 500, "out of memory\n");
+                return;
+            }
+            entries = new_entries;
+            capacity = new_capacity;
+        }
+
+        FilePickerEntry *file = &entries[count++];
+        memset(file, 0, sizeof(*file));
+        snprintf(file->name, sizeof(file->name), "%s", entry->d_name);
+        snprintf(file->path, sizeof(file->path), "%s", child_path);
+        file->is_directory = S_ISDIR(st.st_mode);
+        file->size = (uint64_t)st.st_size;
+        file->modified = (double)st.st_mtime;
+    }
+    closedir(dir);
+
+    qsort(entries, count, sizeof(FilePickerEntry), compare_file_picker_entries);
+
+    char parent[PATH_MAX];
+    parent_path_for(path, parent, sizeof(parent));
+
+    Buffer *entry_payloads = calloc(count ? count : 1, sizeof(Buffer));
+    if (!entry_payloads) {
+        free(entries);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+
+    bool ok = true;
+    for (size_t i = 0; ok && i < count; i++) {
+        ok = build_file_picker_entry_payload(&entries[i], &entry_payloads[i]);
+    }
+    free(entries);
+
+    Buffer builder = {0};
+    size_t fixed_size = 20 + count * 8;
+    ok = ok && binary_append_zero(&builder, fixed_size) &&
+         binary_write_u32_at(&builder, 16, (uint32_t)count) &&
+         binary_append_string_ref_at(&builder, 0, path) &&
+         binary_append_string_ref_at(&builder, 8, parent);
+    for (size_t i = 0; ok && i < count; i++) {
+        ok = binary_append_child_ref_at(&builder, 20 + i * 8, &entry_payloads[i]);
+    }
+    for (size_t i = 0; i < count; i++) {
+        buffer_free(&entry_payloads[i]);
+    }
+    free(entry_payloads);
+
+    if (!ok) {
+        buffer_free(&builder);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    send_binary_buffer_response(fd, 200, &builder);
+    buffer_free(&builder);
 }
 
 static void send_file_load_binary(int fd,
@@ -716,6 +939,8 @@ static void process_client_request(int fd, Buffer *request, size_t header_length
         send_bundle_file(fd, g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86);
     } else if (strcasecmp(method, "GET") == 0 && strcmp(target, "/api/file") == 0) {
         send_file_get_response(fd, query);
+    } else if (strcasecmp(method, "GET") == 0 && strcmp(target, "/api/files") == 0) {
+        send_file_picker_response(fd, query);
     } else if (strcasecmp(method, "POST") == 0 && strcmp(target, "/api/file") == 0) {
         const char *body = request->data + header_length;
         size_t body_length = request->length >= header_length ? request->length - header_length : 0;
