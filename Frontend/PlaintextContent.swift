@@ -1693,12 +1693,22 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         filePickerTypeaheadDeadline = now.addingTimeInterval(1.0)
         filePickerTypeaheadBuffer += text.lowercased()
         guard let entries = pendingFilePicker?.entries, !filePickerTypeaheadBuffer.isEmpty else { return }
-        let start = (filePickerSelectedIndex ?? -1) + 1
-        let split = min(max(start, 0), entries.count)
-        let ordered = Array(entries.indices.dropFirst(split)) + Array(entries.indices.prefix(split))
-        if let match = ordered.first(where: { entries[$0].name.lowercased().hasPrefix(filePickerTypeaheadBuffer) }) {
+        if let match = filePickerMatch(in: entries, prefix: filePickerTypeaheadBuffer, startingAfterSelection: false) {
+            selectFilePickerIndex(match)
+            return
+        }
+        filePickerTypeaheadBuffer = text.lowercased()
+        if let match = filePickerMatch(in: entries, prefix: filePickerTypeaheadBuffer, startingAfterSelection: true) {
             selectFilePickerIndex(match)
         }
+    }
+
+    private func filePickerMatch(in entries: [FilePickerEntryRecord], prefix: String, startingAfterSelection: Bool) -> Int? {
+        guard !prefix.isEmpty else { return nil }
+        let start = startingAfterSelection ? (filePickerSelectedIndex ?? -1) + 1 : 0
+        let split = min(max(start, 0), entries.count)
+        let ordered = Array(entries.indices.dropFirst(split)) + Array(entries.indices.prefix(split))
+        return ordered.first { entries[$0].name.lowercased().hasPrefix(prefix) }
     }
 
     private func handleFilePickerMouseDown(point: CGPoint, clickCount: Int) -> Bool {
