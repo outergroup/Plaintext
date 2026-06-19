@@ -241,6 +241,12 @@ static const char *home_directory(void) {
 }
 
 static void default_drafts_directory(char *out, size_t out_size) {
+    const char *service_state_dir = getenv("OUTERSHELL_SERVICE_STATE_DIR");
+    if (service_state_dir && service_state_dir[0] != '\0') {
+        snprintf(out, out_size, "%s/drafts", service_state_dir);
+        return;
+    }
+
     const char *state_home = getenv("XDG_STATE_HOME");
     if (state_home && state_home[0] != '\0') {
         snprintf(out, out_size, "%s/outershell/plaintext-drafts", state_home);
