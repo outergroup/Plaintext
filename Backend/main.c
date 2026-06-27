@@ -25,11 +25,11 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #ifdef __APPLE__
+#include <mach-o/dyld.h>
 extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 #endif
 
@@ -48,14 +48,57 @@ enum { FILE_PICKER_FLAG_IS_DIRECTORY = 0x01 };
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_backend_label[256] = "org.outershell.Plaintext";
-static char g_outerctl_path[PATH_MAX] = "";
-static char g_app_icon_path[PATH_MAX] = "";
 static char g_listen_socket_path[PATH_MAX] = "";
 static int g_listen_port = -1;
 static bool g_systemd_socket_activation = false;
 static bool g_listen_socket_is_launchd_owned = false;
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static char g_drafts_directory[PATH_MAX] = "";
+
+#ifdef __APPLE__
+static bool remove_last_path_component(char *path) {
+    char *slash = strrchr(path, '/');
+    if (!slash) return false;
+    if (slash == path) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    return true;
+}
+
+static void configure_resource_paths_from_app_bundle(void) {
+    char executable_path[PATH_MAX];
+    uint32_t executable_path_size = sizeof(executable_path);
+    if (_NSGetExecutablePath(executable_path, &executable_path_size) != 0) {
+        return;
+    }
+
+    char resolved_path[PATH_MAX];
+    const char *path = realpath(executable_path, resolved_path) ? resolved_path : executable_path;
+    char macos_dir[PATH_MAX];
+    snprintf(macos_dir, sizeof(macos_dir), "%s", path);
+    if (!remove_last_path_component(macos_dir)) return;
+
+    char contents_dir[PATH_MAX];
+    snprintf(contents_dir, sizeof(contents_dir), "%s", macos_dir);
+    if (!remove_last_path_component(contents_dir)) return;
+
+    char arm_bundle_path[PATH_MAX];
+    char x86_bundle_path[PATH_MAX];
+    snprintf(arm_bundle_path, sizeof(arm_bundle_path),
+             "%s/Resources/bundles/PlaintextContent.bundle.macos-arm.aar", contents_dir);
+    snprintf(x86_bundle_path, sizeof(x86_bundle_path),
+             "%s/Resources/bundles/PlaintextContent.bundle.macos-x86.aar", contents_dir);
+
+    struct stat st;
+    if (stat(arm_bundle_path, &st) == 0 && S_ISREG(st.st_mode) &&
+        stat(x86_bundle_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm), "%s", arm_bundle_path);
+        snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86), "%s", x86_bundle_path);
+    }
+}
+#endif
 
 typedef struct {
     char *data;
@@ -1197,66 +1240,6 @@ static void default_socket_path(char *out, size_t out_size) {
     snprintf(out, out_size, "/tmp/%s", g_backend_label);
 }
 
-static void run_outerctl_wait(const char *const *arguments) {
-    if (!g_outerctl_path[0]) return;
-    pid_t child = fork();
-    if (child == 0) {
-        execv(g_outerctl_path, (char *const *)arguments);
-        _exit(127);
-    }
-    if (child > 0) {
-        int status = 0;
-        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-    }
-}
-
-static void announce_plaintext_capabilities(void) {
-    if (!g_outerctl_path[0] || !g_backend_label[0]) return;
-
-    if (!g_listen_socket_path[0]) return;
-
-    const char *app_clear_args[] = {g_outerctl_path, "app", "clear", "--backend", g_backend_label, NULL};
-    run_outerctl_wait(app_clear_args);
-
-    const char *app_args[16];
-    size_t count = 0;
-    app_args[count++] = g_outerctl_path;
-    app_args[count++] = "app";
-    app_args[count++] = "add";
-    app_args[count++] = "--backend";
-    app_args[count++] = g_backend_label;
-    app_args[count++] = "--socket-path";
-    app_args[count++] = g_listen_socket_path;
-    app_args[count++] = "--name";
-    app_args[count++] = "Plaintext";
-    if (g_app_icon_path[0]) {
-        app_args[count++] = "--icon-path";
-        app_args[count++] = g_app_icon_path;
-    }
-    app_args[count] = NULL;
-    run_outerctl_wait(app_args);
-
-    const char *opener_clear_args[] = {g_outerctl_path, "opener", "clear", "--backend", g_backend_label, NULL};
-    run_outerctl_wait(opener_clear_args);
-    const char *opener_args[] = {
-        g_outerctl_path,
-        "opener",
-        "add",
-        "--backend",
-        g_backend_label,
-        "--content-type",
-        "public.text",
-        "--socket-path",
-        g_listen_socket_path,
-        "--name",
-        "Plaintext",
-        "--url-template",
-        "?file={file}",
-        NULL
-    };
-    run_outerctl_wait(opener_args);
-}
-
 static int create_unix_listener(const char *requested_socket_path) {
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) fatal("socket");
@@ -1342,12 +1325,15 @@ static bool parse_port(const char *value, int *out) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--label LABEL] [--bundles-dir DIR] [--icon-file PATH]\n",
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--launchd-socket-name NAME] [--label LABEL] [--bundles-dir DIR]\n",
             program && program[0] ? program : "PlaintextBackend");
 }
 
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
+#ifdef __APPLE__
+    configure_resource_paths_from_app_bundle();
+#endif
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_handler = handle_shutdown_signal;
@@ -1357,10 +1343,6 @@ int main(int argc, char **argv) {
 
     int requested_port = -1;
     char requested_socket_path[PATH_MAX] = "";
-    const char *outerctl_path = getenv("OUTERCTL_PATH");
-    if (outerctl_path && outerctl_path[0]) {
-        snprintf(g_outerctl_path, sizeof(g_outerctl_path), "%s", outerctl_path);
-    }
 #ifdef __APPLE__
     char launchd_socket_name[128] = "";
 #endif
@@ -1369,9 +1351,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
             snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--icon-file") == 0 && i + 1 < argc) {
-            snprintf(g_app_icon_path, sizeof(g_app_icon_path), "%s", argv[++i]);
-        } else if (strcmp(argv[i], "--outerctl-path") == 0 && i + 1 < argc) {
-            snprintf(g_outerctl_path, sizeof(g_outerctl_path), "%s", argv[++i]);
+            i++;
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm),
                      "%s/PlaintextContent.bundle.macos-arm.aar", argv[i + 1]);
@@ -1425,7 +1405,6 @@ int main(int argc, char **argv) {
     }
     fflush(stdout);
 
-    announce_plaintext_capabilities();
     run_reactor(listen_fd);
 
     close(listen_fd);
