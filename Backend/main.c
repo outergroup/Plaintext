@@ -28,6 +28,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "HTTPCache.h"
+
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
@@ -217,6 +219,38 @@ static void send_text_response(int fd, int status, const char *text) {
     send_response(fd, status, status_text, "text/plain; charset=utf-8", text, strlen(text));
 }
 
+static void send_cached_header(int fd,
+                               int status,
+                               const char *content_type,
+                               size_t content_length,
+                               const char *etag,
+                               const char *last_modified) {
+    char header[1024];
+    size_t header_length = outer_http_cache_response_header(header, sizeof(header), status,
+                                                            content_type, content_length,
+                                                            etag, last_modified);
+    if (header_length > 0) write_all(fd, header, header_length);
+}
+
+static void send_cached_memory_response(int fd,
+                                        const char *request,
+                                        size_t request_header_length,
+                                        const char *content_type,
+                                        const void *body,
+                                        size_t body_length,
+                                        bool send_body) {
+    time_t last_modified = outer_http_cache_server_start_time();
+    char etag[96], last_modified_text[64];
+    outer_http_cache_memory_etag(body, body_length, etag, sizeof(etag));
+    outer_http_cache_format_date(last_modified, last_modified_text, sizeof(last_modified_text));
+    if (outer_http_cache_not_modified(request, request_header_length, etag, &last_modified)) {
+        send_cached_header(fd, 304, content_type, 0, etag, last_modified_text);
+        return;
+    }
+    send_cached_header(fd, 200, content_type, body_length, etag, last_modified_text);
+    if (send_body && body_length > 0) write_all(fd, body, body_length);
+}
+
 static void url_decode(const char *input, size_t input_length, char *out, size_t out_size) {
     if (!out || out_size == 0) return;
     size_t write_index = 0;
@@ -370,7 +404,10 @@ static void write_double_le(unsigned char *bytes, double value) {
     write_uint64_le(bytes, bits);
 }
 
-static void send_outer_descriptor(int fd) {
+static void send_outer_descriptor(int fd,
+                                  const char *request,
+                                  size_t request_header_length,
+                                  bool send_body) {
     const char *file_api_path = "/api/file";
     const char *files_api_path = "/api/files";
     size_t plugin_header_length = 36;
@@ -403,22 +440,17 @@ static void send_outer_descriptor(int fd) {
     write_uint64_le(payload + data_offset + 28, (uint64_t)files_api_path_length);
     memcpy(payload + data_offset + plugin_header_length, file_api_path, file_api_path_length);
     memcpy(payload + data_offset + plugin_header_length + file_api_path_length, files_api_path, files_api_path_length);
-    send_response(fd, 200, "OK", "application/vnd.outerframe", payload, total_length);
+    send_cached_memory_response(fd, request, request_header_length,
+                                "application/vnd.outerframe", payload, total_length,
+                                send_body);
     free(payload);
 }
 
-static void send_outer_descriptor_head(int fd) {
-    const char *file_api_path = "/api/file";
-    const char *files_api_path = "/api/files";
-    size_t plugin_length = 36 + strlen(file_api_path) + strlen(files_api_path);
-    size_t path_length = strlen(kBundleUrlPath);
-    size_t header_length = 40;
-    size_t data_offset = header_length + path_length;
-    size_t total_length = data_offset + plugin_length;
-    send_response(fd, 200, "OK", "application/vnd.outerframe", NULL, total_length);
-}
-
-static void send_bundle_file(int fd, const char *path) {
+static void send_bundle_file(int fd,
+                             const char *path,
+                             const char *request,
+                             size_t request_header_length,
+                             bool send_body) {
     int file_fd = open(path, O_RDONLY);
     if (file_fd < 0) {
         send_text_response(fd, 404, "bundle not found\n");
@@ -435,7 +467,20 @@ static void send_bundle_file(int fd, const char *path) {
         send_text_response(fd, 500, "invalid bundle size\n");
         return;
     }
+    char etag[96], last_modified[64];
+    outer_http_cache_file_etag(&st, etag, sizeof(etag));
+    outer_http_cache_format_date(st.st_mtime, last_modified, sizeof(last_modified));
+    if (outer_http_cache_not_modified(request, request_header_length, etag, &st.st_mtime)) {
+        close(file_fd);
+        send_cached_header(fd, 304, "application/octet-stream", 0, etag, last_modified);
+        return;
+    }
     size_t size = (size_t)st.st_size;
+    if (!send_body) {
+        close(file_fd);
+        send_cached_header(fd, 200, "application/octet-stream", size, etag, last_modified);
+        return;
+    }
     char *data = malloc(size == 0 ? 1 : size);
     if (!data) {
         close(file_fd);
@@ -455,7 +500,8 @@ static void send_bundle_file(int fd, const char *path) {
         send_text_response(fd, 500, "failed to read bundle\n");
         return;
     }
-    send_response(fd, 200, "OK", "application/octet-stream", data, size);
+    send_cached_header(fd, 200, "application/octet-stream", size, etag, last_modified);
+    if (size > 0) write_all(fd, data, size);
     free(data);
 }
 
@@ -974,18 +1020,20 @@ static void process_client_request(int fd, Buffer *request, size_t header_length
 
     bool is_get = strcasecmp(method, "GET") == 0;
     bool is_head = strcasecmp(method, "HEAD") == 0;
-    if ((is_get || is_head) && (strcmp(target, "/") == 0 || strcmp(target, "/index") == 0)) {
-        if (is_head) {
-            send_outer_descriptor_head(fd);
-        } else {
-            send_outer_descriptor(fd);
-        }
+    if ((is_get || is_head) &&
+        (strcmp(target, "/") == 0 || strcmp(target, "/index") == 0 ||
+         strcmp(target, "/index.outer") == 0 || strcmp(target, "/plaintext.outer") == 0)) {
+        send_outer_descriptor(fd, request->data, header_length, !is_head);
     } else if (strcasecmp(method, "GET") == 0 && strcmp(target, kBundleUrlPath) == 0) {
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
-    } else if (strcasecmp(method, "GET") == 0 && strcmp(target, kBundleUrlPathMacosArm) == 0) {
-        send_bundle_file(fd, g_bundle_file_path_macos_arm[0] ? g_bundle_file_path_macos_arm : kBundleFilePathMacosArm);
-    } else if (strcasecmp(method, "GET") == 0 && strcmp(target, kBundleUrlPathMacosX86) == 0) {
-        send_bundle_file(fd, g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86);
+    } else if ((is_get || is_head) && strcmp(target, kBundleUrlPathMacosArm) == 0) {
+        send_bundle_file(fd,
+                         g_bundle_file_path_macos_arm[0] ? g_bundle_file_path_macos_arm : kBundleFilePathMacosArm,
+                         request->data, header_length, !is_head);
+    } else if ((is_get || is_head) && strcmp(target, kBundleUrlPathMacosX86) == 0) {
+        send_bundle_file(fd,
+                         g_bundle_file_path_macos_x86[0] ? g_bundle_file_path_macos_x86 : kBundleFilePathMacosX86,
+                         request->data, header_length, !is_head);
     } else if (strcasecmp(method, "GET") == 0 && strcmp(target, "/api/file") == 0) {
         send_file_get_response(fd, query);
     } else if (strcasecmp(method, "GET") == 0 && strcmp(target, "/api/files") == 0) {
