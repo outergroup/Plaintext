@@ -24,6 +24,7 @@ DerivedData/
 
 # Packaged deploy artifacts
 *.aar
+target.env
 
 # C / native build outputs
 *.o
