@@ -113,8 +113,8 @@ cmd_build_frontend() {
     require_tool aa
     require_tool lipo
 
-    rm -rf "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles"
-    mkdir -p "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles"
+    rm -rf "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web"
+    mkdir -p "${FRONTEND_BUILD_DIR}" "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web"
     echo "==> Building ${APP_NAME} frontend"
     /usr/bin/xcodebuild \
         -project "${ROOT}/${XCODE_PROJECT}" \
@@ -134,6 +134,7 @@ cmd_build_frontend() {
         "${STAGE_ROOT}/bundles" \
         "${BUNDLE_ARCHIVE_STEM}"
     install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/app-icon.png"
+    install -m 0644 "${ROOT}/Resources/PlaintextWeb/index.html" "${ROOT}/Resources/PlaintextWeb/app.css" "${ROOT}/Resources/PlaintextWeb/app.js" "${STAGE_ROOT}/web/"
 }
 
 backend_directory() {
