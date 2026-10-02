@@ -86,10 +86,13 @@ mkdir -p "${OUTPUT_APP_ROOT}"
 
 install_shared_resources() {
     local app_root="$1"
-    mkdir -p "${app_root}/bundles"
+    mkdir -p "${app_root}/bundles" "${app_root}/web"
     install -m 0644 "${PACKAGE_ROOT}/bundles/PlaintextContent.bundle.macos-arm.aar" "${app_root}/bundles/PlaintextContent.bundle.macos-arm.aar"
     install -m 0644 "${PACKAGE_ROOT}/bundles/PlaintextContent.bundle.macos-x86.aar" "${app_root}/bundles/PlaintextContent.bundle.macos-x86.aar"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+    install -m 0644 "${REPO_ROOT}/Resources/PlaintextWeb/index.html" "${app_root}/web/index.html"
+    install -m 0644 "${REPO_ROOT}/Resources/PlaintextWeb/app.css" "${app_root}/web/app.css"
+    install -m 0644 "${REPO_ROOT}/Resources/PlaintextWeb/app.js" "${app_root}/web/app.js"
 }
 
 write_info_plist() {
@@ -143,6 +146,7 @@ package_macos_variant() {
         "${macos_app_root}/Contents/MacOS" \
         "${macos_app_root}/Contents/Resources/bundles"
     install_shared_resources "${app_root}"
+    install_shared_resources "${macos_app_root}/Contents/Resources"
     /usr/bin/lipo "${MACOS_BUILD_ROOT}/${CONFIGURATION}/PlaintextBackend" -thin "${arch}" -output "${macos_app_root}/Contents/MacOS/PlaintextBackend"
     chmod 0755 "${macos_app_root}/Contents/MacOS/PlaintextBackend"
     install -m 0644 "${PACKAGE_ROOT}/bundles/PlaintextContent.bundle.macos-arm.aar" "${macos_app_root}/Contents/Resources/bundles/PlaintextContent.bundle.macos-arm.aar"

@@ -750,6 +750,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             paste(items)
         case .contextMenuItemSelected(let menuID, let itemID):
             handleContextMenuItem(menuID: menuID, itemID: itemID)
+        case .accessibilityAction(let identifier, let action, let value):
+            performAccessibilityAction(identifier, action: action, value: value)
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: buildAccessibilitySnapshot())
@@ -1117,6 +1119,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func renderFilePicker() {
+        defer { notifyAccessibilityLayoutChanged() }
         guard let picker = pendingFilePicker else {
             guard !isFilePickerFadingOut else { return }
             setFilePickerOverlayOpacity(0)
@@ -1351,6 +1354,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateFilePickerVisibleRows(rebuild: Bool) {
+        defer { notifyAccessibilityLayoutChanged() }
         guard let picker = pendingFilePicker else {
             resetFilePickerRowLayers()
             return
@@ -1760,7 +1764,6 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 dismissFilePicker()
                 return true
             case "\r", "\n":
-                openFilePickerTypedPath()
                 return true
             default:
                 return true
@@ -1771,7 +1774,6 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             dismissFilePicker()
             return true
         case "\r", "\n":
-            activateSelectedFilePickerEntry()
             return true
         default:
             break
@@ -1818,6 +1820,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     func textInputControllerDidChangeState() {
+        defer { notifyAccessibilityLayoutChanged() }
         if filePickerNameInputController.isFocused || pendingFilePicker != nil {
             updateFilePickerNameDisplay()
             updateCursor()
@@ -3130,14 +3133,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func performFilePickerTextCommand(_ command: String) {
-        guard filePickerNameInputController.isFocused else { return }
         switch command {
         case "insertNewline", "insertNewlineIgnoringFieldEditor":
-            openFilePickerTypedPath()
+            if filePickerNameInputController.isFocused { openFilePickerTypedPath() }
+            else { activateSelectedFilePickerEntry() }
         case "cancelOperation":
             dismissFilePicker()
         default:
-            filePickerNameInputController.performCommand(command)
+            if filePickerNameInputController.isFocused { filePickerNameInputController.performCommand(command) }
         }
     }
 
@@ -3589,6 +3592,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateEditingCapabilities() {
+        notifyAccessibilityLayoutChanged()
     }
 
     private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
@@ -3685,8 +3689,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             hideFind()
         } else if pathPromptMode != nil, normalized == "\u{1b}" {
             cancelPathPrompt()
-        } else if pathPromptMode != nil, normalized == "\r" || normalized == "\n" {
-            confirmPathPrompt()
+
         }
     }
 
@@ -3701,78 +3704,133 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
     }
 
+    private var accessibilityIDs: [String: UInt32] = [:]
+    private var accessibilityNodes: [UInt32: OuterframeAccessibilityNode] = [:]
+    private var accessibilityHandlers: [UInt32: (PlaintextHandler, OuterframeAccessibilityAction, String) -> Void] = [:]
+
+    private func axNode(_ key: String, _ role: OuterframeAccessibilityRole, _ frame: CGRect, _ label: String,
+                        value: String? = nil, children: [OuterframeAccessibilityNode] = [],
+                        actions: OuterframeAccessibilityActions = [], enabled: Bool = true, focused: Bool = false,
+                        selected: Bool = false, rowIndex: Int? = nil, rowCount: Int? = nil, selection: NSRange? = nil,
+                        handler: ((PlaintextHandler, OuterframeAccessibilityAction, String) -> Void)? = nil) -> OuterframeAccessibilityNode {
+        let id = accessibilityIDs[key] ?? UInt32(accessibilityIDs.count + 1)
+        accessibilityIDs[key] = id
+        let node = OuterframeAccessibilityNode(identifier: id, role: role, frame: frame, label: label, value: value,
+            children: children, rowCount: rowCount, isEnabled: enabled, actions: actions, isFocused: focused,
+            isSelected: selected, rowIndex: rowIndex, selectedTextRange: selection)
+        accessibilityNodes[id] = node
+        accessibilityHandlers[id] = handler
+        return node
+    }
+
+    private func performAccessibilityAction(_ id: UInt32, action: OuterframeAccessibilityAction, value: String) {
+        _ = buildAccessibilitySnapshot()
+        guard let node = accessibilityNodes[id], node.isEnabled, node.actions.supports(action) else { return }
+        accessibilityHandlers[id]?(self, action, value)
+        notifyAccessibilityLayoutChanged()
+    }
+
+    private func focusAccessibleEditor() {
+        findInputController.blur()
+        filePickerNameInputController.blur()
+        if pathPromptMode != nil { cancelPathPrompt() }
+        updateCursor()
+        updateEditingCapabilities()
+    }
+
     private func buildAccessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
-        var nextIdentifier: UInt32 = 1
+        accessibilityNodes.removeAll(keepingCapacity: true)
+        accessibilityHandlers.removeAll(keepingCapacity: true)
         var children: [OuterframeAccessibilityNode] = []
-
-        if let pathPromptMode {
-            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                             role: .textField,
-                                             frame: headerLayer.convert(pathControlFrame, to: rootLayer),
-                                             label: "\(pathPromptMode.label) path",
-                                             value: pathPromptText,
-                                             hint: "Insertion point at character \(pathPromptCursorOffset)"))
+        if let picker = pendingFilePicker {
+            for segment in filePickerBreadcrumbSegmentFrames {
+                let frame = filePickerBreadcrumbLayer.convert(segment.frame, to: rootLayer)
+                children.append(axNode("directory:\(segment.path)", .button, frame, segment.path, actions: [.press]) { owner, _, _ in
+                    owner.fetchFilePickerDirectory(path: segment.path)
+                })
+            }
+            let rows = filePickerEntryFrames.filter { $0.frame.intersects(filePickerListFrame) }.map { item in
+                axNode("file:\(picker.directory)/\(item.entry.name)", .row, item.frame.intersection(filePickerListFrame), item.entry.name,
+                       value: item.entry.isDirectory ? "Folder" : "File", actions: [.press, .focus],
+                       selected: filePickerSelectedIndex == item.index, rowIndex: item.index) { owner, action, _ in
+                    if action == .press { owner.activateFilePickerEntry(item.entry) }
+                    else { owner.selectFilePickerIndex(item.index) }
+                }
+            }
+            children.append(axNode("file-list", .table, filePickerListFrame, "Files", children: rows,
+                                   actions: [.scrollUp, .scrollDown], rowCount: picker.entries.count) { owner, action, _ in
+                owner.setFilePickerScroll(owner.filePickerScroll + (action == .scrollUp ? -1 : 1) * owner.filePickerListFrame.height * 0.8)
+            })
+            if picker.isLoading || !picker.error.isEmpty {
+                children.append(axNode("picker-status", .staticText, filePickerListFrame, picker.isLoading ? "Loading files" : picker.error))
+            }
+            children.append(axNode("filename", .textField, filePickerNameFieldFrame, "File name", value: filePickerNameInputController.text,
+                                   actions: [.focus, .setValue], focused: filePickerNameInputController.isFocused) { owner, action, value in
+                owner.filePickerNameInputController.focus()
+                if action == .setValue { owner.filePickerNameInputController.setText(value) }
+            })
+            children.append(axNode("cancel-open", .button, filePickerCancelFrame, "Cancel", actions: [.press]) { owner, _, _ in owner.dismissFilePicker() })
+            children.append(axNode("open", .button, filePickerOpenFrame, "Open", actions: [.press], enabled: !picker.isLoading) { owner, _, _ in owner.openFilePickerTypedPath() })
+            return OuterframeAccessibilitySnapshot(rootNodes: [axNode("picker", .container, filePickerPanelFrame, "Open File", children: children)])
+        }
+        if let mode = pathPromptMode {
+            children.append(axNode("path-prompt", .textField, headerLayer.convert(pathControlFrame, to: rootLayer), "\(mode.label) path",
+                                   value: pathPromptText, actions: [.focus, .setValue], focused: true) { owner, action, value in
+                if action == .setValue {
+                    owner.pathPromptText = value
+                    owner.pathPromptCursorOffset = value.utf16.count
+                    owner.renderHeader()
+                    owner.updateCursor()
+                }
+            })
         } else {
-            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                             role: .button,
-                                             frame: headerLayer.convert(pathControlFrame, to: rootLayer),
-                                             label: "File actions",
-                                             value: documentDisplayName(),
-                                             hint: "Open file actions menu"))
+            children.append(axNode("file-actions", .button, headerLayer.convert(pathControlFrame, to: rootLayer), "File actions",
+                                   value: documentDisplayName(), actions: [.press, .showMenu]) { owner, _, _ in
+                let frame = owner.headerLayer.convert(owner.pathControlFrame, to: owner.rootLayer)
+                owner.showPathMenu(at: CGPoint(x: frame.midX, y: frame.maxY))
+            })
         }
-
         if let status = statusLayer.string as? String, !status.isEmpty {
-            children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                             role: .staticText,
-                                             frame: headerLayer.convert(statusLayer.frame, to: rootLayer),
-                                             label: status))
+            children.append(axNode("status", .staticText, headerLayer.convert(statusLayer.frame, to: rootLayer), "Status", value: status))
         }
-
-        children.append(accessibilityNode(nextIdentifier: &nextIdentifier,
-                                         role: .textField,
-                                         frame: editorClipLayer.frame,
-                                         label: filePath.isEmpty ? "Text editor" : "Text editor, \(filePath)",
-                                         value: text,
-                                         hint: editorAccessibilityHint()))
-
-        let rootNode = OuterframeAccessibilityNode(identifier: 0,
-                                                   role: .container,
-                                                   frame: rootLayer.bounds,
-                                                   label: "Plaintext",
-                                                   children: children)
-        return OuterframeAccessibilitySnapshot(rootNodes: [rootNode])
-    }
-
-    private func editorAccessibilityHint() -> String {
-        let lineCount = max(visualLineMetrics().lines.count, 1)
-        if let selectionRange {
-            return "\(lineCount) visual lines, \(selectionRange.length) selected characters"
+        if isFindVisible {
+            children.append(axNode("find", .textField, findFieldLayer.convert(findFieldLayer.bounds, to: rootLayer), "Find", value: findInputController.text,
+                                   actions: [.focus, .setValue], focused: findInputController.isFocused) { owner, action, value in
+                owner.findInputController.focus()
+                if action == .setValue { owner.findInputController.setText(value) }
+            })
+            children.append(axNode("find-previous", .button, findPreviousButtonLayer.convert(findPreviousButtonLayer.bounds, to: rootLayer), "Previous match",
+                                   actions: [.press], enabled: !findMatches.isEmpty) { owner, _, _ in owner.findPrevious() })
+            children.append(axNode("find-next", .button, findNextButtonLayer.convert(findNextButtonLayer.bounds, to: rootLayer), "Next match",
+                                   actions: [.press], enabled: !findMatches.isEmpty) { owner, _, _ in owner.findNext() })
+            children.append(axNode("find-count", .staticText, findStatusLayer.convert(findStatusLayer.bounds, to: rootLayer), "Matches", value: findStatusLayer.string as? String))
+            children.append(axNode("find-done", .button, findDoneButtonLayer.convert(findDoneButtonLayer.bounds, to: rootLayer), "Done", actions: [.press]) { owner, _, _ in owner.hideFind() })
         }
-        return "\(lineCount) visual lines, insertion point at character \(cursorOffset)"
-    }
-
-    private func accessibilityNode(nextIdentifier: inout UInt32,
-                                   role: OuterframeAccessibilityRole,
-                                   frame: CGRect,
-                                   label: String? = nil,
-                                   value: String? = nil,
-                                   hint: String? = nil,
-                                   children: [OuterframeAccessibilityNode] = [],
-                                   rowCount: Int? = nil,
-                                   columnCount: Int? = nil,
-                                   isEnabled: Bool = true) -> OuterframeAccessibilityNode {
-        let identifier = nextIdentifier
-        nextIdentifier = nextIdentifier == UInt32.max ? 1 : nextIdentifier + 1
-        return OuterframeAccessibilityNode(identifier: identifier,
-                                           role: role,
-                                           frame: frame,
-                                           label: label,
-                                           value: value,
-                                           hint: hint,
-                                           children: children,
-                                           rowCount: rowCount,
-                                           columnCount: columnCount,
-                                           isEnabled: isEnabled)
+        children.append(axNode("editor", .textArea, editorClipLayer.frame, filePath.isEmpty ? "Text editor" : "Text editor, \(filePath)", value: text,
+                               actions: [.focus, .setValue, .setSelectedTextRange, .showMenu, .scrollUp, .scrollDown], enabled: !isLoading,
+                               focused: viewIsFocused && !findInputController.isFocused && pathPromptMode == nil,
+                               selection: selectionRange ?? NSRange(location: cursorOffset, length: 0)) { owner, action, value in
+            switch action {
+            case .focus: owner.focusAccessibleEditor()
+            case .setValue:
+                owner.focusAccessibleEditor()
+                owner.replace(range: NSRange(location: 0, length: (owner.text as NSString).length), with: value)
+            case .setSelectedTextRange:
+                let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+                guard parts.count == 2, let location = Int(parts[0]), let length = Int(parts[1]), location >= 0, length >= 0,
+                      location <= owner.text.utf16.count, length <= owner.text.utf16.count - location,
+                      Range(NSRange(location: location, length: length), in: owner.text) != nil else { return }
+                owner.focusAccessibleEditor()
+                owner.setCursorOffset(location, modifySelection: false)
+                owner.setCursorOffset(location + length, modifySelection: true)
+            case .showMenu:
+                owner.showEditorContextMenu(at: CGPoint(x: owner.editorClipLayer.frame.midX, y: owner.editorClipLayer.frame.midY))
+            case .scrollUp, .scrollDown:
+                owner.scrollbarDidChangeScrollOffset(owner.scrollOffset + (action == .scrollUp ? -1 : 1) * owner.editorClipLayer.bounds.height * 0.8)
+            default: break
+            }
+        })
+        return OuterframeAccessibilitySnapshot(rootNodes: [axNode("root", .container, rootLayer.bounds, "Plaintext", children: children)])
     }
 
     private func notifyAccessibilityLayoutChanged() {
