@@ -13,11 +13,14 @@ public enum OuterframeAccessibilityRole: UInt8, Sendable {
     case textField = 7
     case scrollArea = 8
     case textArea = 9
+    case dialog = 10
+    case outline = 11
+    case slider = 12
 }
 
 /// Actions are handled by content against the current node identifier, never stale screen coordinates.
 public enum OuterframeAccessibilityAction: UInt8, Sendable {
-    case press = 0, showMenu, focus, setValue, scrollUp, scrollDown, moveEarlier, moveLater, setSelectedTextRange
+    case press = 0, showMenu, focus, setValue, scrollUp, scrollDown, moveEarlier, moveLater, setSelectedTextRange, increment, decrement, expand, collapse
 }
 
 public struct OuterframeAccessibilityActions: OptionSet, Sendable {
@@ -32,6 +35,10 @@ public struct OuterframeAccessibilityActions: OptionSet, Sendable {
     public static let moveEarlier = Self(rawValue: 1 << 6)
     public static let moveLater = Self(rawValue: 1 << 7)
     public static let setSelectedTextRange = Self(rawValue: 1 << 8)
+    public static let increment = Self(rawValue: 1 << 9)
+    public static let decrement = Self(rawValue: 1 << 10)
+    public static let expand = Self(rawValue: 1 << 11)
+    public static let collapse = Self(rawValue: 1 << 12)
     public func supports(_ action: OuterframeAccessibilityAction) -> Bool {
         rawValue & (1 << action.rawValue) != 0
     }
@@ -76,6 +83,12 @@ public struct OuterframeAccessibilityNode: Sendable {
     public var sortDirection: OuterframeAccessibilitySortDirection
     public var isEnabled: Bool
     public var selectedTextRange: NSRange?
+    public var supportsActionSnapshot: Bool
+    public var supportsTextGeometry: Bool
+    public var isExpanded: Bool?
+    public var disclosureLevel: Int
+    public var minimumValue: Double?
+    public var maximumValue: Double?
 
     public init(identifier: UInt32,
                 role: OuterframeAccessibilityRole,
@@ -93,7 +106,15 @@ public struct OuterframeAccessibilityNode: Sendable {
                 rowIndex: Int? = nil,
                 columnIndex: Int? = nil,
                 sortDirection: OuterframeAccessibilitySortDirection = .none,
-                selectedTextRange: NSRange? = nil) {
+                selectedTextRange: NSRange? = nil,
+                supportsTextGeometry: Bool = false, supportsActionSnapshot: Bool = false, isExpanded: Bool? = nil, disclosureLevel: Int = 0,
+                minimumValue: Double? = nil, maximumValue: Double? = nil) {
+        self.supportsActionSnapshot = supportsActionSnapshot
+        self.supportsTextGeometry = supportsTextGeometry
+        self.isExpanded = isExpanded
+        self.disclosureLevel = disclosureLevel
+        self.minimumValue = minimumValue
+        self.maximumValue = maximumValue
         self.selectedTextRange = selectedTextRange
         self.identifier = identifier
         self.role = role
@@ -240,7 +261,7 @@ private struct FlattenedAccessibilityNode {
 private extension OuterframeAccessibilitySnapshot {
     static let formatVersion: UInt32 = 1
     static let headerSize = 16
-    static let nodeRecordSize = 93
+    static let nodeRecordSize = 114
     static let minimumNodeRecordSize: UInt32 = 74
     static let maximumNodeCount = 100_000
 
@@ -316,6 +337,17 @@ private extension OuterframeAccessibilitySnapshot {
         nodeRecords.appendUInt8(UInt8(truncatingIfNeeded: flattenedNode.node.actions.rawValue >> 8))
         nodeRecords.appendUInt32(flattenedNode.node.selectedTextRange.map { UInt32(clamping: $0.location) } ?? UInt32.max)
         nodeRecords.appendUInt32(flattenedNode.node.selectedTextRange.map { UInt32(clamping: $0.length) } ?? 0)
+        let node = flattenedNode.node
+        var extraFlags: UInt8 = node.supportsTextGeometry ? 1 : 0
+        if node.supportsActionSnapshot { extraFlags |= 32 }
+        if node.isExpanded != nil { extraFlags |= 2 }
+        if node.isExpanded == true { extraFlags |= 4 }
+        if node.minimumValue != nil { extraFlags |= 8 }
+        if node.maximumValue != nil { extraFlags |= 16 }
+        nodeRecords.appendUInt8(extraFlags)
+        nodeRecords.appendInt32(Int32(clamping: node.disclosureLevel))
+        nodeRecords.appendFloat64(node.minimumValue ?? 0)
+        nodeRecords.appendFloat64(node.maximumValue ?? 0)
     }
 
     func appendStringReference(_ string: String?,
@@ -388,11 +420,19 @@ private extension OuterframeAccessibilitySnapshot {
             if location != UInt32.max {
                 let textLength = (value ?? "").utf16.count
                 guard Int(location) <= textLength, Int(length) <= textLength - Int(location) else { return nil }
-                selectedTextRange = NSRange(location: Int(location), length: Int(length))
+                let range = NSRange(location: Int(location), length: Int(length))
+                guard OuterframeAccessibilityTextRange.isValid(range, in: value ?? "") else { return nil }
+                selectedTextRange = range
             } else if length != 0 { return nil }
         }
         let actionMask = UInt16(recordSize > 74 ? (data.readUInt8(at: offset + 74) ?? 0) : 0)
             | (UInt16(recordSize > 84 ? (data.readUInt8(at: offset + 84) ?? 0) : 0) << 8)
+        let extraFlags = recordSize >= 114 ? (data.readUInt8(at: offset + 93) ?? 0) : 0
+        let disclosureLevel = recordSize >= 114 ? Int(data.readInt32(at: offset + 94) ?? 0) : 0
+        let minimumValue = extraFlags & 8 != 0 ? data.readFloat64(at: offset + 98) : nil
+        let maximumValue = extraFlags & 16 != 0 ? data.readFloat64(at: offset + 106) : nil
+        guard disclosureLevel >= 0, minimumValue?.isFinite != false, maximumValue?.isFinite != false else { return nil }
+        if let minimumValue, let maximumValue, minimumValue > maximumValue { return nil }
         let node = OuterframeAccessibilityNode(identifier: identifier,
                                                role: role,
                                                frame: CGRect(x: originX, y: originY, width: width, height: height),
@@ -407,7 +447,10 @@ private extension OuterframeAccessibilitySnapshot {
                                                isSelected: flags & (1 << 7) != 0,
                                                rowIndex: rowIndex < 0 ? nil : rowIndex,
                                                columnIndex: columnIndex < 0 ? nil : columnIndex,
-                                               sortDirection: sortDirection, selectedTextRange: selectedTextRange)
+                                               sortDirection: sortDirection, selectedTextRange: selectedTextRange,
+                                               supportsTextGeometry: extraFlags & 1 != 0, supportsActionSnapshot: extraFlags & 32 != 0,
+                                               isExpanded: extraFlags & 2 == 0 ? nil : extraFlags & 4 != 0,
+                                               disclosureLevel: disclosureLevel, minimumValue: minimumValue.map(Double.init), maximumValue: maximumValue.map(Double.init))
         return DecodedNodeRecord(node: node, parentIndex: parentIndex)
     }
 
@@ -489,5 +532,35 @@ private extension Data {
     func readFloat64(at offset: Int) -> CGFloat? {
         guard let bits = readUInt64(at: offset) else { return nil }
         return CGFloat(Double(bitPattern: bits))
+    }
+}
+
+/// Geometry is queried on demand in content-root coordinates. Text offsets use UTF-16.
+public enum OuterframeAccessibilityTextQuery: UInt8, Sendable {
+    case frameForRange = 0, rangeForPosition, lineForIndex, rangeForLine, visibleRange
+}
+
+public struct OuterframeAccessibilityTextResult: Sendable {
+    public var range: NSRange
+    public var frame: CGRect
+    public var index: Int
+    public init(range: NSRange = NSRange(location: 0, length: 0), frame: CGRect = .zero, index: Int = 0) {
+        self.range = range
+        self.frame = frame
+        self.index = index
+    }
+}
+
+public enum OuterframeAccessibilityTextRange {
+    public static func isValid(_ range: NSRange, in text: String) -> Bool {
+        let value = text as NSString
+        guard range.location >= 0, range.length >= 0, range.location <= value.length,
+              range.length <= value.length - range.location else { return false }
+        func isBoundary(_ index: Int) -> Bool {
+            guard index > 0, index < value.length else { return true }
+            return !(0xDC00...0xDFFF).contains(value.character(at: index))
+                || !(0xD800...0xDBFF).contains(value.character(at: index - 1))
+        }
+        return isBoundary(range.location) && isBoundary(NSMaxRange(range))
     }
 }

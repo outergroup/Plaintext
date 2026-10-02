@@ -464,6 +464,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var pathPromptMode: PathPromptMode?
     private var pathPromptText = ""
     private var pathPromptCursorOffset = 0
+    private var pathPromptSelectionRange: NSRange?
+    private let pathPromptSelectionLayer = CALayer()
     private var pendingFilePicker: PendingFilePicker?
     private var filePickerPanelFrame = CGRect.zero
     private var filePickerListFrame = CGRect.zero
@@ -716,7 +718,12 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 return
             } else if pathPromptMode != nil {
                 let textLength = (pathPromptText as NSString).length
-                pathPromptCursorOffset = min(max(Int(position), 0), textLength)
+                let destination = min(max(Int(position), 0), textLength)
+                guard OuterframeAccessibilityTextRange.isValid(NSRange(location: destination, length: 0), in: pathPromptText) else { return }
+                let anchor = pathPromptSelectionRange?.location ?? pathPromptCursorOffset
+                pathPromptSelectionRange = modifySelection && destination != anchor
+                    ? NSRange(location: min(anchor, destination), length: abs(destination - anchor)) : nil
+                pathPromptCursorOffset = destination
                 layout()
             } else {
                 setCursorOffset(Int(position), modifySelection: modifySelection)
@@ -750,8 +757,15 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             paste(items)
         case .contextMenuItemSelected(let menuID, let itemID):
             handleContextMenuItem(menuID: menuID, itemID: itemID)
+        case .accessibilityActionAndSnapshot(let requestID, let identifier, let action, let value):
+            performAccessibilityAction(identifier, action: action, value: value)
+            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: buildAccessibilitySnapshot())
         case .accessibilityAction(let identifier, let action, let value):
             performAccessibilityAction(identifier, action: action, value: value)
+        case .accessibilityTextQuery(let requestID, let identifier, let query, let range, let point):
+            _ = buildAccessibilitySnapshot()
+            outerframeHost.sendAccessibilityTextResponse(requestID: requestID,
+                result: accessibilityTextQuery(identifier: identifier, query: query, range: range, point: point))
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID,
                                                              snapshot: buildAccessibilitySnapshot())
@@ -840,6 +854,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         rootLayer.addSublayer(filePickerOverlayLayer)
         headerLayer.addSublayer(toolbarDividerLayer)
         headerLayer.addSublayer(pathChevronLayer)
+        headerLayer.addSublayer(pathPromptSelectionLayer)
         headerLayer.addSublayer(pathPromptCursorLayer)
         headerLayer.addSublayer(findBarLayer)
         pathPromptCursorLayer.zPosition = 10
@@ -1037,10 +1052,19 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                        width: max(currentSize.width - pathChevronLayer.frame.maxX - 18, 1),
                                        height: 17)
             layoutFindBar()
+            pathPromptSelectionLayer.isHidden = !isPrompting || pathPromptSelectionRange == nil
+            if isPrompting, let selection = pathPromptSelectionRange {
+                let line = CTLineCreateWithAttributedString(NSAttributedString(string: pathPromptText, attributes: [.font: pathFont]))
+                let start = CTLineGetOffsetForStringIndex(line, selection.location, nil)
+                let end = CTLineGetOffsetForStringIndex(line, NSMaxRange(selection), nil)
+                pathPromptSelectionLayer.frame = CGRect(x: pathLayer.frame.minX + min(start, end), y: textY,
+                    width: max(abs(end - start), 1), height: 18).intersection(pathLayer.frame)
+                pathPromptSelectionLayer.backgroundColor = resolvedCGColor(.selectedTextBackgroundColor)
+            }
             if isPrompting {
                 let cursorX = pathLayer.frame.minX + pathPromptCursorX(font: pathFont, maxWidth: pathLayer.frame.width)
                 pathPromptCursorLayer.frame = CGRect(x: cursorX, y: textY, width: cursorWidth, height: 17)
-                pathPromptCursorLayer.isHidden = false
+                pathPromptCursorLayer.isHidden = pathPromptSelectionRange != nil
                 startBlinkingCaret(pathPromptCursorLayer)
             } else {
                 pathPromptCursorLayer.isHidden = true
@@ -1541,6 +1565,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         filePickerNameInputController.setText(defaultName)
         filePickerScroll = 0
         filePickerSelectedIndex = nil
+        findInputController.blur()
+        filePickerNameInputController.focus()
         resetFilePickerTypeahead()
         renderFilePicker()
         fadeInFilePickerOverlayIfNeeded(shouldAnimate)
@@ -2284,6 +2310,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func beginPathPrompt(mode: PathPromptMode, defaultValue: String) {
         pathPromptMode = mode
+        findInputController.blur()
+        filePickerNameInputController.blur()
+        pathPromptSelectionRange = nil
         pathPromptText = defaultValue
         pathPromptCursorOffset = (pathPromptText as NSString).length
         renderHeader()
@@ -2293,6 +2322,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func cancelPathPrompt() {
         pathPromptMode = nil
         pathPromptText = ""
+        pathPromptSelectionRange = nil
         pathPromptCursorOffset = 0
         renderHeader()
         layout()
@@ -2326,7 +2356,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let nsString = pathPromptText as NSString
         var bestOffset = 0
         var bestDistance = CGFloat.greatestFiniteMagnitude
-        for offset in 0...nsString.length {
+        for offset in 0...nsString.length where OuterframeAccessibilityTextRange.isValid(NSRange(location: offset, length: 0), in: pathPromptText) {
             let prefix = nsString.substring(to: offset) as NSString
             let width = prefix.size(withAttributes: [.font: font]).width
             let distance = abs(width - relativeX)
@@ -2335,12 +2365,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 bestOffset = offset
             }
         }
+        pathPromptSelectionRange = nil
         pathPromptCursorOffset = bestOffset
         layout()
     }
 
     private func insertPathPromptText(_ value: String) {
-        replacePathPromptText(range: NSRange(location: pathPromptCursorOffset, length: 0), with: value)
+        replacePathPromptText(range: pathPromptSelectionRange ?? NSRange(location: pathPromptCursorOffset, length: 0), with: value)
     }
 
     private func replacePathPromptText(range: NSRange, with replacement: String) {
@@ -2349,21 +2380,24 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let safeLength = min(max(range.length, 0), nsString.length - safeLocation)
         pathPromptText = nsString.replacingCharacters(in: NSRange(location: safeLocation, length: safeLength),
                                                       with: replacement)
+        pathPromptSelectionRange = nil
         pathPromptCursorOffset = safeLocation + (replacement as NSString).length
         renderHeader()
         layout()
     }
 
     private func deletePathPromptBackward() {
+        if let selection = pathPromptSelectionRange { replacePathPromptText(range: selection, with: ""); return }
         let nsString = pathPromptText as NSString
         guard pathPromptCursorOffset > 0, nsString.length > 0 else { return }
-        replacePathPromptText(range: NSRange(location: pathPromptCursorOffset - 1, length: 1), with: "")
+        replacePathPromptText(range: nsString.rangeOfComposedCharacterSequence(at: pathPromptCursorOffset - 1), with: "")
     }
 
     private func deletePathPromptForward() {
+        if let selection = pathPromptSelectionRange { replacePathPromptText(range: selection, with: ""); return }
         let nsString = pathPromptText as NSString
         guard pathPromptCursorOffset < nsString.length else { return }
-        replacePathPromptText(range: NSRange(location: pathPromptCursorOffset, length: 1), with: "")
+        replacePathPromptText(range: nsString.rangeOfComposedCharacterSequence(at: pathPromptCursorOffset), with: "")
     }
 
     private func performPathPromptTextCommand(_ command: String) {
@@ -2377,16 +2411,24 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             deletePathPromptBackward()
         case "deleteForward", "deleteForwardByDecomposingPreviousCharacter":
             deletePathPromptForward()
+        case "selectAll":
+            pathPromptSelectionRange = nsString.length > 0 ? NSRange(location: 0, length: nsString.length) : nil
+            pathPromptCursorOffset = nsString.length
+            layout()
         case "moveLeft":
-            pathPromptCursorOffset = max(pathPromptCursorOffset - 1, 0)
+            pathPromptCursorOffset = pathPromptSelectionRange?.location ?? (pathPromptCursorOffset > 0 ? nsString.rangeOfComposedCharacterSequence(at: pathPromptCursorOffset - 1).location : 0)
+            pathPromptSelectionRange = nil
             layout()
         case "moveRight":
-            pathPromptCursorOffset = min(pathPromptCursorOffset + 1, nsString.length)
+            pathPromptCursorOffset = pathPromptSelectionRange.map(NSMaxRange) ?? (pathPromptCursorOffset < nsString.length ? NSMaxRange(nsString.rangeOfComposedCharacterSequence(at: pathPromptCursorOffset)) : nsString.length)
+            pathPromptSelectionRange = nil
             layout()
         case "moveToBeginningOfLine", "moveToBeginningOfDocument", "moveToLeftEndOfLine":
+            pathPromptSelectionRange = nil
             pathPromptCursorOffset = 0
             layout()
         case "moveToEndOfLine", "moveToEndOfDocument", "moveToRightEndOfLine":
+            pathPromptSelectionRange = nil
             pathPromptCursorOffset = nsString.length
             layout()
         default:
@@ -2831,7 +2873,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             } else if pathPromptMode != nil, viewIsFocused, windowIsActive {
                 editorCaretLayer.isHidden = true
                 stopBlinkingCaret(editorCaretLayer)
-                pathPromptCursorLayer.isHidden = false
+                pathPromptCursorLayer.isHidden = pathPromptSelectionRange != nil
                 startBlinkingCaret(pathPromptCursorLayer)
                 sendTextInputGeometryUpdate(rect: pathPromptCursorLayer.bounds, in: pathPromptCursorLayer, fieldID: editorInputID)
             } else if pathPromptMode != nil {
@@ -3541,6 +3583,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func pasteboardItemsForCopy() -> [OuterframeContentPasteboardItem] {
+        if pathPromptMode != nil {
+            return pasteboardItems(for: pathPromptSelectionRange.map { (pathPromptText as NSString).substring(with: $0) })
+        }
         if filePickerNameInputController.isFocused {
             return pasteboardItems(for: filePickerNameInputController.selectedTextContent())
         }
@@ -3560,6 +3605,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func pasteboardItemsForCut() -> [OuterframeContentPasteboardItem] {
+        if pathPromptMode != nil {
+            let items = pasteboardItemsForCopy()
+            if let selection = pathPromptSelectionRange { replacePathPromptText(range: selection, with: "") }
+            return items
+        }
         if filePickerNameInputController.isFocused {
             return pasteboardItems(for: filePickerNameInputController.cutSelectedTextContent())
         }
@@ -3596,6 +3646,12 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        if pathPromptMode != nil {
+            var commands: OuterframeEditCommandSet = [.paste]
+            if !pathPromptText.isEmpty { commands.insert(.selectAll) }
+            if pathPromptSelectionRange != nil { commands.formUnion([.copy, .cut]) }
+            return commands.intersection(requestedCommands)
+        }
         if filePickerNameInputController.isFocused {
             return filePickerNameInputController.enabledEditCommands(in: requestedCommands)
         }
@@ -3704,6 +3760,22 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
     }
 
+    private lazy var accessibilityTextLayout = PlaintextAccessibilityTextLayout(layoutManager: textLayoutManager)
+
+    private func accessibilityTextQuery(identifier: UInt32, query: OuterframeAccessibilityTextQuery, range: NSRange, point: CGPoint) -> OuterframeAccessibilityTextResult? {
+        if let key = ["find", "filename", "path-prompt"].first(where: { accessibilityIDs[$0] == identifier }),
+           let value = accessibilityNodes[identifier]?.value {
+            let layer = key == "find" ? findTextLayer : key == "filename" ? filePickerNameTextLayer : pathLayer
+            let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: value, attributes: [.font: font]))
+            return accessibilitySingleLineQuery(query, range: range, point: point, text: value, line: line,
+                frame: rootLayer.convert(layer.bounds, from: layer))
+        }
+        guard identifier == accessibilityIDs["editor"], pendingFilePicker == nil, !isLoading else { return nil }
+        return accessibilityTextLayout.query(query, range: range, point: point, text: text, generation: generation,
+            viewport: editorClipLayer.frame, scrollOffset: scrollOffset, inset: CGSize(width: textInsetX, height: textInsetY))
+    }
+
     private var accessibilityIDs: [String: UInt32] = [:]
     private var accessibilityNodes: [UInt32: OuterframeAccessibilityNode] = [:]
     private var accessibilityHandlers: [UInt32: (PlaintextHandler, OuterframeAccessibilityAction, String) -> Void] = [:]
@@ -3715,9 +3787,23 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                         handler: ((PlaintextHandler, OuterframeAccessibilityAction, String) -> Void)? = nil) -> OuterframeAccessibilityNode {
         let id = accessibilityIDs[key] ?? UInt32(accessibilityIDs.count + 1)
         accessibilityIDs[key] = id
+        var actions = actions
+        var selection = selection
+        let isField = ["find", "filename", "path-prompt"].contains(key)
+        if isField {
+            actions.insert(.setSelectedTextRange)
+            if key == "path-prompt" { selection = pathPromptSelectionRange ?? NSRange(location: pathPromptCursorOffset, length: 0) }
+            else {
+                let controller = key == "find" ? findInputController : filePickerNameInputController
+                let selected = controller.selectionRange ?? controller.cursorPosition..<controller.cursorPosition
+                let lower = controller.text.index(controller.text.startIndex, offsetBy: selected.lowerBound)
+                let upper = controller.text.index(controller.text.startIndex, offsetBy: selected.upperBound)
+                selection = NSRange(lower..<upper, in: controller.text)
+            }
+        }
         let node = OuterframeAccessibilityNode(identifier: id, role: role, frame: frame, label: label, value: value,
             children: children, rowCount: rowCount, isEnabled: enabled, actions: actions, isFocused: focused,
-            isSelected: selected, rowIndex: rowIndex, selectedTextRange: selection)
+            isSelected: selected, rowIndex: rowIndex, selectedTextRange: selection, supportsTextGeometry: key == "editor" || isField, supportsActionSnapshot: true)
         accessibilityNodes[id] = node
         accessibilityHandlers[id] = handler
         return node
@@ -3726,7 +3812,24 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func performAccessibilityAction(_ id: UInt32, action: OuterframeAccessibilityAction, value: String) {
         _ = buildAccessibilitySnapshot()
         guard let node = accessibilityNodes[id], node.isEnabled, node.actions.supports(action) else { return }
-        accessibilityHandlers[id]?(self, action, value)
+        if action == .setSelectedTextRange, let key = ["find", "filename", "path-prompt"].first(where: { accessibilityIDs[$0] == id }), let text = node.value {
+            let parts = value.split(separator: ":", omittingEmptySubsequences: false)
+            guard parts.count == 2, let location = Int(parts[0]), let length = Int(parts[1]),
+                  OuterframeAccessibilityTextRange.isValid(NSRange(location: location, length: length), in: text),
+                  let selected = Range(NSRange(location: location, length: length), in: text),
+                  (text.indices.contains(selected.lowerBound) || selected.lowerBound == text.endIndex),
+                  (text.indices.contains(selected.upperBound) || selected.upperBound == text.endIndex) else { return }
+            if key == "path-prompt" {
+                pathPromptSelectionRange = length > 0 ? NSRange(location: location, length: length) : nil
+                pathPromptCursorOffset = location + length
+                layout()
+            } else {
+                let controller = key == "find" ? findInputController : filePickerNameInputController
+                controller.focus()
+                controller.setCursorPosition(text.distance(from: text.startIndex, to: selected.lowerBound), modifySelection: false)
+                controller.setCursorPosition(text.distance(from: text.startIndex, to: selected.upperBound), modifySelection: true)
+            }
+        } else { accessibilityHandlers[id]?(self, action, value) }
         notifyAccessibilityLayoutChanged()
     }
 
@@ -3771,13 +3874,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             })
             children.append(axNode("cancel-open", .button, filePickerCancelFrame, "Cancel", actions: [.press]) { owner, _, _ in owner.dismissFilePicker() })
             children.append(axNode("open", .button, filePickerOpenFrame, "Open", actions: [.press], enabled: !picker.isLoading) { owner, _, _ in owner.openFilePickerTypedPath() })
-            return OuterframeAccessibilitySnapshot(rootNodes: [axNode("picker", .container, filePickerPanelFrame, "Open File", children: children)])
+            return OuterframeAccessibilitySnapshot(rootNodes: [axNode("picker", .dialog, filePickerPanelFrame, "Open File", children: children)])
         }
         if let mode = pathPromptMode {
             children.append(axNode("path-prompt", .textField, headerLayer.convert(pathControlFrame, to: rootLayer), "\(mode.label) path",
                                    value: pathPromptText, actions: [.focus, .setValue], focused: true) { owner, action, value in
                 if action == .setValue {
                     owner.pathPromptText = value
+                    owner.pathPromptSelectionRange = nil
                     owner.pathPromptCursorOffset = value.utf16.count
                     owner.renderHeader()
                     owner.updateCursor()
@@ -3819,7 +3923,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 let parts = value.split(separator: ":", omittingEmptySubsequences: false)
                 guard parts.count == 2, let location = Int(parts[0]), let length = Int(parts[1]), location >= 0, length >= 0,
                       location <= owner.text.utf16.count, length <= owner.text.utf16.count - location,
-                      Range(NSRange(location: location, length: length), in: owner.text) != nil else { return }
+                      OuterframeAccessibilityTextRange.isValid(NSRange(location: location, length: length), in: owner.text) else { return }
                 owner.focusAccessibleEditor()
                 owner.setCursorOffset(location, modifySelection: false)
                 owner.setCursorOffset(location + length, modifySelection: true)
@@ -3861,4 +3965,42 @@ private func withoutImplicitAnimations(_ updates: () -> Void) {
     CATransaction.setDisableActions(true)
     updates()
     CATransaction.commit()
+}
+
+private func accessibilitySingleLineQuery(_ query: OuterframeAccessibilityTextQuery, range: NSRange,
+                                           point: CGPoint, text: String, line: CTLine,
+                                           frame: CGRect) -> OuterframeAccessibilityTextResult? {
+    let count = text.utf16.count
+    switch query {
+    case .lineForIndex:
+        guard OuterframeAccessibilityTextRange.isValid(NSRange(location: range.location, length: 0), in: text) else { return nil }
+        return OuterframeAccessibilityTextResult(index: 0)
+    case .rangeForLine:
+        guard range.location == 0 else { return nil }
+        return OuterframeAccessibilityTextResult(range: NSRange(location: 0, length: count))
+    case .visibleRange:
+        let hit = CTLineGetStringIndexForPosition(line, CGPoint(x: frame.width, y: 0))
+        let end = hit == kCFNotFound ? count : min(max(hit, 0), count)
+        let boundary = end < count ? (text as NSString).rangeOfComposedCharacterSequence(at: end).location : count
+        return OuterframeAccessibilityTextResult(range: NSRange(location: 0, length: boundary))
+    case .frameForRange:
+        guard OuterframeAccessibilityTextRange.isValid(range, in: text) else { return nil }
+        let a = CTLineGetOffsetForStringIndex(line, range.location, nil)
+        let b = CTLineGetOffsetForStringIndex(line, NSMaxRange(range), nil)
+        return OuterframeAccessibilityTextResult(range: range,
+            frame: CGRect(x: frame.minX + min(a, b), y: frame.minY, width: max(abs(b - a), 1), height: frame.height))
+    case .rangeForPosition:
+        guard frame.contains(point) else { return nil }
+        let x = point.x - frame.minX
+        let string = text as NSString
+        var offset = 0
+        while offset < count {
+            let cluster = string.rangeOfComposedCharacterSequence(at: offset)
+            let a = CTLineGetOffsetForStringIndex(line, cluster.location, nil)
+            let b = CTLineGetOffsetForStringIndex(line, NSMaxRange(cluster), nil)
+            if x >= min(a, b), x < max(a, b) { return OuterframeAccessibilityTextResult(range: cluster) }
+            offset = NSMaxRange(cluster)
+        }
+        return OuterframeAccessibilityTextResult(range: NSRange(location: x <= 0 ? 0 : count, length: 0))
+    }
 }
