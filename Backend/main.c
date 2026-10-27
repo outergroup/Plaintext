@@ -1071,6 +1071,8 @@ static void process_client_request(int fd, Buffer *request, size_t header_length
     if ((is_get || is_head) && (strcmp(target, "/") == 0 || strcmp(target, "/index") == 0) &&
         !request_accepts_outerframe(request->data, header_length)) {
         send_web_file(fd, "index.html", "text/html; charset=utf-8", request->data, header_length, !is_head);
+    } else if ((is_get || is_head) && (strcmp(target, "/web/app-icon.png") == 0 || strcmp(target, "/favicon.ico") == 0)) {
+        send_web_file(fd, "app-icon.png", "image/png", request->data, header_length, !is_head);
     } else if ((is_get || is_head) && strcmp(target, "/web/app.css") == 0) {
         send_web_file(fd, "app.css", "text/css; charset=utf-8", request->data, header_length, !is_head);
     } else if ((is_get || is_head) && strcmp(target, "/web/app.js") == 0) {
