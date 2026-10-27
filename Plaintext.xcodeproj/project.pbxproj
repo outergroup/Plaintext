@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		E03567A8E084482A901A0002 /* Environment.c in Sources */ = {isa = PBXBuildFile; fileRef = E03567A8E084482A901A0001 /* Environment.c */; };
 		PT0000000000000000000101 /* main.c in Sources */ = {isa = PBXBuildFile; fileRef = PT0000000000000000000008 /* main.c */; };
 		PT0000000000000000000201 /* app-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = PT0000000000000000000202 /* app-icon.png */; };
 /* End PBXBuildFile section */
@@ -25,6 +26,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		E03567A8E084482A901A0001 /* Environment.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = Environment.c; sourceTree = "<group>"; };
 		PT0000000000000000000003 /* Plaintext.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = Plaintext.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
 		PT0000000000000000000004 /* PlaintextBackend */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = PlaintextBackend; sourceTree = BUILT_PRODUCTS_DIR; };
 		PT0000000000000000000008 /* main.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = main.c; sourceTree = "<group>"; };
@@ -100,6 +102,7 @@
 			isa = PBXGroup;
 			children = (
 				PT0000000000000000000008 /* main.c */,
+				E03567A8E084482A901A0001 /* Environment.c */,
 			);
 			path = Backend;
 			sourceTree = "<group>";
@@ -214,6 +217,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				PT0000000000000000000101 /* main.c in Sources */,
+				E03567A8E084482A901A0002 /* Environment.c in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -134,7 +134,7 @@ cmd_build_frontend() {
         "${STAGE_ROOT}/bundles" \
         "${BUNDLE_ARCHIVE_STEM}"
     install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/app-icon.png"
-    install -m 0644 "${ROOT}/Resources/PlaintextWeb/index.html" "${ROOT}/Resources/PlaintextWeb/app.css" "${ROOT}/Resources/PlaintextWeb/app.js" "${STAGE_ROOT}/web/"
+    install -m 0644 "${ROOT}/Resources/PlaintextWeb/index.html" "${ROOT}/Resources/PlaintextWeb/app.css" "${ROOT}/Resources/PlaintextWeb/app.js" "${ROOT}/Resources/PlaintextWeb/environment.js" "${STAGE_ROOT}/web/"
 }
 
 backend_directory() {
@@ -176,20 +176,20 @@ build_backend_in_docker() {
         -e "BACKEND_CFLAGS=${BACKEND_CFLAGS}" \
         -e "BACKEND_LDFLAGS=${BACKEND_LDFLAGS}" \
         "${image}" \
-        bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
+        bash -lc '"$CC" $BACKEND_CFLAGS -o "/out/$BACKEND_EXECUTABLE_NAME" "/src/$BACKEND_SOURCE" /src/Backend/Environment.c $BACKEND_LDFLAGS && strip --strip-unneeded "/out/$BACKEND_EXECUTABLE_NAME"'
 }
 
 build_backend_on_target() {
     local output_dir remote_build=".cache/outershell-app-build/${APP_ID}"
     output_dir="$(backend_directory "${STAGE_ROOT}" "${TARGET_LIBC}" "${TARGET_ARCH}")"
     echo "==> Docker is unavailable; building ${BACKEND_EXECUTABLE_NAME} on the ${TARGET_LIBC} target"
-    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" Backend | run_ssh "
+    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" Backend Helper | run_ssh "
         set -e
         rm -rf \"\$HOME/${remote_build}\"
         mkdir -p \"\$HOME/${remote_build}\"
         tar xzf - -C \"\$HOME/${remote_build}\"
         cc ${BACKEND_CFLAGS} -o \"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\" \
-            \"\$HOME/${remote_build}/${BACKEND_SOURCE}\" ${BACKEND_LDFLAGS}
+            \"\$HOME/${remote_build}/${BACKEND_SOURCE}\" \"\$HOME/${remote_build}/Backend/Environment.c\" ${BACKEND_LDFLAGS}
         if command -v strip >/dev/null 2>&1; then
             strip --strip-unneeded \"\$HOME/${remote_build}/${BACKEND_EXECUTABLE_NAME}\"
         fi

@@ -12,4 +12,7 @@ rm -rf "$RUN_ROOT"
 mkdir -p "$RUN_ROOT/bundles"
 Scripts/archive_plaintext_bundle.sh "$BUILD_ROOT/Release/Plaintext.bundle" "$RUN_ROOT/bundles"
 
+mkdir -p "${RUN_ROOT}/web"
+cp -R "$PWD/Resources/PlaintextWeb/." "${RUN_ROOT}/web/"
+
 "$BUILD_ROOT/Release/PlaintextBackend" --port "$PORT" --bundles-dir "$RUN_ROOT/bundles"

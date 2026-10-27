@@ -40,6 +40,8 @@ extern int launch_activate_socket(const char *name, int **fds, size_t *cnt);
 #define MAX_CLIENTS 256
 #define CLIENT_TIMEOUT_SECONDS 5
 
+#include "EnvironmentTools.h"
+
 static const char *kBundleUrlPath = "/bundles/PlaintextContent-v12";
 static const char *kBundleUrlPathMacosArm = "/bundles/PlaintextContent-v12/macos-arm";
 static const char *kBundleUrlPathMacosX86 = "/bundles/PlaintextContent-v12/macos-x86";
@@ -1048,6 +1050,7 @@ static size_t content_length_from_headers(const char *headers) {
 }
 
 static void process_client_request(int fd, Buffer *request, size_t header_length, size_t content_length) {
+    bool has_environment_header = environment_request_header(request->data, header_length);
     char *header_end = request->data + header_length - 4;
     *header_end = '\0';
     char method[16] = "";
@@ -1066,6 +1069,17 @@ static void process_client_request(int fd, Buffer *request, size_t header_length
         query = "";
     }
 
+    if (strcmp(target, "/api/environments") == 0) {
+        if (strcasecmp(method, "POST") == 0 && !has_environment_header) {
+            send_text_response(fd, 403, "Missing environment request header\n"); return;
+        }
+        size_t result_length = 0;
+        char *result = environment_tools_request(method, request->data + header_length, content_length, &result_length);
+        if (!result) { send_text_response(fd, 503, "Plaintext helper connection failed. Reopen the file to check whether a write completed before retrying.\n"); return; }
+        send_response(fd, 200, "OK", "application/octet-stream", result, result_length);
+        free(result); return;
+    }
+
     bool is_get = strcasecmp(method, "GET") == 0;
     bool is_head = strcasecmp(method, "HEAD") == 0;
     if ((is_get || is_head) && (strcmp(target, "/") == 0 || strcmp(target, "/index") == 0) &&
@@ -1077,6 +1091,8 @@ static void process_client_request(int fd, Buffer *request, size_t header_length
         send_web_file(fd, "app.css", "text/css; charset=utf-8", request->data, header_length, !is_head);
     } else if ((is_get || is_head) && strcmp(target, "/web/app.js") == 0) {
         send_web_file(fd, "app.js", "text/javascript; charset=utf-8", request->data, header_length, !is_head);
+    } else if ((is_get || is_head) && strcmp(target, "/web/environment.js") == 0) {
+        send_web_file(fd, "environment.js", "text/javascript; charset=utf-8", request->data, header_length, !is_head);
     } else if ((is_get || is_head) &&
         (strcmp(target, "/") == 0 || strcmp(target, "/index") == 0 ||
          strcmp(target, "/index.outer") == 0 || strcmp(target, "/plaintext.outer") == 0)) {

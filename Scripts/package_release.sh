@@ -94,6 +94,7 @@ install_shared_resources() {
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/web/app-icon.png"
     install -m 0644 "${REPO_ROOT}/Resources/PlaintextWeb/app.css" "${app_root}/web/app.css"
     install -m 0644 "${REPO_ROOT}/Resources/PlaintextWeb/app.js" "${app_root}/web/app.js"
+    install -m 0644 "${REPO_ROOT}/Resources/PlaintextWeb/environment.js" "${app_root}/web/environment.js"
 }
 
 write_info_plist() {
