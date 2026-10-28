@@ -18,7 +18,8 @@ class Connection(http.client.HTTPConnection):
  def connect(self):self.sock=socket.socket(socket.AF_UNIX);self.sock.settimeout(10);self.sock.connect(self.path)
 with tempfile.TemporaryDirectory(prefix='env-http-',dir='/tmp') as temp:
  work=Path(temp);sock=work/'app.sock';web=work/'web';web.mkdir()
- (web/'environment.js').write_bytes((root/'Resources'/f'{app}Web/environment.js').read_bytes())
+ for name in ['environment.js','offline.js','sw.js']:
+  (web/name).write_bytes((root/'Resources'/f'{app}Web'/name).read_bytes())
  file=work/'file.txt';file.write_text('HTTP binary ☃')
  env=dict(os.environ,XDG_STATE_HOME=str(work/'state'))
  process=subprocess.Popen([backend,'--socket-path',str(sock),'--web-root',str(web)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,env=env)
@@ -44,6 +45,10 @@ with tempfile.TemporaryDirectory(prefix='env-http-',dir='/tmp') as temp:
   assert 'error' in decode_client(request(b'not a binary packet')[1])
   c=Connection(str(sock));c.request('GET','/web/environment.js');r=c.getresponse()
   assert r.status==200 and b'EnvironmentBinary' in r.read();c.close()
+  assert decode_client(request(encode_client('disk',path=str(file)))[1])['contents']=='HTTP binary ☃'
+  for route, marker in [('/web/offline.js',b'PlaintextDrafts'),('/sw.js',b'plaintext-shell-')]:
+   c=Connection(str(sock));c.request('GET',route);r=c.getresponse()
+   assert r.status==200 and marker in r.read();c.close()
   print(f'PASS {app}: real HTTP binary body, final-header guard, missing guard rejection, malformed packet, codec asset')
  finally:
   process.terminate();process.wait(timeout=5);process.stderr.close()

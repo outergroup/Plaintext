@@ -155,6 +155,12 @@ protocol OuterframeHostDelegate: AnyObject {
 @MainActor
 final class OuterframeHost: SocketToBrowserDelegate {
     let socket: SocketToBrowser
+    var dataDirectoryURL: URL? {
+        guard let path = ProcessInfo.processInfo.environment["OUTERFRAME_DATA_DIR"],
+              path.hasPrefix("/") else { return nil }
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
     var stagedFileDirectoryURL: URL? {
         guard let path = ProcessInfo.processInfo.environment["OUTERFRAME_STAGING_DIR"],
               !path.isEmpty else {

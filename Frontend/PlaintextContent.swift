@@ -28,61 +28,6 @@ private struct PlaintextConfiguration {
     }
 }
 
-private struct FileLoadResponse {
-    let ok: Bool
-    let path: String
-    let contents: String
-    let size: UInt64
-    let modified: Double
-    let error: String
-    let dirty: Bool
-
-    init?(data: Data) {
-        guard PlaintextBinary.version(in: data) == 1,
-              let flags = PlaintextBinary.uint8(in: data, at: 4),
-              let size = PlaintextBinary.uint64(in: data, at: 8),
-              let modified = PlaintextBinary.double(in: data, at: 16),
-              let path = PlaintextBinary.stringRef64(in: data, at: 24),
-              let contents = PlaintextBinary.stringRef64(in: data, at: 40),
-              let error = PlaintextBinary.stringRef64(in: data, at: 56) else {
-            return nil
-        }
-        self.ok = flags & 1 != 0
-        self.dirty = flags & 2 != 0
-        self.path = path
-        self.contents = contents
-        self.size = size
-        self.modified = modified
-        self.error = error
-    }
-}
-
-private struct FileSaveResponse {
-    let ok: Bool
-    let path: String
-    let size: UInt64
-    let modified: Double
-    let error: String
-    let dirty: Bool
-
-    init?(data: Data) {
-        guard PlaintextBinary.version(in: data) == 1,
-              let flags = PlaintextBinary.uint8(in: data, at: 4),
-              let size = PlaintextBinary.uint64(in: data, at: 8),
-              let modified = PlaintextBinary.double(in: data, at: 16),
-              let path = PlaintextBinary.stringRef64(in: data, at: 24),
-              let error = PlaintextBinary.stringRef64(in: data, at: 40) else {
-            return nil
-        }
-        self.ok = flags & 1 != 0
-        self.dirty = flags & 2 != 0
-        self.path = path
-        self.size = size
-        self.modified = modified
-        self.error = error
-    }
-}
-
 private enum PlaintextBinary {
     static func version(in data: Data) -> UInt32? {
         uint32(in: data, at: 0)
@@ -361,6 +306,8 @@ private final class SymbolImageLayer: CALayer {
 private enum PathPromptMode {
     case open
     case moveRename
+    case saveAs
+    case saveCopy
 
     var label: String {
         switch self {
@@ -368,6 +315,8 @@ private enum PathPromptMode {
             return "Open"
         case .moveRename:
             return "Move/Rename"
+        case .saveAs: return "Save As"
+        case .saveCopy: return "Save a Copy"
         }
     }
 }
@@ -387,16 +336,18 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var currentURLString = ""
 
     private var urlSession: URLSession?
-    private var fileEndpoint: URL?
     private var filesEndpoint: URL?
     private var filePath = ""
-    private var loadedModified: Double = 0
-    private var loadedSize: UInt64 = 0
     private var statusText = "Loading..."
     private var isLoading = false
     private var isSaving = false
-    private var saveTask: URLSessionDataTask?
-    private var draftTask: URLSessionDataTask?
+    private var environmentEndpoint: URL?
+    private var draftStore: PlaintextDraftStore?
+    private var document: PlaintextDocument?
+    private var documents: [String: PlaintextDocument] = [:]
+    private var reviewedDisk: PlaintextReply?
+    private var showingServerVersion = false
+    private var didRestoreQueue = false
 
     private let rootLayer = CALayer()
     private let backgroundLayer = CALayer()
@@ -771,11 +722,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                                              snapshot: buildAccessibilitySnapshot())
         case .historyTraversal(_, let url):
             currentURLString = url
-            if let nextPath = filePath(from: url), nextPath != filePath {
-                filePath = nextPath
-                loadFile()
-            }
+            openDocument(path: filePath(from: url) ?? "", draftID: queryValue("draft"), target: queryValue("target"))
         case .shutdown:
+            flushDrafts()
             retainedSelf = nil
         default:
             break
@@ -783,6 +732,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        flushDrafts()
         retainedSelf = nil
     }
 
@@ -809,12 +759,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if let data = arguments.data,
            let configuration = PlaintextConfiguration(data: data),
            let base = outerframeHost.pluginBaseURL() {
-            fileEndpoint = URL(string: configuration.fileAPIPath, relativeTo: base)?.absoluteURL
             filesEndpoint = URL(string: configuration.filesAPIPath, relativeTo: base)?.absoluteURL
         } else if let base = outerframeHost.pluginBaseURL() {
-            fileEndpoint = URL(string: "/api/file", relativeTo: base)?.absoluteURL
             filesEndpoint = URL(string: "/api/files", relativeTo: base)?.absoluteURL
         }
+        if let base = outerframeHost.pluginBaseURL() {
+            environmentEndpoint = URL(string: "/api/environments", relativeTo: base)?.absoluteURL
+        }
+        draftStore = PlaintextDraftStore(directory: outerframeHost.dataDirectoryURL)
         filePath = filePath(from: arguments.url) ?? ""
 
         let configuration = URLSessionConfiguration.ephemeral
@@ -1011,7 +963,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func statusColor() -> NSColor {
-        statusText.lowercased().contains("error") || statusText.lowercased().contains("failed")
+        document?.localError != nil || statusText.lowercased().contains("error") || statusText.lowercased().contains("failed")
             ? .systemRed
             : .secondaryLabelColor
     }
@@ -1039,7 +991,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             renderHeader()
             let pathX: CGFloat = 14
             let renderedStatus = (statusLayer.string as? String) ?? ""
-            let statusWidth = renderedStatus.isEmpty ? CGFloat(0) : min(max(statusLayer.preferredFrameSize().width + 2, 58), 120)
+            let statusWidth = renderedStatus.isEmpty ? CGFloat(0) : min(max(statusLayer.preferredFrameSize().width + 2, 58), currentSize.width * 0.65)
             let availablePathWidth = max(currentSize.width - pathX - statusWidth - 48, 42)
             let pathWidth = min(max(pathLayer.preferredFrameSize().width + 2, 42), availablePathWidth)
             let textY = floor((headerHeight - 18) / 2) + 1
@@ -2074,202 +2026,192 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func documentDisplayName() -> String {
-        filePath.isEmpty ? "No file" : filePath
+        filePath.isEmpty ? "Untitled" : filePath
+    }
+
+    private func queryValue(_ name: String) -> String? {
+        URLComponents(string: currentURLString)?.queryItems?.first(where: { $0.name == name })?.value
     }
 
     private func loadFile() {
-        guard !filePath.isEmpty else {
-            statusText = "Open with ?file=/path/to/file.txt"
-            text = ""
-            cursorOffset = 0
-            selectionAnchor = nil
-            updateTextContent(force: true)
-            layout()
-            return
-        }
-        guard let fileEndpoint, let urlSession else { return }
-        isLoading = true
-        statusText = "Loading..."
-        layout()
+        openDocument(path: filePath, draftID: queryValue("draft"), target: queryValue("target"))
+    }
 
-        var components = URLComponents(url: fileEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "file", value: filePath)]
-        guard let url = components?.url else { return }
-        urlSession.dataTask(with: url) { [weak self] data, _, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isLoading = false
-                if let error {
-                    self.statusText = "Load failed: \(error.localizedDescription)"
-                } else if let data,
-                          let response = FileLoadResponse(data: data) {
-                    self.filePath = response.path
-                    self.loadedSize = response.size
-                    self.loadedModified = response.modified
-                    if response.ok {
-                        self.text = response.contents
-                        self.cursorOffset = 0
-                        self.selectionAnchor = nil
-                        self.scrollOffset = 0
-                        self.statusText = self.documentStatusText(dirty: response.dirty)
-                    } else if response.error == "No such file or directory" {
-                        self.text = ""
-                        self.loadedSize = 0
-                        self.loadedModified = 0
-                        self.cursorOffset = 0
-                        self.selectionAnchor = nil
-                        self.scrollOffset = 0
-                        self.statusText = "New file"
-                    } else {
-                        self.text = ""
-                        self.cursorOffset = 0
-                        self.selectionAnchor = nil
-                        self.statusText = "Load failed: \(response.error)"
-                    }
-                    self.updateTextContent(force: true)
-                } else {
-                    self.statusText = "Load failed: invalid response"
+    private func flushDrafts() {
+        let documents = Array(documents.values)
+        Task { for document in documents { _ = await document.persist() } }
+    }
+
+    private func makeDocument(_ record: PlaintextDraft, storage: PlaintextDraftStore? = nil) -> PlaintextDocument? {
+        guard let store = storage ?? draftStore, let session = urlSession, let endpoint = environmentEndpoint else { return nil }
+        let doc = PlaintextDocument(draft: record, store: store) { operation, target, path, revision, contents in
+            try await PlaintextEnvironment.request(session: session, endpoint: endpoint, operation: operation,
+                                                   target: target, path: path, revision: revision, contents: contents)
+        }
+        doc.changed = { [weak self, weak doc] in
+            guard let self, let doc, self.document === doc else { return }
+            self.filePath = doc.draft.path
+            self.isSaving = doc.isSaving
+            let previousStatus = self.statusText
+            self.statusText = self.showingServerVersion ? "Server version (read-only) · Use the file menu to return to your draft" : doc.status
+            self.outerframeHost.setTitle((self.showingServerVersion ? "Server version · " : "") + (doc.draft.dirty ? "• " : "") + (doc.draft.path.isEmpty ? "Untitled" : (doc.draft.path as NSString).lastPathComponent))
+            self.updateURLForCurrentFile()
+            self.renderHeader(); self.updateColors()
+            if previousStatus != self.statusText { self.layout() }
+        }
+        documents[record.id] = doc
+        return doc
+    }
+
+    private func activate(_ doc: PlaintextDocument) {
+        document = doc; reviewedDisk = nil; showingServerVersion = false
+        filePath = doc.draft.path; text = doc.draft.contents
+        cursorOffset = 0; selectionAnchor = nil; scrollOffset = 0
+        clearMarkedTextState()
+        doc.changed?(); updateTextContent(force: true); layout()
+        doc.resume()
+    }
+
+    private func openDocument(path: String, draftID: String? = nil, new: Bool = false, target requestedTarget: String? = nil) {
+        guard !isLoading, let store = draftStore, let session = urlSession, let endpoint = environmentEndpoint else { return }
+        isLoading = true; statusText = "Opening…"; renderHeader()
+        let target = requestedTarget ?? document?.draft.target ?? queryValue("target") ?? "host"
+        Task {
+            defer { isLoading = false; renderHeader(); updateColors() }
+            if let document, !(await document.persist()) { statusText = document.status; return }
+            do {
+                let records: [PlaintextDraft]
+                do { records = try await store.all() }
+                catch {
+                    if document != nil { throw error }
+                    records = []
                 }
-                self.layout()
-                self.updateColors()
+                var record = new ? nil : records.first { draftID != nil ? $0.id == draftID : $0.path == path && $0.target == target }
+                if let record, let existing = documents[record.id] { activate(existing); return }
+                if record == nil {
+                    var fresh = PlaintextDraft(); fresh.target = target; fresh.path = path
+                    if !path.isEmpty {
+                        let result = try await PlaintextEnvironment.request(session: session, endpoint: endpoint, operation: 2, target: target, path: path)
+                        fresh.path = result.path; fresh.contents = result.contents; fresh.revision = result.revision
+                        fresh.dirty = result.dirty; fresh.conflict = result.conflict
+                    }
+                    record = fresh
+                }
+                guard var selected = record else { return }
+                var selectedStore = store
+                do {
+                    if !(try await store.claim(selected.id)) {
+                        selected.id = UUID().uuidString; selected.pending = nil
+                        guard try await store.claim(selected.id) else { throw PlaintextDocumentError.message("Cannot claim a new draft") }
+                    }
+                } catch {
+                    if document != nil { throw error }
+                    selected.id = UUID().uuidString
+                    selectedStore = PlaintextDraftStore(directory: nil, unavailableReason: error.localizedDescription)
+                }
+                guard let doc = makeDocument(selected, storage: selectedStore) else { return }
+                _ = await doc.persist(); activate(doc)
+                if !didRestoreQueue {
+                    didRestoreQueue = true
+                    for record in records where record.pending != nil && !record.conflict && documents[record.id] == nil {
+                        if try await store.claim(record.id), let queued = makeDocument(record) { queued.resume() }
+                    }
+                }
+                if !doc.draft.dirty && doc.draft.pending == nil && !doc.draft.path.isEmpty {
+                    let version = doc.draft.version
+                    Task {
+                        do {
+                            let result = try await doc.disk()
+                            guard document === doc, doc.draft.version == version, !doc.draft.dirty, doc.draft.pending == nil else { return }
+                            doc.draft.contents = result.contents; doc.draft.revision = result.revision
+                            _ = await doc.persist()
+                            if document === doc && doc.draft.version == version { text = doc.draft.contents; updateTextContent(force: true) }
+                        } catch {
+                            if document === doc && !doc.draft.dirty { statusText = "Local copy · " + error.localizedDescription; renderHeader() }
+                        }
+                    }
+                }
+            } catch {
+                if let document { filePath = document.draft.path }
+                statusText = error.localizedDescription
             }
-        }.resume()
+        }
     }
 
     private func scheduleSave() {
-        guard !filePath.isEmpty else { return }
-        statusText = documentStatusText(dirty: true)
-        renderHeader()
-        syncDraftNow()
-    }
-
-    private func syncDraftNow() {
-        guard !filePath.isEmpty,
-              let fileEndpoint,
-              let urlSession else {
-            return
-        }
-        draftTask?.cancel()
-
-        var components = URLComponents(url: fileEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
-            URLQueryItem(name: "file", value: filePath),
-            URLQueryItem(name: "draft", value: "1")
-        ]
-        guard let url = components?.url else { return }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Data(text.utf8)
-
-        draftTask = urlSession.dataTask(with: request)
-        draftTask?.resume()
+        guard !showingServerVersion else { return }
+        document?.edit(text)
     }
 
     private func saveNow() {
-        guard !filePath.isEmpty,
-              let fileEndpoint,
-              let urlSession else {
-            return
-        }
-        saveTask?.cancel()
-        draftTask?.cancel()
-        isSaving = true
-        statusText = "Saving..."
-        renderHeader()
-
-        var components = URLComponents(url: fileEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "file", value: filePath)]
-        guard let url = components?.url else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Data(text.utf8)
-
-        saveTask = urlSession.dataTask(with: request) { [weak self] data, _, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isSaving = false
-                if let error {
-                    self.statusText = "Save failed: \(error.localizedDescription)"
-                } else if let data,
-                          let response = FileSaveResponse(data: data) {
-                    if response.ok {
-                        self.loadedSize = response.size
-                        self.loadedModified = response.modified
-                        self.statusText = self.documentStatusText(dirty: false)
-                    } else {
-                        self.statusText = "Save failed: \(response.error)"
-                    }
-                } else {
-                    self.statusText = "Save failed: invalid response"
-                }
-                self.renderHeader()
-                self.updateColors()
-            }
-        }
-        saveTask?.resume()
+        guard let document, !isLoading, !showingServerVersion else { return }
+        if document.draft.conflict { reviewServerVersion(); return }
+        if document.draft.path.isEmpty { beginPathPrompt(mode: .saveAs, defaultValue: ""); return }
+        Task { await document.save() }
     }
 
     private func openPath(_ path: String) {
         let nextPath = normalizedPath(path, relativeTo: filePath)
         guard !nextPath.isEmpty else { return }
-        filePath = nextPath
-        updateURLForCurrentFile()
-        loadFile()
+        openDocument(path: nextPath)
     }
 
     private func moveFile(to path: String) {
         let targetPath = normalizedPath(path, relativeTo: filePath)
-        guard !filePath.isEmpty, !targetPath.isEmpty, targetPath != filePath,
-              let fileEndpoint,
-              let urlSession else {
-            return
+        guard let document, !isLoading, !document.draft.dirty, document.draft.pending == nil,
+              !targetPath.isEmpty, targetPath != filePath, let session = urlSession, let endpoint = environmentEndpoint else {
+            statusText = "Save the file before moving it"; renderHeader(); return
         }
+        isLoading = true; statusText = "Moving…"; renderHeader()
+        Task {
+            defer { isLoading = false; renderHeader() }
+            guard await document.persist() else { return }
+            do {
+                let result = try await PlaintextEnvironment.request(session: session, endpoint: endpoint, operation: 4,
+                                                                    target: document.draft.target, path: document.draft.path,
+                                                                    destination: targetPath, revision: document.draft.revision)
+                document.draft.path = result.path; document.draft.revision = result.revision
+                _ = await document.persist(); document.changed?()
+            } catch { statusText = error.localizedDescription }
+        }
+    }
 
-        isSaving = true
-        statusText = "Moving..."
-        renderHeader()
-        updateColors()
+    private func reviewServerVersion() {
+        guard let doc = document else { return }
+        Task {
+            do {
+                let disk = try await doc.disk()
+                guard document === doc else { return }
+                reviewedDisk = disk; showingServerVersion = true; text = disk.contents
+                cursorOffset = 0; selectionAnchor = nil
+                updateTextContent(force: true); doc.changed?()
+            } catch { statusText = error.localizedDescription; renderHeader() }
+        }
+    }
 
-        var components = URLComponents(url: fileEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [
-            URLQueryItem(name: "file", value: filePath),
-            URLQueryItem(name: "moveTo", value: targetPath)
-        ]
-        guard let url = components?.url else { return }
+    private func returnToDraft() {
+        guard let document else { return }
+        showingServerVersion = false; text = document.draft.contents; cursorOffset = 0; selectionAnchor = nil
+        updateTextContent(force: true); document.changed?()
+    }
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Data()
-
-        urlSession.dataTask(with: request) { [weak self] data, _, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isSaving = false
-                if let error {
-                    self.statusText = "Move failed: \(error.localizedDescription)"
-                } else if let data,
-                          let response = FileSaveResponse(data: data) {
-                    if response.ok {
-                        self.filePath = response.path
-                        self.loadedSize = response.size
-                        self.loadedModified = response.modified
-                        self.statusText = self.documentStatusText(dirty: response.dirty)
-                        self.updateURLForCurrentFile()
-                    } else {
-                        self.statusText = "Move failed: \(response.error)"
-                    }
-                } else {
-                    self.statusText = "Move failed: invalid response"
-                }
-                self.renderHeader()
-                self.layout()
-                self.updateColors()
-            }
-        }.resume()
+    private func exportDraft() {
+        guard let document, let directory = outerframeHost.stagedFileDirectoryURL else { return }
+        let contents = document.draft.contents
+        Task {
+            do {
+                let url = try await Task.detached {
+                    let url = directory.appendingPathComponent("Plaintext-draft-" + UUID().uuidString + ".txt")
+                    try Data(contents.utf8).write(to: url)
+                    return url
+                }.value
+                outerframeHost.requestPasteboardWrite(items: [OuterframeContentPasteboardItem(representations: [
+                    OuterframeContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.fileURL.rawValue,
+                                                              data: Data(url.absoluteString.utf8))
+                ])])
+                statusText = "Draft copied as a file · Paste into Finder to keep it"; renderHeader()
+            } catch { statusText = "Export failed: " + error.localizedDescription; renderHeader() }
+        }
     }
 
     private func normalizedPath(_ value: String, relativeTo basePath: String) -> String {
@@ -2289,17 +2231,23 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             return
         }
         var items = components.queryItems ?? []
-        items.removeAll { $0.name == "file" }
+        items.removeAll { ["file", "draft", "target"].contains($0.name) }
         if !filePath.isEmpty {
             items.append(URLQueryItem(name: "file", value: filePath))
         }
+        if let document {
+            items.append(URLQueryItem(name: "draft", value: document.draft.id))
+            items.append(URLQueryItem(name: "target", value: document.draft.target))
+        }
         components.queryItems = items.isEmpty ? nil : items
         guard let url = components.url else { return }
+        guard currentURLString != url.absoluteString else { return }
         currentURLString = url.absoluteString
         outerframeHost.replaceHistoryEntry(url: url)
     }
 
     private func showOpenPrompt() {
+        if document?.draft.target != "host" { beginPathPrompt(mode: .open, defaultValue: filePath); return }
         showOpenFilePicker()
     }
 
@@ -2338,6 +2286,15 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             openPath(value)
         case .moveRename:
             moveFile(to: value)
+        case .saveAs:
+            let path = normalizedPath(value, relativeTo: filePath)
+            if !path.isEmpty, let document { Task { await document.save(path: path) } }
+        case .saveCopy:
+            let path = normalizedPath(value, relativeTo: filePath)
+            if !path.isEmpty, let document {
+                returnToDraft()
+                Task { await document.saveCopy(path: path) }
+            }
         }
     }
 
@@ -2449,32 +2406,33 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func showPathMenu(at point: CGPoint) {
         let menuID = UUID()
         pendingPathMenuIDs.insert(menuID)
-        let hasFile = !filePath.isEmpty
-        let items = [
-            OuterframeContextMenuItem(id: "path-title",
-                                      title: hasFile ? filePath : "No file",
-                                      isEnabled: false),
-            OuterframeContextMenuItem(id: "path-separator-1",
-                                      title: "",
-                                      kind: .separator,
-                                      isEnabled: false),
-            OuterframeContextMenuItem(id: "path-save",
-                                      title: "Save",
-                                      isEnabled: hasFile),
-            OuterframeContextMenuItem(id: "path-open",
-                                      title: "Open..."),
-            OuterframeContextMenuItem(id: "path-separator-2",
-                                      title: "",
-                                      kind: .separator,
-                                      isEnabled: false),
-            OuterframeContextMenuItem(id: "path-move-rename",
-                                      title: "Move/Rename...",
-                                      isEnabled: hasFile),
-            OuterframeContextMenuItem(id: "path-copy",
-                                      title: "Copy Path",
-                                      isEnabled: hasFile)
-        ]
-        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+        let doc = document
+        Task {
+            var recovery: [OuterframeContextMenuItem] = []
+            do {
+                if let draftStore {
+                    recovery = try await draftStore.all().map {
+                        OuterframeContextMenuItem(id: "recover:" + $0.id,
+                                                  title: ($0.path.isEmpty ? "Untitled" : $0.path) + " · " + $0.target + " · " + $0.updated.formatted() + ($0.pending == nil ? "" : " · Save queued"))
+                    }
+                }
+            } catch { statusText = error.localizedDescription; renderHeader() }
+            let items = [
+                OuterframeContextMenuItem(id: "path-save", title: "Save", isEnabled: doc != nil && !isLoading && !showingServerVersion),
+                OuterframeContextMenuItem(id: "path-new", title: "New"),
+                OuterframeContextMenuItem(id: "path-open", title: "Open…"),
+                OuterframeContextMenuItem(id: "path-recover", title: "Recover Draft", kind: .submenu, isEnabled: !recovery.isEmpty, children: recovery),
+                OuterframeContextMenuItem(id: "path-export", title: "Copy Draft as File", isEnabled: doc != nil),
+                OuterframeContextMenuItem(id: "path-copy-text", title: "Copy Draft Text", isEnabled: doc != nil),
+                OuterframeContextMenuItem(id: "path-save-copy", title: "Save a Copy…", isEnabled: doc != nil && doc?.isSynchronizing == false),
+                OuterframeContextMenuItem(id: "path-review", title: "Review Server Version", isEnabled: doc?.draft.conflict == true),
+                OuterframeContextMenuItem(id: "path-return", title: "Return to My Draft", isEnabled: showingServerVersion),
+                OuterframeContextMenuItem(id: "path-replace", title: "Replace Reviewed Server Version with My Draft…", isEnabled: reviewedDisk != nil && doc?.draft.conflict == true),
+                OuterframeContextMenuItem(id: "path-move-rename", title: "Move/Rename…", isEnabled: doc != nil && !filePath.isEmpty && doc?.draft.dirty == false && doc?.draft.pending == nil),
+                OuterframeContextMenuItem(id: "path-copy", title: "Copy Path", isEnabled: !filePath.isEmpty)
+            ]
+            outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+        }
     }
 
     private func copyCurrentPath() {
@@ -2484,10 +2442,6 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                                       data: Data(filePath.utf8))
         ])
         outerframeHost.requestPasteboardWrite(items: [item])
-    }
-
-    private func documentStatusText(dirty: Bool) -> String {
-        dirty ? "Modified" : ""
     }
 
     private func textFont() -> NSFont {
@@ -2964,8 +2918,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         updateEditingCapabilities()
     }
 
-    private func replace(range: NSRange, with replacement: String, scheduleSave shouldScheduleSave: Bool = true, clearsMarkedText: Bool = true) {
-        guard let normalized = normalizedReplacementRange(range),
+    private func replace(range: NSRange, with replacement: String, clearsMarkedText: Bool = true) {
+        guard !isLoading, !showingServerVersion, document != nil,
+              let normalized = normalizedReplacementRange(range),
               let swiftRange = Range(normalized, in: text) else {
             return
         }
@@ -2979,9 +2934,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             selectionAnchor = nil
             updateTextContent(force: true)
             ensureCursorVisible()
-            if shouldScheduleSave {
-                scheduleSave()
-            }
+            scheduleSave()
         }
     }
 
@@ -3003,6 +2956,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                hasReplacementRange: Bool,
                                replacementLocation: Int,
                                replacementLength: Int) {
+        guard !isLoading, !showingServerVersion, document != nil else { return }
         let requestedRange = hasReplacementRange
             ? NSRange(location: replacementLocation, length: replacementLength)
             : (markedTextRange ?? selectionRange ?? NSRange(location: cursorOffset, length: 0))
@@ -3011,7 +2965,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let markedLength = (value as NSString).length
         markedTextRange = markedLength > 0 ? NSRange(location: replacementRange.location, length: markedLength) : nil
         pendingMarkedTextReplacementRange = nil
-        replace(range: replacementRange, with: value, scheduleSave: false, clearsMarkedText: false)
+        replace(range: replacementRange, with: value, clearsMarkedText: false)
 
         let selectedLower = min(max(selectedLocation, 0), markedLength)
         let selectedUpper = min(max(selectedLower + selectedLength, selectedLower), markedLength)
@@ -3705,7 +3659,26 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             return
         }
         if pendingPathMenuIDs.remove(menuID) != nil {
+            if itemID.hasPrefix("recover:") { openDocument(path: "", draftID: String(itemID.dropFirst(8))); return }
             switch itemID {
+            case "path-new": openDocument(path: "", new: true)
+            case "path-export": exportDraft()
+            case "path-copy-text":
+                if let document { outerframeHost.requestPasteboardWrite(items: pasteboardItems(for: document.draft.contents)) }
+            case "path-save-copy": beginPathPrompt(mode: .saveCopy, defaultValue: filePath)
+            case "path-review": reviewServerVersion()
+            case "path-return": returnToDraft()
+            case "path-replace":
+                let confirmation = UUID(); pendingPathMenuIDs.insert(confirmation)
+                outerframeHost.showContextMenu(menuID: confirmation, items: [
+                    OuterframeContextMenuItem(id: "path-confirm-replace", title: "Replace Server File with My Draft"),
+                    OuterframeContextMenuItem(id: "path-cancel", title: "Cancel")
+                ], at: CGPoint(x: pathLayer.frame.minX, y: pathLayer.frame.maxY))
+            case "path-confirm-replace":
+                if let document, let reviewedDisk {
+                    returnToDraft()
+                    Task { await document.replaceReviewedFile(revision: reviewedDisk.revision) }
+                }
             case "path-save":
                 saveNow()
             case "path-open":
@@ -3910,8 +3883,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             children.append(axNode("find-count", .staticText, findStatusLayer.convert(findStatusLayer.bounds, to: rootLayer), "Matches", value: findStatusLayer.string as? String))
             children.append(axNode("find-done", .button, findDoneButtonLayer.convert(findDoneButtonLayer.bounds, to: rootLayer), "Done", actions: [.press]) { owner, _, _ in owner.hideFind() })
         }
+        var editorActions: OuterframeAccessibilityActions = [.focus, .setSelectedTextRange, .showMenu, .scrollUp, .scrollDown]
+        if !showingServerVersion { editorActions.insert(.setValue) }
         children.append(axNode("editor", .textArea, editorClipLayer.frame, filePath.isEmpty ? "Text editor" : "Text editor, \(filePath)", value: text,
-                               actions: [.focus, .setValue, .setSelectedTextRange, .showMenu, .scrollUp, .scrollDown], enabled: !isLoading,
+                               actions: editorActions, enabled: !isLoading,
                                focused: viewIsFocused && !findInputController.isFocused && pathPromptMode == nil,
                                selection: selectionRange ?? NSRange(location: cursorOffset, length: 0)) { owner, action, value in
             switch action {

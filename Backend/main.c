@@ -1091,6 +1091,10 @@ static void process_client_request(int fd, Buffer *request, size_t header_length
         send_web_file(fd, "app.css", "text/css; charset=utf-8", request->data, header_length, !is_head);
     } else if ((is_get || is_head) && strcmp(target, "/web/app.js") == 0) {
         send_web_file(fd, "app.js", "text/javascript; charset=utf-8", request->data, header_length, !is_head);
+    } else if ((is_get || is_head) && strcmp(target, "/sw.js") == 0) {
+        send_web_file(fd, "sw.js", "text/javascript; charset=utf-8", request->data, header_length, !is_head);
+    } else if ((is_get || is_head) && strcmp(target, "/web/offline.js") == 0) {
+        send_web_file(fd, "offline.js", "text/javascript; charset=utf-8", request->data, header_length, !is_head);
     } else if ((is_get || is_head) && strcmp(target, "/web/environment.js") == 0) {
         send_web_file(fd, "environment.js", "text/javascript; charset=utf-8", request->data, header_length, !is_head);
     } else if ((is_get || is_head) &&
