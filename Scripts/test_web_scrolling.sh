@@ -25,7 +25,7 @@ script = (web / 'app.js').read_text()
 start = script.index('function configurePopoverDismissal()')
 end = script.index('const wrapLinesKey=', start)
 render = script[script.index('function renderDocument()'):script.index('const recentFilesKey=')]
-fixture += '<script>const $=selector=>document.querySelector(selector);const state={active:{path:"/folder/example.txt",target:"host",dirty:false},replacing:false};const targetName=()=>"Host";' + script[start:end] + render + 'renderDocument();</script>'
+fixture += '<script>let editorPinching=false,movingDocument=null;const $=selector=>document.querySelector(selector);const state={active:{path:"/folder/example.txt",target:"host",dirty:false},replacing:false};const targetName=()=>"Host";' + script[start:end] + render + 'renderDocument();</script>'
 (output / 'Scrolling.app/fixture.html').write_text(fixture)
 source = (outerloop / 'OuterLoop/MobileBrowser/MobileBrowserView.swift').read_text()
 a = source.index('private struct MobilePageDragValue')
