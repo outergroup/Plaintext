@@ -22,7 +22,7 @@ fixture = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="w
 script = (web / 'app.js').read_text()
 start = script.index('function configurePopoverDismissal()')
 end = script.index('const wrapLinesKey=', start)
-render = script[script.index('function renderDocument()'):script.index('function showPath(')]
+render = script[script.index('function renderDocument()'):script.index('const recentFilesKey=')]
 fixture += '<script>const $=selector=>document.querySelector(selector);const state={active:{path:"/folder/example.txt",target:"host",dirty:false},replacing:false};const targetName=()=>"Host";' + script[start:end] + render + 'renderDocument();</script>'
 (output / 'Scrolling.app/fixture.html').write_text(fixture)
 source = (outerloop / 'OuterLoop/MobileBrowser/MobileBrowserView.swift').read_text()

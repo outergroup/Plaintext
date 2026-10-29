@@ -7,7 +7,7 @@ const storageUser = window.outerLoop?.sessionContext?.username || '';
 const documents = new Map();
 let recoveryWarning = '';
 const state = {target:query.get('target') || 'host', targets:[], active:null, replacing:false, pickerPath:'~', pickerSelected:null, pickerVersion:0};
-function status(text){$('#status').textContent=text;}
+function status(text){$('#status').textContent=text;$('#start-overlay-status').textContent=$('#start-overlay').open?text:'';}
 function configurePopoverDismissal(){
  const panels=[$('#document-menu'),$('#document-info')];
  let dismissing=false;
@@ -132,9 +132,13 @@ async function api(operation, values={}, context=state){
  }finally{clearTimeout(timeout);}
 }
 async function discover(){
- try{const result=await api('targets');state.targets=result.targets;const select=$('#environment');select.replaceChildren(...result.targets.map(t=>{const option=new Option(t.id==='host'?`Host — ${t.name}`:t.name+(t.state==='running'?'':` · ${t.state}`),t.id);option.disabled=t.state!=='running';return option}));if(!state.targets.some(t=>t.id===state.target))select.add(new Option('Unavailable container',state.target));select.value=state.target;$('#environment-errors').textContent=result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · ');if(state.active)showPath(state.active);else $('#targetLabel').textContent=targetName(state.target);renderDocument()}catch(e){$('#environment-errors').textContent=e.message}
+ try{const result=await api('targets');state.targets=result.targets;const select=$('#environment');select.replaceChildren(...result.targets.map(t=>{const option=new Option(t.id==='host'?`Host — ${t.name}`:t.name+(t.state==='running'?'':` · ${t.state}`),t.id);option.disabled=t.state!=='running';return option}));if(!state.targets.some(t=>t.id===state.target))select.add(new Option('Unavailable container',state.target));select.value=state.target;$('#environment-errors').textContent=result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · ');if(state.active)showPath(state.active);else $('#targetLabel').textContent=targetName(state.target);renderDocument();if(!state.active)void renderRecentFiles()}catch(e){$('#environment-errors').textContent=e.message}
 }
 function renderDocument(){
+ document.documentElement.toggleAttribute('data-start',!state.active);
+ $('#start-screen').hidden=!!state.active&&!$('#start-overlay')?.open;
+ for(const id of ['start-new','start-open'])$('#'+id).disabled=state.replacing;
+ for(const button of document.querySelectorAll('.recent-file'))button.disabled=state.replacing;
  const doc=state.active,dirty=!!(doc?.dirty||doc?.pendingSave);
  const saving=!!doc?.pendingSave&&doc.pendingSave.version===doc.version&&!doc.localError&&!doc.networkError&&!doc.conflict;
  $('#dirty').textContent=dirty?'Edited':'';
@@ -150,11 +154,42 @@ function renderDocument(){
  $('#review').hidden=!state.active?.conflict;
  $('#editor').disabled=!state.active||state.replacing;
  $('#save').disabled=!doc||state.replacing||saving||(!dirty&&!!doc.path);$('#move').disabled=!state.active?.path||state.replacing;
- for(const id of ['new','open','mobile-new','mobile-open','mobile-location','path','location-target'])$('#'+id).disabled=state.replacing;
+ for(const id of ['home','overflow-home','mobile-location','path','location-target'])$('#'+id).disabled=state.replacing;
  $('#download').disabled=!state.active;
  document.title=(dirty?'• ':'')+(state.active?(state.active.path.split('/').pop()||'Untitled'):'Plaintext');
 }
-function showPath(doc){$('#targetLabel').textContent=targetName(doc.target);const label=$('#pathLabel');label.replaceChildren();const parts=doc.path.split('/').filter(Boolean);const filename=document.createElement('strong');filename.textContent=parts.pop()||'Untitled';if(parts.length){const parent=document.createElement('span');parent.className='parent-path';parent.textContent=parts.join(' / ')+' / ';label.append(parent)}label.append(filename);$('#path').title=doc.path||'Untitled';history.replaceState(null,'','?'+new URLSearchParams({file:doc.path,target:doc.target,draft:doc.id}).toString().replace(/%2F/gi,'/'));}
+const recentFilesKey='plaintext.recentFiles.'+storageUser;
+function recentFiles(){
+ try{
+  const records=JSON.parse(localStorage.getItem(recentFilesKey)||'[]');
+  return Array.isArray(records)?records.filter(r=>r&&typeof r.path==='string'&&r.path&&typeof r.target==='string'&&Number.isFinite(r.openedAt)):[];
+ }catch{return [];}
+}
+function rememberFile(doc){
+ if(!doc.path)return;
+ const records=recentFiles().filter(r=>r.path!==doc.path||r.target!==doc.target);
+ records.unshift({path:doc.path,target:doc.target,openedAt:Date.now()});
+ try{localStorage.setItem(recentFilesKey,JSON.stringify(records.slice(0,30)));}catch{}
+}
+async function renderRecentFiles(){
+ const records=recentFiles(),known=new Set(records.map(r=>JSON.stringify([r.target,r.path])));
+ for(const record of await localRecords()){
+  const key=JSON.stringify([record.target,record.path]);
+  if(record.path&&!known.has(key)){records.push({path:record.path,target:record.target,openedAt:record.updatedAt||0});known.add(key);}
+ }
+ if(state.active&&!$('#start-overlay').open)return;
+ records.sort((a,b)=>b.openedAt-a.openedAt);
+ $('#recent-files').replaceChildren(...records.slice(0,30).map(record=>{
+  const button=document.createElement('button'),name=document.createElement('strong'),detail=document.createElement('span');
+  button.className='recent-file';button.disabled=state.replacing;
+  name.textContent=record.path.split('/').pop();detail.textContent=targetName(record.target)+' · '+record.path;
+  button.title=detail.textContent;button.append(name,detail);
+  button.onclick=()=>load(record.path,{target:record.target});return button;
+ }));
+ $('#recent-empty').hidden=records.length>0;
+}
+function documentURL(doc){return '?'+new URLSearchParams({file:doc.path,target:doc.target,draft:doc.id}).toString().replace(/%2F/gi,'/');}
+function showPath(doc){rememberFile(doc);$('#targetLabel').textContent=targetName(doc.target);const label=$('#pathLabel');label.replaceChildren();const parts=doc.path.split('/').filter(Boolean);const filename=document.createElement('strong');filename.textContent=parts.pop()||'Untitled';if(parts.length){const parent=document.createElement('span');parent.className='parent-path';parent.textContent=parts.join(' / ')+' / ';label.append(parent)}label.append(filename);$('#path').title='Move / Rename… — '+(doc.path||'Untitled');if(new URLSearchParams(location.search).get('draft')===doc.id)history.replaceState(null,'',documentURL(doc));}
 let fileNotifications=null;
 function updateFileNotifications(restart=false){
  const doc=state.active;
@@ -203,36 +238,61 @@ async function createDocument(record, forkIfLocked=true){
  return doc;
 }
 function activate(doc){state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;$('#editor').value=doc.contents;window.scrollTo(0,0);documentChanged(doc);doc.resume();}
-async function replaceDocument(replacement){
- if(state.replacing)return;
- state.replacing=true;renderDocument();
- const previous=state.active;
- try{
-  if(previous&&!(await previous.persist()))throw Error(previous.message);
-  await replacement();
-  if(previous&&previous!==state.active&&!previous.pendingSave){previous.stop();if(previous.running)void previous.running.finally(()=>previous.release?.());else previous.release?.();documents.delete(previous.id);}
- }catch(e){status(e.message);}
- finally{state.replacing=false;renderDocument();}
+let navigationVersion=0,navigationTask=Promise.resolve();
+function currentRoute(){
+ const parameters=new URLSearchParams(location.search);
+ return parameters.has('file')||parameters.has('draft')?{path:parameters.get('file')||'',target:parameters.get('target')||'host',draftID:parameters.get('draft')}:null;
 }
-function newDocument(){return replaceDocument(async()=>activate(await createDocument({target:state.active?.target||state.target,user:storageUser})));}
+function navigateRoute(route,mode='push'){
+ const version=++navigationVersion;
+ navigationTask=navigationTask.then(async()=>{
+  if(version!==navigationVersion)return;
+  state.replacing=true;renderDocument();
+  try{
+   if(state.active&&!(await state.active.persist()))throw Error(state.active.message);
+   if(route)status('Opening…');
+   const doc=route?await resolveDocument(route):null;
+   if(version!==navigationVersion)return;
+   history[mode==='push'?'pushState':'replaceState'](null,'',doc?documentURL(doc):location.pathname);
+   $('#document-menu').open=false;$('#document-info').open=false;
+   if($('#picker').open)$('#picker').close();
+   if($('#start-overlay').open)$('#start-overlay').close();
+   state.locationKey=null;
+   if(doc)activate(doc);
+   else{
+    state.active?.setWatching(false);state.active=null;
+    $('#editor').blur();$('#editor').value='';
+    updateFileNotifications();renderDocument();status('');window.scrollTo(0,0);
+    await renderRecentFiles();
+   }
+  }catch(error){
+   if(version===navigationVersion){
+    history.replaceState(null,'',state.active?documentURL(state.active):location.pathname);
+    status(error.message);
+   }
+  }finally{state.replacing=false;renderDocument();}
+ });
+ return navigationTask;
+}
+function newDocument(){return navigateRoute({path:'',target:state.active?.target||state.target});}
+function load(path, context={target:state.target}, draftID=null){
+ if(state.active?.path===path&&state.active.target===context.target&&(!draftID||state.active.id===draftID)){if($('#start-overlay').open)$('#start-overlay').close();return;}
+ return navigateRoute({path,target:context.target,draftID});
+}
+window.addEventListener('popstate',()=>{void navigateRoute(currentRoute(),'replace');});
 async function localRecords(){
  try{return(await drafts.all()).filter(record=>record.user===storageUser).sort((a,b)=>b.updatedAt-a.updatedAt);}
  catch(e){recoveryWarning='Local recovery unavailable: '+e.message;return [];}
 }
-async function load(path, context={target:state.target}, draftID=null){
- if(state.active?.path===path&&state.active.target===context.target&&!draftID)return;
- await replaceDocument(async()=>{
-  status('Opening…');
-  const records=await localRecords();
-  const local=draftID?records.find(d=>d.id===draftID&&d.target===context.target):records.find(d=>d.path===path&&d.target===context.target);
-  if(local){
-   const doc=await createDocument(local);activate(doc);
-   return;
-  }
-  if(!path){activate(await createDocument({target:context.target,user:storageUser}));return;}
-  const result=await api('state',{path},context);
-  activate(await createDocument({...context,user:storageUser,path:result.path,contents:result.contents,revision:result.revision,dirty:result.dirty,conflict:result.draftConflict,draftRevision:result.draftRevision,remoteVersion:0}));
- });
+async function resolveDocument({path,target,draftID}){
+ const existing=draftID&&documents.get(draftID);
+ if(existing&&existing.target===target)return existing;
+ const records=await localRecords();
+ const local=draftID?records.find(d=>d.id===draftID&&d.target===target):path?records.find(d=>d.path===path&&d.target===target):null;
+ if(local)return createDocument(local);
+ if(!path)return createDocument({target,user:storageUser});
+ const result=await api('state',{path},{target});
+ return createDocument({target,user:storageUser,path:result.path,contents:result.contents,revision:result.revision,dirty:result.dirty,conflict:result.draftConflict,draftRevision:result.draftRevision,remoteVersion:0});
 }
 function ask(title, value=null, action='Save'){
  return new Promise(resolve=>{
@@ -292,16 +352,30 @@ $('#editor').addEventListener('compositionstart',()=>{if(state.active)state.acti
 $('#editor').addEventListener('compositionend',()=>{if(state.active){state.active.composing=false;if(state.active.refreshNeeded)void state.active.refresh();}});
 $('#editor').addEventListener('input',()=>{if(state.active&&!state.replacing)state.active.edit($('#editor').value);});
 $('#editor').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='s'){e.preventDefault();void save();}else if(e.key==='Tab'){e.preventDefault();const t=e.currentTarget;t.setRangeText('\t',t.selectionStart,t.selectionEnd,'end');t.dispatchEvent(new Event('input'));}});
-$('#save').onclick=()=>save();$('#new').onclick=newDocument;
+$('#save').onclick=()=>save();
+function showStartOverlay(){
+ const overlay=$('#start-overlay');
+ if(overlay.open||state.replacing)return;
+ $('#document-menu').open=false;$('#document-info').open=false;
+ $('#start-overlay-status').textContent='';overlay.insertBefore($('#start-screen'),$('#start-overlay-status'));$('#start-screen').hidden=false;
+ overlay.showModal();void renderRecentFiles();
+}
+$('#home').onclick=showStartOverlay;$('#overflow-home').onclick=showStartOverlay;
+$('#start-close').onclick=()=>$('#start-overlay').close();
+$('#start-overlay').addEventListener('close',()=>{
+ document.querySelector('main').prepend($('#start-screen'));renderDocument();
+});
 $('#recover').onclick=recoverDraft;$('#download').onclick=downloadDocument;$('#review').onclick=reviewChanges;
-$('#move').onclick=async()=>{
- const doc=state.active;if(!doc?.path)return;
+async function moveDocument(){
+ const doc=state.active;if(!doc)return;
+ if(!doc.path){await save(doc);return;}
  if(doc.dirty||doc.pendingSave){status('Save this file and wait for confirmation before moving it.');return;}
  const destination=await ask('Move or rename file',doc.path,'Move');if(!destination||destination===doc.path)return;
  state.replacing=true;renderDocument();
  try{const result=await api('move',{path:doc.path,destination,revision:doc.revision},doc);doc.path=result.path;doc.draftRevision='missing';await doc.persist();documentChanged(doc);}
  catch(e){status(e.message);}finally{state.replacing=false;renderDocument();}
-};
+}
+$('#move').onclick=()=>{$('#document-info').open=false;void moveDocument();};$('#path').onclick=moveDocument;
 async function pickerLoad(path){
  const version=++state.pickerVersion;state.pickerSelected=null;$('#choose').disabled=true;$('#pickerRows').replaceChildren();$('#pickerPath').textContent='Loading…';
  try{const value=await api('list',{path});if(version!==state.pickerVersion)return;state.pickerPath=value.path;state.pickerSelected=null;$('#choose').disabled=true;$('#pickerPath').textContent=value.path;
@@ -312,8 +386,9 @@ async function pickerLoad(path){
 function openPicker(){state.target=state.active?.target||state.target;$('#environment').value=state.target;if(!$('#picker').open)$('#picker').showModal();const path=state.active?.path;pickerLoad(path&&path.includes('/')?path.slice(0,path.lastIndexOf('/'))||'/':'~');}
 function choose(path){const context={target:state.target};$('#picker').close();load(path,context);}
 $('#choose').onclick=e=>{e.preventDefault();if(state.pickerSelected&&!state.pickerSelected.directory)choose(state.pickerSelected.path);};
-$('#mobile-new').onclick=newDocument;$('#mobile-open').onclick=openPicker;$('#mobile-location').onclick=openPicker;
-$('#open').onclick=openPicker;$('#path').onclick=openPicker;$('#location-target').onclick=openPicker;
+$('#mobile-location').onclick=openPicker;
+$('#start-open').onclick=openPicker;$('#start-new').onclick=newDocument;
+$('#location-target').onclick=openPicker;
 $('#environment').onchange=()=>{state.target=$('#environment').value;pickerLoad('~');};
 $('#environment-refresh').onclick=discover;
 $('#picker').addEventListener('close',()=>{state.pickerVersion++;state.target=state.active?.target||state.target;});
@@ -323,11 +398,12 @@ for(const id of ['document-menu','document-info']){
  panel.addEventListener('toggle',()=>{if(panel.open)$('#'+(id==='document-menu'?'document-info':'document-menu')).open=false;});
 }
 window.addEventListener('beforeunload',e=>{if([...documents.values()].some(doc=>doc.localError||doc.localVersion<doc.version)){e.preventDefault();e.returnValue='';}});
+window.addEventListener('storage',event=>{if(event.key===recentFilesKey&&(!state.active||$('#start-overlay').open))void renderRecentFiles();});
 window.addEventListener('online',()=>{updateFileNotifications(true);for(const doc of documents.values())doc.resume();void discover();});
 document.addEventListener('visibilitychange',()=>{for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});
 window.addEventListener('focus',()=>{if(!document.hidden){updateFileNotifications(true);state.active?.resume();}});
 window.addEventListener('pagehide',()=>{fileNotifications?.stream.stop();fileNotifications=null;for(const doc of documents.values()){void doc.persist();doc.stop();}});
-window.addEventListener('pageshow',event=>{if(event.persisted){updateFileNotifications(true);for(const doc of documents.values())doc.resume();}});
+window.addEventListener('pageshow',event=>{if(event.persisted){state.replacing=false;renderDocument();updateFileNotifications(true);for(const doc of documents.values())doc.resume();if(!state.active)void renderRecentFiles();}});
 async function prepareOfflineShell(){
  if(!('serviceWorker' in navigator))return;
  try{await navigator.serviceWorker.register('/sw.js',{scope:'/'});await navigator.serviceWorker.ready;}
@@ -336,7 +412,7 @@ async function prepareOfflineShell(){
 $('#editor').disabled=true;renderDocument();
 void prepareOfflineShell();void discover();
 async function boot(){
- await load(query.get('file')||'',{target:state.target},query.get('draft'));
+ await navigateRoute(currentRoute(),'replace');
  for(const record of await localRecords()){
   if(record.pendingSave&&!record.conflict&&!documents.has(record.id)){
    const doc=await createDocument(record,false);

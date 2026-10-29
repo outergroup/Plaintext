@@ -6,8 +6,12 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 swiftc -module-cache-path "$TEST_DIR/modules" -parse-as-library \
     "$ROOT/Vendor/TextEditing/TextUndoHistory.swift" "$ROOT/Frontend/PlaintextDocument.swift" "$ROOT/Tests/NativeDocumentTests.swift" -o "$TEST_DIR/documents"
 "$TEST_DIR/documents"
+frameworks=()
+if [[ "$(uname -s)" == Darwin ]]; then
+    frameworks=(-framework SystemConfiguration -framework CoreFoundation)
+fi
 cc -std=gnu17 -Wall -Wextra -O2 "$ROOT/Tests/EnvironmentDriver.c" "$ROOT/Backend/Environment.c" \
-    -lpthread -lm -o "$TEST_DIR/driver"
+    -lpthread -lm "${frameworks[@]}" -o "$TEST_DIR/driver"
 swiftc -module-cache-path "$TEST_DIR/modules" -parse-as-library \
     "$ROOT/Vendor/TextEditing/TextUndoHistory.swift" "$ROOT/Frontend/PlaintextDocument.swift" "$ROOT/Tests/NativeCodecTests.swift" -o "$TEST_DIR/codec"
 "$TEST_DIR/codec" "$TEST_DIR/driver"

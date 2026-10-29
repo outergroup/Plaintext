@@ -1,5 +1,6 @@
 #include "RuntimeCommand.h"
 #ifdef __APPLE__
+#include <SystemConfiguration/SystemConfiguration.h>
 static Bytes registry_command(char *const *args, double timeout) {
     Bytes b = {0};
     Child c;
@@ -319,13 +320,28 @@ EnvironmentSnapshot discover_environments(void) {
     if (gethostname(hostname, sizeof(hostname)))
         strcpy(hostname, "Host");
     hostname[sizeof(hostname) - 1] = 0;
+    char *host_name = strdup(hostname);
+#ifdef __APPLE__
+    CFStringRef computer_name = SCDynamicStoreCopyComputerName(NULL, NULL);
+    if (computer_name) {
+        CFIndex capacity = CFStringGetMaximumSizeForEncoding(CFStringGetLength(computer_name), kCFStringEncodingUTF8) + 1;
+        char *name = capacity > 0 ? malloc((size_t)capacity) : NULL;
+        if (name && CFStringGetCString(computer_name, name, capacity, kCFStringEncodingUTF8) && name[0]) {
+            free(host_name);
+            host_name = name;
+        } else {
+            free(name);
+        }
+        CFRelease(computer_name);
+    }
+#endif
     struct passwd *pw = getpwuid(geteuid());
     char uid[32];
     snprintf(uid, sizeof(uid), "%u", (unsigned)geteuid());
     target_add(&result, (EnvironmentTarget){.id = strdup("host"),
                                             .runtime = strdup("host"),
                                             .container = strdup(""),
-                                            .name = strdup(hostname),
+                                            .name = host_name,
                                             .state = strdup("running"),
                                             .image = strdup(""),
                                             .user = strdup(pw ? pw->pw_name : uid)});
