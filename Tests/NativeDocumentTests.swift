@@ -3,25 +3,34 @@ import Foundation
 actor FileServer {
     var contents = "original"
     var revision = "r0"
+    var shared: String?
     var offline = false
     var loseResponse = false
     var pauseSave = false
     var waiting: CheckedContinuation<Void, Never>?
     var saves: [String] = []
+    var destinations: [String: String] = [:]
+    func destinationRequest(_ op: UInt32, _ target: String, _ path: String, _ revision: String, _ token: String, _ text: String) throws -> PlaintextReply {
+        let key = target + ":" + path
+        if op == 13 { precondition(revision == "missing"); destinations[key] = text }
+        return PlaintextReply(path: path, contents: destinations[key] ?? "", revision: "saved")
+    }
     func setOffline(_ value: Bool) { offline = value }
     func setLoseResponse() { loseResponse = true }
     func setPause() { pauseSave = true }
     func external(_ value: String) { contents = value; revision += "x" }
     func release() { pauseSave = false; waiting?.resume(); waiting = nil }
-    func request(_ op: UInt32, _ target: String, _ path: String, _ expected: String, _ text: String) async throws -> PlaintextReply {
+    func request(_ op: UInt32, _ target: String, _ path: String, _ expected: String, _ draftRevision: String, _ text: String) async throws -> PlaintextReply {
         if offline { throw PlaintextDocumentError.connection }
-        if op == 3 {
+        if op == 13 {
             if pauseSave { await withCheckedContinuation { waiting = $0 } }
             guard expected == revision else { throw PlaintextDocumentError.message("File changed") }
-            contents = text; revision += "s"; saves.append(text)
+            contents = text; shared = nil; revision += "s"; saves.append(text)
             if loseResponse { loseResponse = false; throw PlaintextDocumentError.connection }
         }
-        return PlaintextReply(path: path, contents: contents, revision: revision)
+        if op == 12 { shared = text }
+        if op == 14 { shared = nil }
+        return PlaintextReply(path: path, contents: [11,12].contains(op) ? shared ?? contents : contents, revision: revision, dirty: [11,12].contains(op) && shared != nil)
     }
 }
 
@@ -33,9 +42,14 @@ struct NativeDocumentTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let store = PlaintextDraftStore(directory: root)
+        try await store.putSetting("preferences", value: Data("persistent preference".utf8))
+        let reopened = PlaintextDraftStore(directory: root)
+        let preference = try await reopened.setting("preferences")
+        precondition(preference == Data("persistent preference".utf8))
+        await reopened.closeStore()
         let server = FileServer()
         func make(_ value: PlaintextDraft = PlaintextDraft()) -> PlaintextDocument {
-            PlaintextDocument(draft: value, store: store) { try await server.request($0, $1, $2, $3, $4) }
+            PlaintextDocument(draft: value, store: store) { try await server.request($0, $1, $2, $3, $4, $5) }
         }
         func check(_ value: Bool, _ message: String) throws {
             guard value else { throw PlaintextDocumentError.message("TEST FAILED: " + message) }
@@ -47,11 +61,21 @@ struct NativeDocumentTests {
             }
             throw PlaintextDocumentError.message("Timed out")
         }
+        let destinationDoc = PlaintextDocument(draft: PlaintextDraft(), store: store) { try await server.destinationRequest($0,$1,$2,$3,$4,$5) }
+        destinationDoc.edit("destination test")
+        await destinationDoc.saveTo(path: "/tmp/new.txt", target: "container", copy: false)
+        try await until { !destinationDoc.isSynchronizing && destinationDoc.draft.pending == nil }
+        try check(await server.destinations["container:/tmp/new.txt"] == "destination test", "container destination")
+        await destinationDoc.saveTo(path: "/tmp/new.txt", target: "host", copy: true)
+        try await until { !destinationDoc.isSynchronizing && destinationDoc.draft.pending == nil }
+        try check(await server.destinations["host:/tmp/new.txt"] == "destination test", "same path on host is a distinct destination")
+        try check(destinationDoc.draft.target == "host", "target persisted in draft")
+        await destinationDoc.stop()
         let untitled = make()
         untitled.edit("Untitled ☃\n")
         try await until { untitled.localVersion == 1 }
         var records = try await store.all()
-        try check(records.first?.contents == "Untitled ☃\n", "untitled checkpoint")
+        try check(records.first(where: { $0.id == untitled.draft.id })?.contents == "Untitled ☃\n", "untitled checkpoint")
         try check(try await store.claim(untitled.draft.id), "first owner")
         let otherStore = PlaintextDraftStore(directory: root)
         try check(!(try await otherStore.claim(untitled.draft.id)), "second owner rejected")
@@ -121,7 +145,7 @@ struct NativeDocumentTests {
         try check(await server.contents == "my draft", "explicit resolution")
         await conflict.stop()
 
-        let unavailable = PlaintextDocument(draft: initial, store: PlaintextDraftStore(directory: nil)) { _,_,_,_,_ in
+        let unavailable = PlaintextDocument(draft: initial, store: PlaintextDraftStore(directory: nil)) { _,_,_,_,_,_ in
             throw PlaintextDocumentError.message("Network must not run without durable queue")
         }
         unavailable.edit("keep in memory"); await unavailable.save()

@@ -217,6 +217,20 @@ const PlaintextDrafts = (() => {
             this.revision = revision; this.draftRevision = draftRevision; this.conflict = false; this.pendingSave = null;
             return this.requestSave();
         }
+        async saveTo(path, target = this.target, copy = false) {
+            if (!path || (!copy && this.path)) return false;
+            if (copy && path === this.path && target === this.target) throw Error('Choose a different name or folder for the copy.');
+            this.stop();
+            if (this.running) await this.running;
+            if (target !== this.target) {
+                this.target = target; this.path = ''; this.revision = 'missing'; this.draftRevision = 'missing'; this.remoteVersion = -1;
+            }
+            this.dirty = true;
+            if (copy) { this.conflict = false; this.pendingSave = null; }
+            const saved = await this.requestSave(path);
+            if (!saved) this.resume();
+            return saved;
+        }
         async saveCopy(path) {
             if (!path || path === this.path) return false;
             this.conflict = false; this.pendingSave = null;

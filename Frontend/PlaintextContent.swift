@@ -166,6 +166,16 @@ private struct FilePickerEntryRecord {
     }
 }
 
+private struct NativeRecentFile: Codable {
+    var path: String
+    var target: String
+}
+private struct NativePreferences: Codable {
+    var textScale: CGFloat = 1
+    var wrapLines = true
+    var recent: [NativeRecentFile] = []
+}
+
 private struct PendingFilePicker {
     var directory: String
     var entries: [FilePickerEntryRecord]
@@ -348,6 +358,37 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var reviewedDisk: PlaintextReply?
     private var showingServerVersion = false
     private var didRestoreQueue = false
+    private var preferences = NativePreferences()
+    private var preferencesWriteTask: Task<Void, Never>?
+    private var watchTask: Task<Void, Never>?
+    private var watchedKey = ""
+    private var pickerMode = "open"
+    private var pickerRequest = UUID()
+    private var recentFrames: [(CGRect, CGRect, NativeRecentFile)] = []
+    private var recentTabFrame = CGRect.zero
+    private var openTabFrame = CGRect.zero
+    private var newFileFrame = CGRect.zero
+    private var openControlFrame = CGRect.zero
+    private var saveControlFrame = CGRect.zero
+    private var menuControlFrame = CGRect.zero
+    private var containerControlFrame = CGRect.zero
+    private let containerButtonLayer = CALayer()
+    private let containerTitleLayer = CATextLayer()
+    private let openButtonLayer = CALayer()
+    private let openIconLayer = SymbolImageLayer(symbolName: "folder", accessibilityTitle: "Open files")
+    private let saveButtonLayer = CATextLayer()
+    private let menuButtonLayer = CATextLayer()
+    private var horizontalOffset: CGFloat = 0
+    private var naturalTextWidth: CGFloat = 0
+    private var shouldPushHistory = false
+    private var showStartupPopover = false
+    private var reviewedShared: PlaintextReply?
+    private var pickerTarget = "host"
+    private var targets: [(id: String, name: String, running: Bool)] = []
+    private var targetControlFrame = CGRect.zero
+    private var targetMenuIDs: Set<UUID> = []
+    private var conflictFrames: [(CGRect, String)] = []
+
 
     private let rootLayer = CALayer()
     private let backgroundLayer = CALayer()
@@ -472,7 +513,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private let editorInputID = UUID()
     private let findInputID = UUID()
     private let filePickerNameInputID = UUID()
-    private let headerHeight: CGFloat = 42
+    private let headerHeight: CGFloat = 58
     private let textInsetX: CGFloat = 14
     private let textInsetY: CGFloat = 12
     private let textMeasurementHeight: CGFloat = 10_000_000
@@ -575,11 +616,18 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             handleKeyDown(characters: characters,
                           charactersIgnoringModifiers: charactersIgnoringModifiers,
                           modifierFlags: modifierFlags)
+        case .magnification(_, let amount, let point, _):
+            if pendingFilePicker == nil && editorClipLayer.frame.contains(point) { setTextScale(preferences.textScale * (1 + amount)) }
         case .scrollWheelEvent(let point, let delta, _, _, _, let precise):
             let rootPoint = rootLayer.convert(point, to: rootLayer)
-            if pendingFilePicker != nil, filePickerListFrame.contains(rootPoint) {
+            if pendingFilePicker != nil, pickerMode == "conflict", filePickerPanelFrame.contains(rootPoint) {
+                filePickerScroll = max(0, filePickerScroll - delta.y * (precise ? 1 : 28)); renderFilePicker()
+            } else if pendingFilePicker != nil, pickerMode == "recent", filePickerPanelFrame.contains(rootPoint) {
+                filePickerScroll = min(max(0, filePickerScroll - delta.y * (precise ? 1 : 28)), max(0, CGFloat(preferences.recent.count) * 58 - filePickerPanelFrame.height + 70)); renderFilePicker()
+            } else if pendingFilePicker != nil, filePickerListFrame.contains(rootPoint) {
                 setFilePickerScroll(filePickerScroll - delta.y * (precise ? 1 : filePickerRowHeight))
             } else if editorClipLayer.frame.contains(rootPoint) {
+                if !preferences.wrapLines { horizontalOffset = min(max(0, horizontalOffset - delta.x * (precise ? 1 : 18)), max(0, editorTextWidth() - editorClipLayer.bounds.width + textInsetX * 2)) }
                 scrollOffset = clampedScrollOffset(scrollOffset - delta.y * (precise ? 1 : scrollLineHeight))
                 updateViewport()
                 updateCursor()
@@ -733,8 +781,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                                              snapshot: buildAccessibilitySnapshot())
         case .historyTraversal(_, let url):
             currentURLString = url
+            showStartupPopover = filePath(from: url) == nil && queryValue("draft") == nil
             openDocument(path: filePath(from: url) ?? "", draftID: queryValue("draft"), target: queryValue("target"))
         case .shutdown:
+            watchTask?.cancel(); watchTask = nil
             flushDrafts()
             retainedSelf = nil
         default:
@@ -743,6 +793,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        watchTask?.cancel(); watchTask = nil
         flushDrafts()
         retainedSelf = nil
     }
@@ -779,6 +830,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
         draftStore = PlaintextDraftStore(directory: outerframeHost.dataDirectoryURL)
         filePath = filePath(from: arguments.url) ?? ""
+        showStartupPopover = filePath.isEmpty && queryValue("draft") == nil
 
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 60
@@ -794,7 +846,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             NSPasteboard.PasteboardType.rtf.rawValue
         ])
         updateEditingCapabilities()
-        loadFile()
+        Task {
+            do {
+                if let data = try await draftStore?.setting("preferences") { preferences = try PropertyListDecoder().decode(NativePreferences.self, from: data) }
+                preferences.textScale = min(3, max(0.25, preferences.textScale))
+            } catch { statusText = "Could not load preferences: " + error.localizedDescription }
+            loadFile(); discoverTargets()
+        }
     }
 
     private func filePath(from urlString: String?) -> String? {
@@ -817,6 +875,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         rootLayer.addSublayer(filePickerOverlayLayer)
         headerLayer.addSublayer(toolbarDividerLayer)
         headerLayer.addSublayer(pathChevronLayer)
+        headerLayer.addSublayer(containerButtonLayer)
+        containerButtonLayer.cornerRadius = 7
+        containerButtonLayer.addSublayer(containerTitleLayer)
+        headerLayer.addSublayer(openButtonLayer)
+        openButtonLayer.cornerRadius = 7
+        headerLayer.addSublayer(openIconLayer)
+        headerLayer.addSublayer(saveButtonLayer)
+        headerLayer.addSublayer(menuButtonLayer)
+        openIconLayer.symbolPointSize = 23
+        openIconLayer.maxSymbolSize = CGSize(width: 26, height: 24)
         headerLayer.addSublayer(pathPromptSelectionLayer)
         headerLayer.addSublayer(pathPromptCursorLayer)
         headerLayer.addSublayer(findBarLayer)
@@ -922,7 +990,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         editorCaretLayer.backgroundColor = resolvedCGColor(.textColor)
         findBarLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         findFieldLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
-        findFieldLayer.borderColor = resolvedCGColor(findInputController.isFocused ? .keyboardFocusIndicatorColor : .separatorColor)
+        findFieldLayer.borderColor = resolvedCGColor(findInputController.isFocused ? .separatorColor : .separatorColor)
         findTextLayer.foregroundColor = resolvedCGColor(.labelColor)
         findPlaceholderLayer.foregroundColor = resolvedCGColor(.placeholderTextColor)
         findStatusLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
@@ -931,7 +999,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         findMarkedUnderlineLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
         findCaretLayer.backgroundColor = resolvedCGColor(.textColor)
         filePickerNameFieldLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
-        filePickerNameFieldLayer.borderColor = resolvedCGColor(filePickerNameInputController.isFocused ? .keyboardFocusIndicatorColor : .separatorColor)
+        filePickerNameFieldLayer.borderColor = resolvedCGColor(filePickerNameInputController.isFocused ? .separatorColor : .separatorColor)
         filePickerNameTextLayer.foregroundColor = resolvedCGColor(.labelColor)
         filePickerNamePlaceholderLayer.foregroundColor = resolvedCGColor(.placeholderTextColor)
         filePickerNameSelectionLayer.backgroundColor = resolvedCGColor(.selectedTextBackgroundColor)
@@ -1000,20 +1068,36 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             statusLayer.fontSize = 12
             pathLayer.truncationMode = isPrompting ? .end : .middle
             renderHeader()
-            let pathX: CGFloat = 14
-            let renderedStatus = (statusLayer.string as? String) ?? ""
-            let statusWidth = renderedStatus.isEmpty ? CGFloat(0) : min(max(statusLayer.preferredFrameSize().width + 2, 58), currentSize.width * 0.65)
-            let availablePathWidth = max(currentSize.width - pathX - statusWidth - 48, 42)
-            let pathWidth = min(max(pathLayer.preferredFrameSize().width + 2, 42), availablePathWidth)
-            let textY = floor((headerHeight - 18) / 2) + 1
-            pathLayer.frame = CGRect(x: pathX, y: textY, width: pathWidth, height: 18)
-            pathChevronLayer.frame = CGRect(x: pathLayer.frame.maxX + 2, y: textY, width: 12, height: 18)
-            pathControlFrame = pathLayer.frame.union(pathChevronLayer.frame).insetBy(dx: -6, dy: -6)
-            pathChevronLayer.isHidden = isPrompting
-            statusLayer.frame = CGRect(x: pathChevronLayer.frame.maxX + 8,
-                                       y: textY + 1,
-                                       width: max(currentSize.width - pathChevronLayer.frame.maxX - 18, 1),
-                                       height: 17)
+            openControlFrame = CGRect(x: 10, y: 7, width: 38, height: 44)
+            openButtonLayer.frame = openControlFrame.insetBy(dx: 0, dy: 4)
+            openIconLayer.frame = openControlFrame.insetBy(dx: 6, dy: 9)
+            openIconLayer.tintColor = .labelColor
+            menuControlFrame = CGRect(x: max(0, currentSize.width - 52), y: 7, width: 42, height: 44)
+            saveControlFrame = CGRect(x: menuControlFrame.minX - 68, y: 7, width: 64, height: 44)
+            let dirty = document?.draft.dirty == true || document?.draft.pending != nil
+            saveButtonLayer.isHidden = !dirty
+            for layer in [saveButtonLayer, menuButtonLayer] { layer.font = NSFont.systemFont(ofSize: 15); layer.fontSize = 15; layer.alignmentMode = .center; layer.contentsScale = rootLayer.contentsScale }
+            saveButtonLayer.string = isSaving ? "Saving…" : "Save"
+            saveButtonLayer.foregroundColor = resolvedCGColor(.controlAccentColor)
+            menuButtonLayer.string = "•••"; menuButtonLayer.foregroundColor = resolvedCGColor(.secondaryLabelColor)
+            saveButtonLayer.frame = saveControlFrame.insetBy(dx: 0, dy: 12)
+            menuButtonLayer.frame = menuControlFrame.insetBy(dx: 0, dy: 12)
+            let target = document?.draft.target ?? "host"
+            let containerName = targets.first { $0.id == target }?.name ?? "Container"
+            let containerWidth = target == "host" ? 0 : min(230, max(60, currentSize.width * 0.3), (containerName as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]).width + 36)
+            containerControlFrame = CGRect(x: 62, y: 13, width: containerWidth, height: 32)
+            containerButtonLayer.frame = containerControlFrame; containerButtonLayer.isHidden = target == "host"
+            containerButtonLayer.backgroundColor = resolvedCGColor(NSColor.labelColor.withAlphaComponent(0.06))
+            containerTitleLayer.string = containerName + "  ▾"; containerTitleLayer.font = NSFont.systemFont(ofSize: 13, weight: .semibold); containerTitleLayer.fontSize = 13
+            containerTitleLayer.foregroundColor = resolvedCGColor(.labelColor); containerTitleLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2; containerTitleLayer.truncationMode = .middle
+            containerTitleLayer.frame = CGRect(x: 9, y: 8, width: max(1, containerWidth - 18), height: 18)
+            let pathX: CGFloat = target == "host" ? 62 : containerControlFrame.maxX + 12
+            let pathWidth = max(40, (dirty ? saveControlFrame.minX : menuControlFrame.minX) - pathX - 12)
+            let textY: CGFloat = statusText.isEmpty ? 19 : 27
+            pathLayer.frame = CGRect(x: pathX, y: textY, width: pathWidth, height: 20)
+            pathControlFrame = pathLayer.frame.insetBy(dx: -4, dy: -7)
+            pathChevronLayer.isHidden = true
+            statusLayer.frame = CGRect(x: pathX, y: 5, width: pathWidth, height: 16)
             layoutFindBar()
             pathPromptSelectionLayer.isHidden = !isPrompting || pathPromptSelectionRange == nil
             if isPrompting, let selection = pathPromptSelectionRange {
@@ -1090,6 +1174,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func makeButtonLayer(title: String, emphasized: Bool) -> CALayer {
         let layer = CALayer()
+        layer.bounds = CGRect(x: 0, y: 0, width: 70, height: 32)
         layer.cornerRadius = 6
         layer.masksToBounds = true
         layer.backgroundColor = resolvedCGColor(emphasized ? .controlAccentColor : .controlBackgroundColor)
@@ -1100,12 +1185,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                  color: emphasized ? .white : .labelColor,
                                  alignment: .center)
         text.string = title
-        text.frame = CGRect(x: 6, y: 7, width: 58, height: 16)
+        text.frame = CGRect(x: 6, y: 7, width: 58, height: 18)
+        text.autoresizingMask = [.layerWidthSizable]
         layer.addSublayer(text)
         return layer
     }
 
     private func renderFilePicker() {
+        openButtonLayer.backgroundColor = pendingFilePicker != nil && ["recent", "open"].contains(pickerMode) ? resolvedCGColor(NSColor.labelColor.withAlphaComponent(0.07)) : nil
         defer { notifyAccessibilityLayoutChanged() }
         guard let picker = pendingFilePicker else {
             guard !isFilePickerFadingOut else { return }
@@ -1125,34 +1212,91 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func renderFilePickerContents(_ picker: PendingFilePicker) {
         filePickerOverlayLayer.isHidden = false
         filePickerOverlayLayer.frame = rootLayer.bounds
-        filePickerOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
+        filePickerOverlayLayer.backgroundColor = nil
         filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
 
         let width = rootLayer.bounds.width
         let height = rootLayer.bounds.height
-        let panelWidth = min(max(width - 48, 460), 760)
-        let panelHeight = min(max(height - 48, 340), 540)
-        let panelFrame = CGRect(x: floor((width - panelWidth) / 2),
-                                y: floor((height - panelHeight) / 2),
+        let panelWidth = min(max(width - 24, 100), 560)
+        let panelHeight = pickerMode == "recent" ? min(max(170, CGFloat(preferences.recent.count) * 58 + 70), max(100, height - headerHeight - 34)) : max(120, height - headerHeight - 34)
+        let anchorX = pickerMode == "move" ? pathControlFrame.midX : openControlFrame.midX
+        let panelFrame = CGRect(x: max(12, min(pickerMode == "move" ? pathControlFrame.minX : 12, width - panelWidth - 12)),
+                                y: height - headerHeight - 12 - panelHeight,
                                 width: panelWidth,
                                 height: panelHeight)
         filePickerPanelFrame = panelFrame
 
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 8
+        panel.cornerRadius = 12
+        panel.shadowColor = NSColor.black.cgColor; panel.shadowOpacity = 0.18; panel.shadowRadius = 14; panel.shadowOffset = CGSize(width: 0, height: -5)
         panel.borderWidth = 1
         panel.borderColor = resolvedCGColor(.separatorColor)
         panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
         filePickerOverlayLayer.addSublayer(panel)
+        let arrow = CAShapeLayer(), triangle = CGMutablePath()
+        let tip = max(18, min(panelWidth - 18, anchorX - panelFrame.minX))
+        triangle.move(to: CGPoint(x: tip - 8, y: panelHeight - 1)); triangle.addLine(to: CGPoint(x: tip, y: panelHeight + 8)); triangle.addLine(to: CGPoint(x: tip + 8, y: panelHeight - 1))
+        arrow.path = triangle; arrow.fillColor = resolvedCGColor(.windowBackgroundColor); arrow.strokeColor = resolvedCGColor(.separatorColor); arrow.lineWidth = 1; panel.addSublayer(arrow)
+        recentTabFrame = CGRect(x: 16, y: panelHeight - 48, width: 72, height: 32).offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        openTabFrame = CGRect(x: 90, y: panelHeight - 48, width: 66, height: 32).offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        newFileFrame = CGRect(x: panelWidth - 136, y: panelHeight - 48, width: 120, height: 32).offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        if ["recent", "open"].contains(pickerMode) {
+            for (label, frame, active) in [("Recent", recentTabFrame, pickerMode == "recent"), ("Open", openTabFrame, pickerMode == "open"), ("New text file", newFileFrame, false)] {
+                let button = makeButtonLayer(title: label, emphasized: active); button.frame = frame.offsetBy(dx: -panelFrame.minX, dy: -panelFrame.minY); panel.addSublayer(button)
+            }
+        }
+        recentFrames.removeAll(); conflictFrames.removeAll()
+        if pickerMode == "conflict", let doc = document, let disk = reviewedDisk {
+            filePickerNameFieldFrame = .zero; filePickerEntryFrames.removeAll(); filePickerListFrame = .zero; filePickerBreadcrumbSegmentFrames.removeAll()
+            let heading = makeTextLayer(size: 15, weight: .semibold, color: .labelColor); heading.string = "Changes were made on another device"; heading.frame = CGRect(x: 18, y: panelHeight - 40, width: panelWidth - 36, height: 22); panel.addSublayer(heading)
+            let columns = [("Your draft", doc.draft.contents), ("Saved file", disk.contents)] + (reviewedShared?.dirty == true ? [("Shared draft", reviewedShared?.contents ?? "")] : [])
+            let columnWidth = (panelWidth - 36) / CGFloat(columns.count)
+            for (index, column) in columns.enumerated() {
+                let x = 18 + CGFloat(index) * columnWidth
+                let title = makeTextLayer(size: 12, weight: .semibold, color: .labelColor); title.string = column.0; title.frame = CGRect(x: x, y: panelHeight - 70, width: columnWidth - 10, height: 20); panel.addSublayer(title)
+                let clip = CALayer(); clip.frame = CGRect(x: x, y: 112, width: columnWidth - 10, height: max(20, panelHeight - 188)); clip.masksToBounds = true; panel.addSublayer(clip)
+                let preview = makeTextLayer(size: 12, weight: .regular, color: .labelColor); preview.isWrapped = true; preview.truncationMode = .none
+                let content = NSAttributedString(string: column.1, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular), .foregroundColor: resolvedNSColor(.labelColor)])
+                let contentHeight = max(clip.bounds.height, content.boundingRect(with: CGSize(width: clip.bounds.width, height: 1000000), options: [.usesLineFragmentOrigin, .usesFontLeading]).height + 20)
+                preview.string = content; preview.frame = CGRect(x: 0, y: clip.bounds.height - contentHeight + filePickerScroll, width: clip.bounds.width, height: contentHeight); clip.addSublayer(preview)
+            }
+            let actions = [("Keep my draft", "keep"), ("Save a copy…", "copy"), ("Discard drafts; use saved file", "discard"), ("Replace server with my draft", "replace")]
+            for (index, action) in actions.enumerated() {
+                let frame = CGRect(x: 18 + CGFloat(index % 2) * (panelWidth - 36) / 2, y: 64 - CGFloat(index / 2) * 40, width: (panelWidth - 44) / 2, height: 32)
+                let button = makeButtonLayer(title: action.0, emphasized: false); button.frame = frame; panel.addSublayer(button); conflictFrames.append((frame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY), action.1))
+            }
+            return
+        }
+        if pickerMode == "recent" {
+            filePickerNameFieldFrame = .zero; filePickerListFrame = .zero; filePickerOpenFrame = .zero; filePickerCancelFrame = .zero
+            filePickerEntryFrames.removeAll(); filePickerBreadcrumbSegmentFrames.removeAll()
+            if preferences.recent.isEmpty { let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor); empty.string = "Files you open appear here."; empty.frame = CGRect(x: 18, y: panelHeight - 94, width: panelWidth - 36, height: 20); panel.addSublayer(empty) }
+            for (index, recent) in preferences.recent.enumerated() {
+                let row = CGRect(x: 16, y: panelHeight - 112 - CGFloat(index) * 58 + filePickerScroll, width: panelWidth - 32, height: 52)
+                guard row.minY >= 12, row.maxY <= panelHeight - 58 else { continue }
+                let name = makeTextLayer(size: 14, weight: .semibold, color: .labelColor); name.string = (recent.path as NSString).lastPathComponent; name.frame = CGRect(x: row.minX, y: row.minY + 25, width: row.width - 40, height: 20); panel.addSublayer(name)
+                let detail = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor); detail.string = (recent.target == "host" ? "" : recent.target + " · ") + recent.path; detail.frame = CGRect(x: row.minX, y: row.minY + 6, width: row.width - 40, height: 17); panel.addSublayer(detail)
+                let remove = makeTextLayer(size: 20, weight: .regular, color: .secondaryLabelColor); remove.string = "×"; remove.frame = CGRect(x: row.maxX - 28, y: row.minY + 12, width: 28, height: 28); panel.addSublayer(remove)
+                recentFrames.append((row.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY), remove.frame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY), recent))
+            }
+            return
+        }
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
-        title.string = "Open File"
+        title.string = pickerMode == "move" ? "Move or rename file" : pickerMode == "copy" ? "Save a copy" : "Save text file"
         title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
-        panel.addSublayer(title)
+        if pickerMode != "open" { panel.addSublayer(title) }
 
+        targetControlFrame = .zero
+        if ["open", "save", "copy"].contains(pickerMode) {
+            let frame = CGRect(x: 18, y: panelHeight - 86, width: panelWidth - 36, height: 30)
+            let label = targets.first { $0.id == pickerTarget }?.name ?? pickerTarget
+            let target = makeButtonLayer(title: (pickerTarget == "host" ? "Host — " : "") + label + " ▾", emphasized: false)
+            target.frame = frame; panel.addSublayer(target); targetControlFrame = frame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        }
         let breadcrumbFrame = CGRect(x: 18,
-                                     y: panelHeight - 78,
+                                     y: panelHeight - (["open", "save", "copy"].contains(pickerMode) ? 120 : 78),
                                      width: panelWidth - 36,
                                      height: FilePickerBreadcrumbBar.height)
         filePickerBreadcrumbFrame = breadcrumbFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
@@ -1163,11 +1307,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                        appearance: appearance)
         panel.addSublayer(filePickerBreadcrumbLayer)
 
-        let bottomControlsHeight: CGFloat = 108
+        let bottomControlsHeight: CGFloat = pickerMode == "open" ? 62 : 108
         let listFrame = CGRect(x: 18,
                                y: bottomControlsHeight,
                                width: panelWidth - 36,
-                               height: max(breadcrumbFrame.minY - bottomControlsHeight - 12, 80))
+                               height: max(breadcrumbFrame.minY - bottomControlsHeight - 12, 1))
         filePickerListFrame = listFrame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         filePickerListLayer.frame = listFrame
         filePickerListLayer.cornerRadius = 6
@@ -1207,24 +1351,25 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let nameLabel = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor)
         nameLabel.string = "File name:"
         nameLabel.frame = CGRect(x: 18, y: 70, width: 76, height: 18)
-        panel.addSublayer(nameLabel)
+        if pickerMode != "open" { panel.addSublayer(nameLabel) }
 
         let nameFieldLocal = CGRect(x: 96, y: 64, width: max(panelWidth - 114, 80), height: 30)
-        filePickerNameFieldFrame = nameFieldLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+        filePickerNameFieldFrame = pickerMode == "open" ? .zero : nameFieldLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         filePickerNameFieldLayer.frame = nameFieldLocal
         filePickerNameFieldLayer.borderWidth = filePickerNameInputController.isFocused ? 1.5 : 1
-        panel.addSublayer(filePickerNameFieldLayer)
+        if pickerMode != "open" { panel.addSublayer(filePickerNameFieldLayer) }
         updateFilePickerNameDisplay()
 
-        let openLocal = CGRect(x: panelWidth - 84, y: 28, width: 66, height: 30)
-        let cancelLocal = CGRect(x: openLocal.minX - 78, y: 28, width: 70, height: 30)
+        let openLocal = CGRect(x: panelWidth - 104, y: 18, width: 86, height: 32)
+        let cancelLocal = CGRect.zero
         filePickerOpenFrame = openLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         filePickerCancelFrame = cancelLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         let cancel = makeButtonLayer(title: "Cancel", emphasized: false)
         cancel.frame = cancelLocal
-        panel.addSublayer(cancel)
-        let open = makeButtonLayer(title: "Open", emphasized: true)
+        _ = cancel
+        let open = makeButtonLayer(title: pickerMode == "move" ? "Move" : pickerMode == "open" ? "Open file" : "Save", emphasized: true)
         open.frame = openLocal
+        open.opacity = picker.isLoading || !picker.error.isEmpty ? 0.4 : 1
         panel.addSublayer(open)
     }
 
@@ -1308,12 +1453,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             icon.symbolName = entry.isDirectory ? "folder" : "doc"
             icon.accessibilityTitle = entry.isDirectory ? "Folder" : "File"
             icon.tintColor = isSelected ? .white : .secondaryLabelColor
-            icon.frame = CGRect(x: 22, y: 6, width: 16, height: 16)
+            icon.symbolPointSize = 15
+            icon.maxSymbolSize = CGSize(width: 16, height: 16)
+            icon.frame = CGRect(x: 12, y: 6, width: 16, height: 16)
         }
         if let name = row.sublayers?[1] as? CATextLayer {
             name.string = entry.name
             name.foregroundColor = resolvedCGColor(isSelected ? .white : .labelColor)
-            name.frame = CGRect(x: 58, y: 6, width: max(frame.width - 70, 1), height: 16)
+            name.frame = CGRect(x: 38, y: 6, width: max(frame.width - 50, 1), height: 16)
         }
     }
 
@@ -1414,7 +1561,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func updateFilePickerNameDisplay() {
         withoutImplicitAnimations {
-            filePickerNameFieldLayer.borderColor = resolvedCGColor(filePickerNameInputController.isFocused ? .keyboardFocusIndicatorColor : .separatorColor)
+            filePickerNameFieldLayer.borderColor = resolvedCGColor(filePickerNameInputController.isFocused ? .separatorColor : .separatorColor)
             filePickerNameFieldLayer.borderWidth = filePickerNameInputController.isFocused ? 1.5 : 1
             filePickerNameTextLayer.font = NSFont.systemFont(ofSize: 13, weight: .regular)
             filePickerNameTextLayer.fontSize = 13
@@ -1509,9 +1656,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         updateCursor()
     }
 
+    private func showHomePopover() {
+        pickerMode = "recent"; showOpenFilePicker()
+    }
+
     private func showOpenFilePicker() {
         endUndoGroup()
         cancelPathPrompt()
+        pickerTarget = document?.draft.target ?? "host"
         let shouldAnimate = pendingFilePicker == nil || filePickerOverlayLayer.isHidden
         prepareFilePickerOverlayForPresentation(animated: shouldAnimate)
         let directory: String
@@ -1525,72 +1677,57 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                               entries: [],
                                               isLoading: true,
                                               error: "")
-        let defaultName = filePath.isEmpty ? "" : (filePath as NSString).lastPathComponent
+        let defaultName = filePath.isEmpty ? (pickerMode == "save" ? "Untitled.txt" : "") : (filePath as NSString).lastPathComponent + (pickerMode == "copy" ? ".copy" : "")
         filePickerNameInputController.setText(defaultName)
         filePickerScroll = 0
         filePickerSelectedIndex = nil
         findInputController.blur()
-        filePickerNameInputController.focus()
+        if ["move", "save", "copy"].contains(pickerMode) { filePickerNameInputController.focus() } else { filePickerNameInputController.blur() }
         resetFilePickerTypeahead()
         renderFilePicker()
         fadeInFilePickerOverlayIfNeeded(shouldAnimate)
-        fetchFilePickerDirectory(path: directory, clearName: false)
+        if pickerMode != "recent" && pickerMode != "conflict" { fetchFilePickerDirectory(path: directory, clearName: false) }
     }
 
     private func fetchFilePickerDirectory(path: String, clearName: Bool = true) {
-        guard let filesEndpoint, let urlSession else { return }
-        pendingFilePicker?.directory = path
-        pendingFilePicker?.entries = []
-        pendingFilePicker?.isLoading = true
-        pendingFilePicker?.error = ""
-        filePickerScroll = 0
-        filePickerSelectedIndex = nil
-        if clearName {
-            filePickerNameInputController.setText("")
-        }
-        resetFilePickerTypeahead()
-        renderFilePicker()
-
-        var components = URLComponents(url: filesEndpoint, resolvingAgainstBaseURL: false)
-        components?.queryItems = [URLQueryItem(name: "path", value: path)]
-        guard let url = components?.url else {
-            pendingFilePicker?.isLoading = false
-            pendingFilePicker?.error = "Could not build file request."
-            renderFilePicker()
-            return
-        }
-        urlSession.dataTask(with: url) { [weak self] data, _, error in
-            Task { @MainActor in
-                guard let self, self.pendingFilePicker != nil else { return }
-                self.pendingFilePicker?.isLoading = false
-                if let error {
-                    self.pendingFilePicker?.error = error.localizedDescription
-                    self.renderFilePicker()
-                    return
+        guard let endpoint = environmentEndpoint, let session = urlSession else { return }
+        let token = UUID(); pickerRequest = token
+        pendingFilePicker?.directory = path; pendingFilePicker?.entries = []; pendingFilePicker?.isLoading = true; pendingFilePicker?.error = ""
+        filePickerScroll = 0; filePickerSelectedIndex = nil
+        if clearName && pickerMode == "open" { filePickerNameInputController.setText("") }
+        resetFilePickerTypeahead(); renderFilePicker()
+        let target = pickerTarget
+        Task {
+            do {
+                var request = URLRequest(url: endpoint); request.httpMethod = "POST"
+                request.setValue("1", forHTTPHeaderField: "X-Environment-Request")
+                request.httpBody = try PlaintextEnvironment.encode(1, target: target, path: path)
+                let (data, _) = try await session.data(for: request)
+                let envelope = BinaryPayloadReader(data: data)
+                if try envelope.uint32(at: 12) != 0 { throw PlaintextDocumentError.message(try envelope.stringRef(at: 32)) }
+                let metadata = try envelope.child(at: 16), count = Int(try metadata.uint32(at: 20))
+                guard count <= 100_000 else { throw PlaintextDocumentError.message("Directory is too large") }
+                var entries: [FilePickerEntryRecord] = []
+                let parent = try metadata.stringRef(at: 56)
+                if !parent.isEmpty { entries.append(FilePickerEntryRecord(name: "..", path: parent, isDirectory: true, size: 0, modified: 0)) }
+                for index in 0..<count {
+                    let offset = 64 + index * 48
+                    let entry = FilePickerEntryRecord(name: try metadata.stringRef(at: offset), path: try metadata.stringRef(at: offset + 8), isDirectory: try metadata.uint32(at: offset + 24) != 0, size: try metadata.uint64(at: offset + 32), modified: Double(try metadata.uint64(at: offset + 40)))
+                    if ["open", "recent"].contains(pickerMode) || entry.isDirectory { entries.append(entry) }
                 }
-                guard let data else {
-                    self.pendingFilePicker?.error = "No directory response."
-                    self.renderFilePicker()
-                    return
-                }
-                do {
-                    let response = try FilePickerResponse.decodeBinary(data)
-                    self.pendingFilePicker?.directory = response.path
-                    self.pendingFilePicker?.entries = response.entries
-                    self.filePickerSelectedIndex = nil
-                    if clearName {
-                        self.filePickerNameInputController.setText("")
-                    }
-                } catch {
-                    self.pendingFilePicker?.error = "Could not decode directory."
-                }
-                self.renderFilePicker()
+                guard pickerRequest == token, pendingFilePicker != nil else { return }
+                pendingFilePicker?.directory = try metadata.stringRef(at: 48); pendingFilePicker?.entries = entries; pendingFilePicker?.isLoading = false
+            } catch {
+                guard pickerRequest == token, pendingFilePicker != nil else { return }
+                pendingFilePicker?.isLoading = false; pendingFilePicker?.error = error.localizedDescription
             }
-        }.resume()
+            renderFilePicker()
+        }
     }
 
     private func dismissFilePicker() {
-        pendingFilePicker = nil
+        pickerRequest = UUID(); pendingFilePicker = nil
+        layout()
         filePickerScroll = 0
         filePickerSelectedIndex = nil
         filePickerNameInputController.blur()
@@ -1601,10 +1738,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func activateFilePickerEntry(_ entry: FilePickerEntryRecord) {
         if entry.isDirectory {
-            fetchFilePickerDirectory(path: entry.path)
+            fetchFilePickerDirectory(path: entry.path, clearName: pickerMode == "open")
         } else {
-            dismissFilePicker()
-            openPath(entry.path)
+            dismissFilePicker(); shouldPushHistory = true
+            openDocument(path: entry.path, target: pickerTarget)
         }
     }
 
@@ -1619,7 +1756,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func openFilePickerTypedPath() {
-        guard let picker = pendingFilePicker else { return }
+        guard let picker = pendingFilePicker, !picker.isLoading, picker.error.isEmpty else { return }
         let name = filePickerNameInputController.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else {
             guard let selectedIndex = filePickerSelectedIndex,
@@ -1645,8 +1782,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         } else {
             path = (picker.directory as NSString).appendingPathComponent(name)
         }
-        dismissFilePicker()
-        openPath(path)
+        let mode = pickerMode
+        if ["move", "save", "copy"].contains(mode) {
+            guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else { return }
+            dismissFilePicker()
+            if mode == "move" { moveFile(to: path) }
+            else if let document { let target = pickerTarget; Task { await document.saveTo(path: path, target: target, copy: mode == "copy") } }
+        } else { dismissFilePicker(); shouldPushHistory = true; openDocument(path: path, target: pickerTarget) }
     }
 
     private func moveFilePickerSelection(delta: Int) {
@@ -1658,7 +1800,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func selectFilePickerIndex(_ index: Int) {
         guard let entries = pendingFilePicker?.entries, entries.indices.contains(index) else { return }
         filePickerSelectedIndex = index
-        filePickerNameInputController.setText(entries[index].name)
+        if pickerMode == "open" { filePickerNameInputController.setText(entries[index].name) }
         ensureFilePickerSelectionVisible()
         updateFilePickerVisibleRows(rebuild: true)
     }
@@ -1707,6 +1849,19 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func handleFilePickerMouseDown(point: CGPoint, clickCount: Int) -> Bool {
         let rootPoint = rootLayer.convert(point, to: rootLayer)
+        if pickerMode == "conflict", let action = conflictFrames.first(where: { $0.0.contains(rootPoint) })?.1 { resolveReview(action); return true }
+        if ["recent", "open"].contains(pickerMode) {
+            if recentTabFrame.contains(rootPoint) { pickerMode = "recent"; filePickerScroll = 0; renderFilePicker(); return true }
+            if openTabFrame.contains(rootPoint) { pickerMode = "open"; fetchFilePickerDirectory(path: pendingFilePicker?.directory ?? "~"); return true }
+            if newFileFrame.contains(rootPoint) { dismissFilePicker(); shouldPushHistory = true; openDocument(path: "", new: true, target: pickerTarget); return true }
+        }
+        if pickerMode == "recent" {
+            for (frame, remove, recent) in recentFrames {
+                if remove.contains(rootPoint) { preferences.recent.removeAll { $0.path == recent.path && $0.target == recent.target }; savePreferences(); renderFilePicker(); return true }
+                if frame.contains(rootPoint) { dismissFilePicker(); shouldPushHistory = true; openDocument(path: recent.path, target: recent.target); return true }
+            }
+        }
+        if targetControlFrame.contains(rootPoint), ["open", "save", "copy"].contains(pickerMode) { showTargetMenu(at: point); return true }
         if filePickerCancelFrame.contains(rootPoint) {
             dismissFilePicker()
             return true
@@ -1722,7 +1877,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if let path = FilePickerBreadcrumbBar.hitPath(at: rootPoint,
                                                       breadcrumbFrame: filePickerBreadcrumbFrame,
                                                       segmentFrames: filePickerBreadcrumbSegmentFrames) {
-            fetchFilePickerDirectory(path: path)
+            fetchFilePickerDirectory(path: path, clearName: pickerMode == "open")
             return true
         }
         if filePickerListFrame.contains(rootPoint),
@@ -1732,16 +1887,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if filePickerListFrame.contains(rootPoint),
            let hit = filePickerEntryFrames.first(where: { $0.frame.contains(rootPoint) }) {
             filePickerSelectedIndex = hit.index
-            filePickerNameInputController.setText(hit.entry.name)
+            if pickerMode == "open" { filePickerNameInputController.setText(hit.entry.name) }
             filePickerNameInputController.blur()
             resetFilePickerTypeahead()
             updateFilePickerVisibleRows(rebuild: true)
-            if clickCount >= 2 {
+            if hit.entry.isDirectory || clickCount >= 2 {
                 activateFilePickerEntry(hit.entry)
             }
             return true
         }
-        return filePickerPanelFrame.contains(rootPoint)
+        if !filePickerPanelFrame.contains(rootPoint) { dismissFilePicker() }; return true
     }
 
     private func handleFilePickerKeyDown(characters: String,
@@ -1802,7 +1957,12 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 pathLayer.string = pathPromptText.isEmpty ? " " : pathPromptText
                 statusLayer.string = pathPromptMode.label
             } else {
-                pathLayer.string = documentDisplayName()
+                let value = documentDisplayName()
+                let styled = NSMutableAttributedString(string: value, attributes: [.font: NSFont.systemFont(ofSize: 15), .foregroundColor: resolvedNSColor(.secondaryLabelColor)])
+                let filename = filePath.isEmpty ? "Untitled" : (filePath as NSString).lastPathComponent
+                let range = (value as NSString).range(of: filename, options: .backwards)
+                if range.location != NSNotFound { styled.addAttributes([.font: NSFont.systemFont(ofSize: 15, weight: .semibold), .foregroundColor: resolvedNSColor(.labelColor)], range: range) }
+                pathLayer.string = styled
                 statusLayer.string = statusText
             }
         }
@@ -1826,7 +1986,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func updateFindDisplay() {
         withoutImplicitAnimations {
             findBarLayer.isHidden = !isFindVisible
-            findFieldLayer.borderColor = resolvedCGColor(findInputController.isFocused ? .keyboardFocusIndicatorColor : .separatorColor)
+            findFieldLayer.borderColor = resolvedCGColor(findInputController.isFocused ? .separatorColor : .separatorColor)
             findFieldLayer.borderWidth = findInputController.isFocused ? 1.5 : 1
             let buttonTint = resolvedNSColor(findInputController.text.isEmpty ? .tertiaryLabelColor : .secondaryLabelColor)
             findPreviousIconLayer.tintColor = buttonTint
@@ -2056,22 +2216,82 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         Task { for document in documents { _ = await document.persist() } }
     }
 
+    private func discoverTargets() {
+        guard let session = urlSession, let endpoint = environmentEndpoint else { return }
+        Task {
+            do {
+                var request = URLRequest(url: endpoint); request.httpMethod = "POST"; request.setValue("1", forHTTPHeaderField: "X-Environment-Request")
+                request.httpBody = try PlaintextEnvironment.encode(7, target: "host", path: "")
+                let (bytes, _) = try await session.data(for: request)
+                let envelope = BinaryPayloadReader(data: bytes), metadata = try envelope.child(at: 16)
+                let count = Int(try metadata.uint32(at: 16)); guard count < 10000 else { return }
+                targets = try (0..<count).map { index in
+                    let offset = 80 + index * 56
+                    return (try metadata.stringRef(at: offset), try metadata.stringRef(at: offset + 24), try metadata.stringRef(at: offset + 32) == "running")
+                }
+                layout()
+            } catch { statusText = error.localizedDescription; layout() }
+        }
+    }
+
+    private func showTargetMenu(at point: CGPoint) {
+        let id = UUID(); targetMenuIDs.insert(id)
+        outerframeHost.showContextMenu(menuID: id, items: targets.map { OuterframeContextMenuItem(id: $0.id, title: $0.id == "host" ? "Host — " + $0.name : $0.name, isEnabled: $0.running) }, at: point)
+    }
+
+    private func startWatching() {
+        guard let doc = document, let session = urlSession, let endpoint = environmentEndpoint else { return }
+        let key = doc.draft.id + ":" + doc.draft.target + ":" + doc.draft.path
+        guard key != watchedKey else { return }
+        watchedKey = key; watchTask?.cancel(); watchTask = nil
+        guard !doc.draft.path.isEmpty else { return }
+        watchTask = Task { [weak self, weak doc] in
+            var delay: UInt64 = 1
+            while !Task.isCancelled {
+                guard let doc else { return }
+                do {
+                    var request = URLRequest(url: endpoint.deletingLastPathComponent().appendingPathComponent("watch"))
+                    request.httpMethod = "POST"; request.timeoutInterval = 3600
+                    request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+                    request.setValue("1", forHTTPHeaderField: "X-Environment-Request")
+                    request.httpBody = try PlaintextEnvironment.encode(10, target: doc.draft.target, path: doc.draft.path)
+                    let (bytes, response) = try await session.bytes(for: request)
+                    guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw PlaintextDocumentError.connection }
+                    await doc.refresh()
+                    for try await line in bytes.lines {
+                        guard !Task.isCancelled, self?.document === doc else { return }
+                        if line.contains("\"changed\":true") || line.contains("\"changed\": true") { await doc.refresh() }
+                        delay = 1
+                    }
+                } catch {}
+                guard !Task.isCancelled else { return }
+                try? await Task.sleep(nanoseconds: delay * 1_000_000_000); delay = min(30, delay * 2)
+            }
+        }
+    }
+
     private func makeDocument(_ record: PlaintextDraft, storage: PlaintextDraftStore? = nil) -> PlaintextDocument? {
         guard let store = storage ?? draftStore, let session = urlSession, let endpoint = environmentEndpoint else { return nil }
-        let doc = PlaintextDocument(draft: record, store: store) { operation, target, path, revision, contents in
+        let doc = PlaintextDocument(draft: record, store: store) { operation, target, path, revision, draftRevision, contents in
             try await PlaintextEnvironment.request(session: session, endpoint: endpoint, operation: operation,
-                                                   target: target, path: path, revision: revision, contents: contents)
+                                                   target: target, path: path, destination: draftRevision, revision: revision, contents: contents)
         }
         doc.changed = { [weak self, weak doc] in
             guard let self, let doc, self.document === doc else { return }
+            let pathChanged = self.filePath != doc.draft.path
             self.filePath = doc.draft.path
+            if !self.showingServerVersion && self.text != doc.draft.contents {
+                self.text = doc.draft.contents; self.cursorOffset = min(self.cursorOffset, self.text.utf16.count); self.selectionAnchor = nil
+                self.updateTextContent(force: true)
+            }
+            if pathChanged { self.rememberRecent() }
+            self.startWatching()
             self.isSaving = doc.isSaving
-            let previousStatus = self.statusText
             self.statusText = self.showingServerVersion ? "Server version (read-only) · Use the file menu to return to your draft" : doc.status
             self.outerframeHost.setTitle((self.showingServerVersion ? "Server version · " : "") + (doc.draft.dirty ? "• " : "") + (doc.draft.path.isEmpty ? "Untitled" : (doc.draft.path as NSString).lastPathComponent))
             self.updateURLForCurrentFile()
             self.renderHeader(); self.updateColors()
-            if previousStatus != self.statusText { self.layout() }
+            self.layout()
         }
         documents[record.id] = doc
         return doc
@@ -2081,10 +2301,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         endUndoGroup()
         document = doc; reviewedDisk = nil; showingServerVersion = false
         filePath = doc.draft.path; text = doc.draft.contents
-        cursorOffset = 0; selectionAnchor = nil; scrollOffset = 0
+        cursorOffset = 0; selectionAnchor = nil; scrollOffset = 0; horizontalOffset = 0
         clearMarkedTextState()
         doc.changed?(); updateTextContent(force: true); layout()
-        doc.resume()
+        rememberRecent(); startWatching(); doc.resume()
+        if showStartupPopover { showStartupPopover = false; showHomePopover() }
     }
 
     private func openDocument(path: String, draftID: String? = nil, new: Bool = false, target requestedTarget: String? = nil) {
@@ -2101,14 +2322,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                     if document != nil { throw error }
                     records = []
                 }
-                var record = new ? nil : records.first { draftID != nil ? $0.id == draftID : $0.path == path && $0.target == target }
+                var record = (new || (path.isEmpty && draftID == nil)) ? nil : records.first { draftID != nil ? $0.id == draftID : $0.path == path && $0.target == target }
                 if let record, let existing = documents[record.id] { activate(existing); return }
                 if record == nil {
                     var fresh = PlaintextDraft(); fresh.target = target; fresh.path = path
                     if !path.isEmpty {
-                        let result = try await PlaintextEnvironment.request(session: session, endpoint: endpoint, operation: 2, target: target, path: path)
+                        let result = try await PlaintextEnvironment.request(session: session, endpoint: endpoint, operation: 11, target: target, path: path)
                         fresh.path = result.path; fresh.contents = result.contents; fresh.revision = result.revision
-                        fresh.dirty = result.dirty; fresh.conflict = result.conflict
+                        fresh.dirty = result.dirty; fresh.conflict = result.conflict; fresh.draftRevision = result.draftRevision; fresh.remoteVersion = fresh.version
                     }
                     record = fresh
                 }
@@ -2132,21 +2353,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                         if try await store.claim(record.id), let queued = makeDocument(record) { queued.resume() }
                     }
                 }
-                if !doc.draft.dirty && doc.draft.pending == nil && !doc.draft.path.isEmpty {
-                    let version = doc.draft.version
-                    Task {
-                        do {
-                            let result = try await doc.disk()
-                            guard document === doc, doc.draft.version == version, !doc.draft.dirty, doc.draft.pending == nil else { return }
-                            doc.draft.contents = result.contents; doc.draft.revision = result.revision
-                            doc.draft.savedContents = result.contents; doc.undoHistory.reset()
-                            _ = await doc.persist()
-                            if document === doc && doc.draft.version == version { text = doc.draft.contents; updateTextContent(force: true) }
-                        } catch {
-                            if document === doc && !doc.draft.dirty { statusText = "Local copy · " + error.localizedDescription; renderHeader() }
-                        }
-                    }
-                }
+                await doc.refresh()
             } catch {
                 if let document { filePath = document.draft.path }
                 statusText = error.localizedDescription
@@ -2163,7 +2370,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         endUndoGroup()
         guard let document, !isLoading, !showingServerVersion else { return }
         if document.draft.conflict { reviewServerVersion(); return }
-        if document.draft.path.isEmpty { beginPathPrompt(mode: .saveAs, defaultValue: ""); return }
+        if document.draft.path.isEmpty { pickerMode = "save"; showOpenFilePicker(); return }
         Task { await document.save() }
     }
 
@@ -2198,12 +2405,25 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         guard let doc = document else { return }
         Task {
             do {
+                let shared = try await doc.sharedState()
                 let disk = try await doc.disk()
                 guard document === doc else { return }
-                reviewedDisk = disk; showingServerVersion = true; text = disk.contents
-                cursorOffset = 0; selectionAnchor = nil
-                updateTextContent(force: true); doc.changed?()
+                reviewedShared = shared
+                reviewedDisk = disk; showingServerVersion = false
+                pickerMode = "conflict"; showOpenFilePicker(); filePickerNameInputController.blur()
             } catch { statusText = error.localizedDescription; renderHeader() }
+        }
+    }
+
+    private func resolveReview(_ action: String) {
+        guard let doc = document, let disk = reviewedDisk else { return }
+        let sharedRevision = reviewedShared?.draftRevision ?? "missing"
+        dismissFilePicker()
+        switch action {
+        case "copy": pickerMode = "copy"; showOpenFilePicker()
+        case "replace": Task { await doc.replaceReviewedFile(revision: disk.revision, draftRevision: sharedRevision) }
+        case "discard": Task { do { try await doc.discardReviewedFile(disk, draftRevision: sharedRevision) } catch { statusText = error.localizedDescription; layout() } }
+        default: break
         }
     }
 
@@ -2261,17 +2481,22 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         guard let url = components.url else { return }
         guard currentURLString != url.absoluteString else { return }
         currentURLString = url.absoluteString
-        outerframeHost.replaceHistoryEntry(url: url)
+        if shouldPushHistory { shouldPushHistory = false; outerframeHost.pushHistoryEntry(url: url) }
+        else { outerframeHost.replaceHistoryEntry(url: url) }
+    }
+
+    private func showContainerPicker() {
+        pickerMode = filePath.isEmpty ? "save" : "open"; showOpenFilePicker()
     }
 
     private func showOpenPrompt() {
-        if document?.draft.target != "host" { beginPathPrompt(mode: .open, defaultValue: filePath); return }
-        showOpenFilePicker()
+        pickerMode = "open"; showOpenFilePicker()
     }
 
     private func showMoveRenamePrompt() {
-        guard !filePath.isEmpty else { return }
-        beginPathPrompt(mode: .moveRename, defaultValue: filePath)
+        guard !filePath.isEmpty else { pickerMode = "save"; showOpenFilePicker(); return }
+        guard document?.draft.dirty == false, document?.draft.pending == nil else { statusText = "Save this file before moving it"; layout(); return }
+        pickerMode = "move"; showOpenFilePicker()
     }
 
     private func beginPathPrompt(mode: PathPromptMode, defaultValue: String) {
@@ -2437,20 +2662,18 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                     }
                 }
             } catch { statusText = error.localizedDescription; renderHeader() }
-            let items = [
-                OuterframeContextMenuItem(id: "path-save", title: "Save", isEnabled: doc != nil && !isLoading && !showingServerVersion),
-                OuterframeContextMenuItem(id: "path-new", title: "New"),
-                OuterframeContextMenuItem(id: "path-open", title: "Open…"),
+            var items = [
+                OuterframeContextMenuItem(id: "text-smaller", title: "Smaller Text", isEnabled: preferences.textScale > 0.25),
+                OuterframeContextMenuItem(id: "text-reset", title: "Text Size: \(Int(preferences.textScale * 100))% — Reset"),
+                OuterframeContextMenuItem(id: "text-larger", title: "Larger Text", isEnabled: preferences.textScale < 3),
+                OuterframeContextMenuItem(id: "text-wrap", title: (preferences.wrapLines ? "✓ " : "") + "Wrap lines"),
                 OuterframeContextMenuItem(id: "path-recover", title: "Recover Draft", kind: .submenu, isEnabled: !recovery.isEmpty, children: recovery),
                 OuterframeContextMenuItem(id: "path-export", title: "Copy Draft as File", isEnabled: doc != nil),
                 OuterframeContextMenuItem(id: "path-copy-text", title: "Copy Draft Text", isEnabled: doc != nil),
                 OuterframeContextMenuItem(id: "path-save-copy", title: "Save a Copy…", isEnabled: doc != nil && doc?.isSynchronizing == false),
-                OuterframeContextMenuItem(id: "path-review", title: "Review Server Version", isEnabled: doc?.draft.conflict == true),
-                OuterframeContextMenuItem(id: "path-return", title: "Return to My Draft", isEnabled: showingServerVersion),
-                OuterframeContextMenuItem(id: "path-replace", title: "Replace Reviewed Server Version with My Draft…", isEnabled: reviewedDisk != nil && doc?.draft.conflict == true),
-                OuterframeContextMenuItem(id: "path-move-rename", title: "Move/Rename…", isEnabled: doc != nil && !filePath.isEmpty && doc?.draft.dirty == false && doc?.draft.pending == nil),
                 OuterframeContextMenuItem(id: "path-copy", title: "Copy Path", isEnabled: !filePath.isEmpty)
             ]
+            if doc?.draft.conflict == true { items.append(OuterframeContextMenuItem(id: "path-review", title: "Review conflicting changes…")) }
             outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
         }
     }
@@ -2465,7 +2688,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func textFont() -> NSFont {
-        NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        NSFont.monospacedSystemFont(ofSize: 15 * preferences.textScale, weight: .regular)
     }
 
     private func updateTextContent(force: Bool = false) {
@@ -2474,6 +2697,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
         withoutImplicitAnimations {
             generation += 1
+            naturalTextWidth = text.components(separatedBy: .newlines).reduce(CGFloat(1)) { max($0, ($1 as NSString).size(withAttributes: [.font: textFont()]).width + 4) }
             contentHeightCache = nil
             visualLineCache = nil
             fragmentCoverage = nil
@@ -2507,9 +2731,38 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         notifyAccessibilityLayoutChanged()
     }
 
+    private func editorTextWidth() -> CGFloat {
+        let viewport = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
+        return preferences.wrapLines ? viewport : max(viewport, naturalTextWidth)
+    }
+
+    private func setTextScale(_ value: CGFloat) {
+        preferences.textScale = min(3, max(0.25, value))
+        savePreferences(); updateTextContent(force: true); layout(); ensureCursorVisible(); updateViewport()
+    }
+
+    private func savePreferences() {
+        guard let store = draftStore else { return }
+        let value = preferences, previous = preferencesWriteTask
+        preferencesWriteTask = Task {
+            await previous?.value
+            do {
+                let encoder = PropertyListEncoder(); encoder.outputFormat = .binary
+                try await store.putSetting("preferences", value: encoder.encode(value))
+            } catch { statusText = "Could not save preferences: " + error.localizedDescription; renderHeader() }
+        }
+    }
+
+    private func rememberRecent() {
+        guard let doc = document, !doc.draft.path.isEmpty else { return }
+        preferences.recent.removeAll { $0.path == doc.draft.path && $0.target == doc.draft.target }
+        preferences.recent.insert(NativeRecentFile(path: doc.draft.path, target: doc.draft.target), at: 0)
+        preferences.recent = Array(preferences.recent.prefix(30)); savePreferences()
+    }
+
     private func layoutText() {
         guard editorClipLayer.bounds.width > 0, editorClipLayer.bounds.height > 0 else { return }
-        let textWidth = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
+        let textWidth = editorTextWidth()
         if abs(textWidth - textLayoutWidth) > 0.5 {
             textLayoutWidth = textWidth
             clearTextFragmentLayers()
@@ -2531,9 +2784,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 return
             }
 
-            let textWidth = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
+            let textWidth = editorTextWidth()
             let contentHeight = max(self.contentHeight() - textInsetY * 2, editorClipLayer.bounds.height)
-            textContentLayer.frame = CGRect(x: textInsetX,
+            textContentLayer.frame = CGRect(x: textInsetX - horizontalOffset,
                                             y: editorClipLayer.bounds.height - textInsetY - contentHeight + scrollOffset,
                                             width: textWidth,
                                             height: contentHeight)
@@ -2612,7 +2865,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func contentHeight() -> CGFloat {
         guard editorClipLayer.bounds.width > 0, editorClipLayer.bounds.height > 0 else { return 0 }
-        let textWidth = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
+        let textWidth = editorTextWidth()
         return contentHeight(textWidth: textWidth)
     }
 
@@ -2633,7 +2886,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func visualLineMetrics(textWidth: CGFloat? = nil) -> EditorVisualLineMetrics {
-        let resolvedTextWidth = max(textWidth ?? (editorClipLayer.bounds.width - textInsetX * 2), 1)
+        let resolvedTextWidth = max(textWidth ?? editorTextWidth(), 1)
         if let cache = visualLineCache,
            cache.generation == generation,
            abs(cache.textWidth - resolvedTextWidth) <= 0.5 {
@@ -2695,7 +2948,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func visibleTextContentRect() -> CGRect {
         CGRect(x: 0,
                y: max(scrollOffset - textInsetY, 0),
-               width: max(editorClipLayer.bounds.width - textInsetX * 2, 1),
+               width: editorTextWidth(),
                height: editorClipLayer.bounds.height)
     }
 
@@ -2900,6 +3153,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func ensureCursorVisible() {
         guard let rect = caretTopDownRect(for: cursorOffset) else { return }
+        if !preferences.wrapLines {
+            let width = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
+            if rect.minX < horizontalOffset { horizontalOffset = max(0, rect.minX - 4) }
+            if rect.maxX > horizontalOffset + width { horizontalOffset = max(0, rect.maxX - width + 4) }
+        }
         let cursorTop = rect.minY + textInsetY
         let cursorBottom = rect.maxY + textInsetY
         if cursorTop < scrollOffset + 4 {
@@ -2951,6 +3209,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func endUndoGroup() {
         document?.undoHistory.finishComposition(text: text, selection: editSelection)
         document?.undoHistory.breakCoalescing()
+        document?.composing = false
         markedTextRange = nil; pendingMarkedTextReplacementRange = nil
     }
 
@@ -2981,7 +3240,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             cursorOffset = normalized.location + replacement.utf16.count
             selectionAnchor = nil
             if composing {
-                if clearsMarkedText { document.undoHistory.finishComposition(text: text, selection: editSelection) }
+                if clearsMarkedText { document.undoHistory.finishComposition(text: text, selection: editSelection); document.composing = false }
             } else {
                 document.undoHistory.record(range: normalized, removed: removed, inserted: replacement,
                                             before: before, after: editSelection, kind: kind)
@@ -3016,6 +3275,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             : (markedTextRange ?? selectionRange ?? NSRange(location: cursorOffset, length: 0))
         guard let replacementRange = normalizedReplacementRange(requestedRange) else { return }
 
+        document?.composing = true
         document?.undoHistory.beginComposition(text: text, selection: editSelection)
         let markedLength = (value as NSString).length
         markedTextRange = markedLength > 0 ? NSRange(location: replacementRange.location, length: markedLength) : nil
@@ -3039,6 +3299,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func unmarkText() {
+        document?.composing = false
         pendingMarkedTextReplacementRange = markedTextRange
         markedTextRange = nil
         updateTextContent(force: true)
@@ -3322,11 +3583,15 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             return
         }
         findInputController.blur()
+        if openControlFrame.contains(headerPoint) { showHomePopover(); return }
+        if containerControlFrame.contains(headerPoint), document?.draft.target != "host" { showContainerPicker(); return }
+        if menuControlFrame.contains(headerPoint) { showPathMenu(at: point); return }
+        if saveControlFrame.contains(headerPoint), document?.draft.dirty == true || document?.draft.pending != nil { saveNow(); return }
         if pathControlFrame.contains(headerPoint) {
             if pathPromptMode != nil {
                 setPathPromptCursor(atToolbarX: headerPoint.x)
             } else {
-                showPathMenu(at: point)
+                showMoveRenamePrompt()
             }
             return
         }
@@ -3671,6 +3936,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                     findInputController.pasteText(string)
                     return
                 }
+                guard pendingFilePicker == nil else { return }
                 endUndoGroup(); insertText(string, kind: .paste); endUndoGroup()
                 return
             }
@@ -3738,6 +4004,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func handleContextMenuItem(menuID: UUID, itemID: String) {
+        if targetMenuIDs.remove(menuID) != nil {
+            pickerTarget = itemID; fetchFilePickerDirectory(path: "~"); return
+        }
         if pendingFilePickerNameMenuIDs.remove(menuID) != nil {
             return
         }
@@ -3747,12 +4016,18 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if pendingPathMenuIDs.remove(menuID) != nil {
             if itemID.hasPrefix("recover:") { openDocument(path: "", draftID: String(itemID.dropFirst(8))); return }
             switch itemID {
+            case "text-smaller": setTextScale(preferences.textScale - 0.1)
+            case "text-larger": setTextScale(preferences.textScale + 0.1)
+            case "text-reset": setTextScale(1)
+            case "text-wrap": preferences.wrapLines.toggle(); horizontalOffset = 0; savePreferences(); updateTextContent(force: true); layout()
             case "path-new": openDocument(path: "", new: true)
             case "path-export": exportDraft()
             case "path-copy-text":
                 if let document { outerframeHost.requestPasteboardWrite(items: pasteboardItems(for: document.draft.contents)) }
-            case "path-save-copy": beginPathPrompt(mode: .saveCopy, defaultValue: filePath)
+            case "path-save-copy": pickerMode = "copy"; showOpenFilePicker()
             case "path-review": reviewServerVersion()
+            case "path-discard":
+                if let document, let reviewedDisk { Task { do { try await document.discardReviewedFile(reviewedDisk, draftRevision: reviewedShared?.draftRevision ?? "missing"); returnToDraft() } catch { statusText = error.localizedDescription; layout() } } }
             case "path-return": returnToDraft()
             case "path-replace":
                 let confirmation = UUID(); pendingPathMenuIDs.insert(confirmation)
@@ -3763,7 +4038,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             case "path-confirm-replace":
                 if let document, let reviewedDisk {
                     returnToDraft()
-                    Task { await document.replaceReviewedFile(revision: reviewedDisk.revision) }
+                    Task { await document.replaceReviewedFile(revision: reviewedDisk.revision, draftRevision: reviewedShared?.draftRevision ?? "missing") }
                 }
             case "path-save":
                 saveNow()
@@ -3790,7 +4065,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func handleKeyDown(characters: String, charactersIgnoringModifiers: String, modifierFlags: NSEvent.ModifierFlags) {
         let normalized = (charactersIgnoringModifiers.isEmpty ? characters : charactersIgnoringModifiers).lowercased()
-        if modifierFlags.contains(.command), normalized == "f" {
+        if modifierFlags.contains(.command), normalized == "o" {
+            showOpenPrompt()
+        } else if modifierFlags.contains(.command), normalized == "f" {
             showFind(selectCurrentSelection: true)
         } else if modifierFlags.contains(.command), normalized == "g" {
             if modifierFlags.contains(.shift) {
@@ -3907,6 +4184,24 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         accessibilityHandlers.removeAll(keepingCapacity: true)
         var children: [OuterframeAccessibilityNode] = []
         if let picker = pendingFilePicker {
+            if pickerMode == "conflict" {
+                for (frame, action) in conflictFrames { children.append(axNode("conflict-" + action, .button, frame, action == "discard" ? "Discard drafts and use saved file" : action == "replace" ? "Replace server file with my draft" : action == "copy" ? "Save a copy" : "Keep my draft", actions: [.press]) { owner, _, _ in owner.resolveReview(action) }) }
+                for (index, item) in [("Your draft", document?.draft.contents ?? ""), ("Saved file", reviewedDisk?.contents ?? ""), ("Shared draft", reviewedShared?.contents ?? "")].enumerated() { children.append(axNode("comparison-\(index)", .staticText, filePickerPanelFrame, item.0, value: item.1)) }
+                return OuterframeAccessibilitySnapshot(rootNodes: [axNode("conflict", .dialog, filePickerPanelFrame, "Review changes", children: children)])
+            }
+            if ["recent", "open"].contains(pickerMode) {
+                children.append(axNode("recent-tab", .button, recentTabFrame, "Recent", actions: [.press]) { owner, _, _ in owner.pickerMode = "recent"; owner.filePickerScroll = 0; owner.renderFilePicker() })
+                children.append(axNode("open-tab", .button, openTabFrame, "Open", actions: [.press]) { owner, _, _ in owner.pickerMode = "open"; owner.fetchFilePickerDirectory(path: owner.pendingFilePicker?.directory ?? "~") })
+                children.append(axNode("new-file", .button, newFileFrame, "New text file", actions: [.press]) { owner, _, _ in owner.dismissFilePicker(); owner.shouldPushHistory = true; owner.openDocument(path: "", new: true, target: owner.pickerTarget) })
+            }
+            if pickerMode == "recent" {
+                for (frame, remove, recent) in recentFrames {
+                    children.append(axNode("recent:" + recent.target + recent.path, .button, frame, (recent.path as NSString).lastPathComponent, value: recent.path, actions: [.press]) { owner, _, _ in owner.dismissFilePicker(); owner.shouldPushHistory = true; owner.openDocument(path: recent.path, target: recent.target) })
+                    children.append(axNode("remove:" + recent.target + recent.path, .button, remove, "Remove " + (recent.path as NSString).lastPathComponent + " from recents", actions: [.press]) { owner, _, _ in owner.preferences.recent.removeAll { $0.path == recent.path && $0.target == recent.target }; owner.savePreferences(); owner.renderFilePicker() })
+                }
+                return OuterframeAccessibilitySnapshot(rootNodes: [axNode("recents", .dialog, filePickerPanelFrame, "Open files", children: children)])
+            }
+            if ["open", "save", "copy"].contains(pickerMode) { children.append(axNode("target", .button, targetControlFrame, "Host or container", value: pickerTarget, actions: [.press]) { owner, _, _ in owner.showTargetMenu(at: owner.targetControlFrame.origin) }) }
             for segment in filePickerBreadcrumbSegmentFrames {
                 let frame = filePickerBreadcrumbLayer.convert(segment.frame, to: rootLayer)
                 children.append(axNode("directory:\(segment.path)", .button, frame, segment.path, actions: [.press]) { owner, _, _ in
@@ -3928,14 +4223,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             if picker.isLoading || !picker.error.isEmpty {
                 children.append(axNode("picker-status", .staticText, filePickerListFrame, picker.isLoading ? "Loading files" : picker.error))
             }
-            children.append(axNode("filename", .textField, filePickerNameFieldFrame, "File name", value: filePickerNameInputController.text,
+            if pickerMode != "open" { children.append(axNode("filename", .textField, filePickerNameFieldFrame, "File name", value: filePickerNameInputController.text,
                                    actions: [.focus, .setValue], focused: filePickerNameInputController.isFocused) { owner, action, value in
                 owner.filePickerNameInputController.focus()
                 if action == .setValue { owner.filePickerNameInputController.setText(value) }
             })
-            children.append(axNode("cancel-open", .button, filePickerCancelFrame, "Cancel", actions: [.press]) { owner, _, _ in owner.dismissFilePicker() })
-            children.append(axNode("open", .button, filePickerOpenFrame, "Open", actions: [.press], enabled: !picker.isLoading) { owner, _, _ in owner.openFilePickerTypedPath() })
-            return OuterframeAccessibilitySnapshot(rootNodes: [axNode("picker", .dialog, filePickerPanelFrame, "Open File", children: children)])
+            }
+            children.append(axNode("open", .button, filePickerOpenFrame, pickerMode == "move" ? "Move" : pickerMode == "open" ? "Open file" : "Save", actions: [.press], enabled: !picker.isLoading && picker.error.isEmpty) { owner, _, _ in owner.openFilePickerTypedPath() })
+            return OuterframeAccessibilitySnapshot(rootNodes: [axNode("picker", .dialog, filePickerPanelFrame, pickerMode == "move" ? "Move or rename file" : pickerMode == "save" ? "Save text file" : pickerMode == "copy" ? "Save a copy" : "Open files", children: children)])
         }
         if let mode = pathPromptMode {
             children.append(axNode("path-prompt", .textField, headerLayer.convert(pathControlFrame, to: rootLayer), "\(mode.label) path",
@@ -3949,12 +4244,18 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 }
             })
         } else {
-            children.append(axNode("file-actions", .button, headerLayer.convert(pathControlFrame, to: rootLayer), "File actions",
+            children.append(axNode("file-actions", .button, headerLayer.convert(pathControlFrame, to: rootLayer), "Move or rename file",
                                    value: documentDisplayName(), actions: [.press, .showMenu]) { owner, _, _ in
                 let frame = owner.headerLayer.convert(owner.pathControlFrame, to: owner.rootLayer)
-                owner.showPathMenu(at: CGPoint(x: frame.midX, y: frame.maxY))
+                _ = frame; owner.showMoveRenamePrompt()
             })
         }
+        if document?.draft.target != "host", containerControlFrame.width > 0 {
+            children.append(axNode("container", .button, headerLayer.convert(containerControlFrame, to: rootLayer), "Choose host or container", value: targets.first { $0.id == document?.draft.target }?.name, actions: [.press]) { owner, _, _ in owner.showContainerPicker() })
+        }
+        children.append(axNode("open-files", .button, headerLayer.convert(openControlFrame, to: rootLayer), "Open files", actions: [.press]) { owner, _, _ in owner.showHomePopover() })
+        children.append(axNode("document-actions", .button, headerLayer.convert(menuControlFrame, to: rootLayer), "Document actions", actions: [.press, .showMenu]) { owner, _, _ in owner.showPathMenu(at: owner.headerLayer.convert(owner.menuControlFrame.origin, to: owner.rootLayer)) })
+        if document?.draft.dirty == true || document?.draft.pending != nil { children.append(axNode("save-file", .button, headerLayer.convert(saveControlFrame, to: rootLayer), isSaving ? "Saving" : "Save", actions: [.press]) { owner, _, _ in owner.saveNow() }) }
         if let status = statusLayer.string as? String, !status.isEmpty {
             children.append(axNode("status", .staticText, headerLayer.convert(statusLayer.frame, to: rootLayer), "Status", value: status))
         }
