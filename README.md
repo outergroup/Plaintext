@@ -54,11 +54,30 @@ builder. `Scripts/test_runtime_command.c` tests the command contract, including
 `wslc.exe`; Windows still needs native process transport integration and live
 validation. `wslc` is not treated as a `wsl.exe` distribution.
 
+## HTML document scrolling
+
+The HTML editor uses the page's vertical scrollbar. The textarea grows with its
+contents using CSS `field-sizing: content`; the title/Save bar is fixed to the viewport, outside the scrolling content.
+There is no viewport-height tracking, translated editor surface, or nested
+vertical editor scrollbar. Current Safari (26.2+) and other browsers supporting
+`field-sizing` are required. This lets the iOS status-bar tap return the document
+to its start. Outer Loop must use native keyboard resizing and automatic WebKit
+inset adjustment so the keyboard is not counted twice. Pointer focus uses
+`preventScroll` to avoid WebKit's animated focus scroll, which can move the native
+scroll layer ahead of fixed-element painting. When the keyboard shrinks the
+visible area, a temporary text-layout mirror locates the caret and the document
+scrolls immediately only as far as needed to reveal it.
+
+Run `Scripts/test_web_scrolling.sh <booted-iOS-simulator-UDID>` for the native
+keyboard/scrolling regression, including native scroll-layer presentation checks. It uses the sibling `outerloop` checkout; set
+`OUTERLOOP_ROOT` to test a different checkout. Also check a real status-bar tap,
+scrolling with the keyboard dismissed, and tapping to reopen it.
+
 ## HTML editor draft recovery
 
 The HTML editor updates its text immediately in the browser. Edits are saved to
 IndexedDB at most 100 ms after typing begins, independently of the server; a
-700 ms debounce also backs up drafts to the server. Untitled drafts are included.
+700 ms debounce also publishes drafts to the server. Untitled drafts are included.
 The document menu's **Recover draft…** command opens previous local drafts, and
 **Download a copy** exports the current text if storage is unavailable.
 
@@ -73,15 +92,40 @@ the local and server text, saving a separate copy, or explicitly replacing the
 server file. A raw disk read reconciles an acknowledged-by-server but lost HTTP
 response without confusing a server draft with the saved file.
 
-A service worker caches a complete editor shell for offline reload after the
-first successful online visit. Packaging hashes the shell assets to version each
+The visible document subscribes to `/api/watch`, an HTTP notification stream backed
+by kqueue on macOS and inotify on Linux. Saved-file and shared-draft changes update other editors while preserving selection
+and scroll position. A synchronized draft remains marked **Edited** until saved;
+it can receive newer drafts as long as it has no outstanding local edits. Local
+edits, pending saves, and composition are protected from replacement. Reconnecting or returning to the
+page checks the current revision to catch missed events. There is no periodic file
+polling; blank stream heartbeats only keep the connection alive. Container watches
+use the helper’s `watch PATH` command and require an updated helper in the container.
+
+The HTML client uses `state`, `publish`, and `commit` operations. Each shared draft
+has a content revision separate from the saved file revision. Publish and commit
+compare both revisions under a per-document filesystem lock; commit only removes
+the draft it checked. Shared state reads use the same lock. Draft acknowledgments
+and the last synchronized local version are persisted with the local recovery
+record, so reloading does not turn an already synchronized draft into a new edit.
+Conflicting edits stay local for review against the shared draft and saved file;
+they can be saved as a copy or explicitly replace the reviewed server state. This
+is device switching with conflict protection, not simultaneous text merging. The
+native editor continues to use its existing draft API.
+
+Where supported, a service worker opportunistically caches the editor shell for
+offline reload after the first successful online visit. Unsupported browsers and
+cache-registration failures do not produce user-facing capability warnings.
+Actual file-loading, draft-storage, and save failures are still reported. Packaging hashes the shell assets to version each
 cache; a new shell activates after existing editor pages close. Browser storage
 belongs to the browser profile and origin: clearing site data removes drafts,
 and browser eviction or device failure can still lose them. Storage failures are
 shown prominently; navigation warns when the latest edits are not persisted.
 This recovery applies to the HTML editor, not the native outerframe editor.
 
-Focused checks: `node Scripts/test_local_drafts.cjs`,
+Focused checks: `node Scripts/test_shared_drafts.cjs <PlaintextBackend>`,
+`node Scripts/test_live_refresh.cjs`,
+`python3 Scripts/test_file_notifications.py <PlaintextBackend> <PlaintextHelper>`,
+`node Scripts/test_local_drafts.cjs`,
 `node Scripts/test_single_document.cjs`, `node Scripts/test_web_environments.cjs`,
 `python3 Scripts/test_disk_read.py <EnvironmentDriver>`, and
 `python3 Scripts/test_environment_http.py <PlaintextBackend>`.
@@ -117,3 +161,28 @@ IndexedDB store are separate; they share the backend's file revision protocol.
 
 Run `bash Scripts/test_native_documents.sh` for controller, SQLite ownership,
 recovery, save queue, conflict, and real-backend binary protocol checks.
+
+## Native undo and redo
+
+The outerframe editor handles Command-Z and Shift-Command-Z through the host's
+native Edit menu and offers named actions in its context menu. Each open document
+owns a Foundation-only `TextUndoHistory` from `Vendor/TextEditing`: contiguous typing forms word-sized
+runs, adjacent deletions in the same direction coalesce, and a two-second pause,
+caret movement, focus change, or Save ends the current group. Paste, cut, line
+breaks, replacements, and committed marked-text compositions are distinct edits.
+Undo and redo restore the caret and selection direction. Character deletion and
+movement respect composed Unicode characters.
+
+Undo uses the same local draft checkpoint and revision-checked save pipeline as
+ordinary editing. Returning to the saved contents clears the modified indicator;
+undoing a saved change marks the draft modified again. A new edit discards redo.
+History is kept in memory per document, with up to 200 groups and a 16 MiB text
+payload budget (the newest operation is always retained). Draft recovery restores
+text and queued saves, but does not restore undo history after restarting.
+
+The outerframe protocol advertises Undo/Redo availability with edit-command mask
+bits 7 and 8 and forwards the existing `textCommand` messages `undo` and `redo`.
+Find and file-picker text fields have independent undo histories using the same
+vendored engine; their focused field receives Undo/Redo instead of the document.
+`Scripts/test_native_documents.sh` includes grouping, Unicode, composition,
+selection, save-race, and backend draft-cleanliness tests.

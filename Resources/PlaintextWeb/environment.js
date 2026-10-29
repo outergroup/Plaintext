@@ -1,12 +1,12 @@
 const EnvironmentBinary = (() => {
     'use strict';
     const encoder = new TextEncoder(), decoder = new TextDecoder('utf-8', {fatal:true});
-    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9, disk:10};
+    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9, disk:10, state:11, publish:12, commit:13};
     function encode(operation, values = {}) {
         const op = operations[operation];
         if (!op) throw Error('Unsupported environment operation');
         const fields = [values.target ?? 'host', values.user ?? '', values.path ?? '~',
-                        values.destination ?? '', values.revision ?? '', values.contents ?? ''];
+                        values.draftRevision ?? values.destination ?? '', values.revision ?? '', values.contents ?? ''];
         const strings = fields.map(value => {
             if (typeof value !== 'string' || value.includes('\0')) throw Error('Invalid environment field');
             return encoder.encode(value);
@@ -64,12 +64,12 @@ const EnvironmentBinary = (() => {
     function decode(buffer, operation) {
         const r = reader(buffer, 48);
         if (r.u32(0) !== 0x52434c50 || r.u32(4) !== 1 || r.u32(8) !== buffer.byteLength ||
-            r.u32(12) > 1 || r.u32(40) > 3 || r.u32(44)) throw Error('Invalid environment response');
-        if (r.u32(12)) throw Error(r.string(32));
+            r.u32(12) > 1 || r.u32(40) > 7 || r.u32(44)) throw Error('Invalid environment response');
+        if (r.u32(12)) { const error = Error(r.string(32)); error.conflict = !!(r.u32(40) & 4); throw error; }
         const metadata = r.bytes(16), body = r.bytes(24);
         if (operation === 'targets') return targets(metadata);
         const m = reader(metadata, 64), count = m.u32(20), stride = m.u32(24), variable = m.u32(32);
-        const expected = (operation === 'preview' || operation === 'disk') ? 2 : operation === 'draft' ? 3 : operations[operation];
+        const expected = (operation === 'preview' || operation === 'disk' || operation === 'state') ? 2 : ['draft','publish','commit'].includes(operation) ? 3 : operations[operation];
         if (!expected || m.u32(0) !== 0x53484c50 || m.u32(4) !== 2 || m.u32(8) !== expected ||
             m.u32(12) !== 0 || m.u32(16) !== metadata.byteLength || m.u32(28) !== 64 || m.u32(36) ||
             m.u64(40) !== body.byteLength || stride !== (operation === 'list' ? 48 : 0) ||
@@ -88,11 +88,16 @@ const EnvironmentBinary = (() => {
             result.data = body; result.type = r.string(32);
         } else {
             result.revision = m.string(56, variable);
-            if ((operation === 'read' || operation === 'disk')) {
+            if ((operation === 'read' || operation === 'disk' || operation === 'state')) {
                 result.contents = decoder.decode(body);
                 if (result.contents.includes('\0')) throw Error('Invalid document text');
                 result.dirty = !!(r.u32(40) & 1); result.draftConflict = !!(r.u32(40) & 2);
             }
+        }
+        if (['state','publish','commit'].includes(operation)) {
+            const tokens = r.string(32).split(':');
+            if (tokens.length !== 2 || tokens.some(token => !/^(missing|[a-f0-9]{64})$/.test(token))) throw Error('Invalid shared draft revision');
+            [result.draftRevision, result.diskRevision] = tokens;
         }
         return result;
     }

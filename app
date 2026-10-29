@@ -258,12 +258,10 @@ build_local_backend() {
         "${resources}/bundles/${BUNDLE_ARCHIVE_STEM}.macos-arm.aar"
     install -m 0644 "${STAGE_ROOT}/bundles/${BUNDLE_ARCHIVE_STEM}.macos-x86.aar" \
         "${resources}/bundles/${BUNDLE_ARCHIVE_STEM}.macos-x86.aar"
-    install -m 0644 "${STAGE_ROOT}/web/index.html" "${resources}/web/index.html"
-    install -m 0644 "${STAGE_ROOT}/web/app.css" "${resources}/web/app.css"
-    install -m 0644 "${STAGE_ROOT}/web/app.js" "${resources}/web/app.js"
-    install -m 0644 "${STAGE_ROOT}/web/environment.js" "${resources}/web/environment.js"
-    install -m 0644 "${STAGE_ROOT}/web/offline.js" "${resources}/web/offline.js"
-    install -m 0644 "${STAGE_ROOT}/web/sw.js" "${resources}/web/sw.js"
+    for asset in "${STAGE_ROOT}/web/"*; do
+        [[ -f "${asset}" ]] || continue
+        install -m 0644 "${asset}" "${resources}/web/$(basename "${asset}")"
+    done
     install -m 0644 "${STAGE_ROOT}/app-icon.png" "${resources}/app-icon.png"
 
     local info_plist="${contents}/Info.plist"

@@ -119,6 +119,7 @@ typedef struct {
     size_t header_length;
     size_t content_length;
     time_t last_activity;
+    EnvironmentWatch *watch;
 } Client;
 
 typedef struct {
@@ -1049,7 +1050,8 @@ static size_t content_length_from_headers(const char *headers) {
     return 0;
 }
 
-static void process_client_request(int fd, Buffer *request, size_t header_length, size_t content_length) {
+static void process_client_request(Client *client, Buffer *request, size_t header_length, size_t content_length) {
+    int fd = client->fd;
     bool has_environment_header = environment_request_header(request->data, header_length);
     char *header_end = request->data + header_length - 4;
     *header_end = '\0';
@@ -1067,6 +1069,18 @@ static void process_client_request(int fd, Buffer *request, size_t header_length
         query++;
     } else {
         query = "";
+    }
+
+    if (strcmp(target, "/api/watch") == 0) {
+        if (strcmp(method, "POST") || !has_environment_header) {
+            send_text_response(fd, 403, "Missing environment request header or method\n"); return;
+        }
+        EnvironmentWatch *watch = environment_watch_open(request->data + header_length, content_length);
+        if (!watch) { send_text_response(fd, 503, "File notifications unavailable\n"); return; }
+        const char *header = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
+        if (send(fd, header, strlen(header), 0) != (ssize_t)strlen(header)) { environment_watch_close(watch); return; }
+        client->watch = watch;
+        return;
     }
 
     if (strcmp(target, "/api/environments") == 0) {
@@ -1142,6 +1156,7 @@ static void client_init(Client *client) {
 }
 
 static void client_close(Client *client) {
+    environment_watch_close(client->watch);
     if (client->fd >= 0) {
         close(client->fd);
     }
@@ -1176,6 +1191,7 @@ static bool client_request_complete(const Client *client) {
 
 static void handle_client_read(Client *client) {
     char chunk[READ_CHUNK_SIZE];
+    if (client->watch) { client_close(client); return; }
     while (true) {
         ssize_t n = read(client->fd, chunk, sizeof(chunk));
         if (n < 0) {
@@ -1202,11 +1218,16 @@ static void handle_client_read(Client *client) {
         }
         if (client_request_complete(client)) {
             set_fd_nonblocking(client->fd, false);
-            process_client_request(client->fd,
+            process_client_request(client,
                                    &client->request,
                                    client->header_length,
                                    client->content_length);
-            client_close(client);
+            if (client->watch) {
+                buffer_free(&client->request);
+                set_fd_nonblocking(client->fd, true);
+                const char *ready = "{\"changed\":true}\n";
+                if (environment_watch_ready(client->watch) && send(client->fd, ready, strlen(ready), 0) != (ssize_t)strlen(ready)) client_close(client);
+            } else client_close(client);
             return;
         }
     }
@@ -1248,6 +1269,13 @@ static void close_idle_clients(Client *clients) {
     time_t now = time(NULL);
     for (size_t i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd < 0) continue;
+        if (clients[i].watch) {
+            if (now - clients[i].last_activity >= 20) {
+                if (send(clients[i].fd, "\n", 1, 0) != 1) client_close(&clients[i]);
+                else clients[i].last_activity = now;
+            }
+            continue;
+        }
         if (now - clients[i].last_activity > CLIENT_TIMEOUT_SECONDS) {
             client_close(&clients[i]);
         }
@@ -1264,8 +1292,9 @@ static void run_reactor(int listen_fd) {
     }
 
     while (!g_shutdown_requested) {
-        struct pollfd fds[MAX_CLIENTS + 1];
-        size_t client_indexes[MAX_CLIENTS];
+        struct pollfd fds[MAX_CLIENTS * 3 + 1];
+        size_t client_indexes[MAX_CLIENTS * 3];
+        int watch_events[MAX_CLIENTS * 3];
         nfds_t count = 1;
         fds[0].fd = listen_fd;
         fds[0].events = POLLIN;
@@ -1274,10 +1303,17 @@ static void run_reactor(int listen_fd) {
         for (size_t i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].fd < 0) continue;
             client_indexes[count - 1] = i;
+            watch_events[count - 1] = false;
             fds[count].fd = clients[i].fd;
             fds[count].events = POLLIN;
             fds[count].revents = 0;
             count++;
+            if (clients[i].watch) {
+                for (int source = 1; source <= 2; source++) {
+                    client_indexes[count - 1] = i; watch_events[count - 1] = source;
+                    fds[count++] = (struct pollfd){environment_watch_descriptor(clients[i].watch, source), POLLIN, 0};
+                }
+            }
         }
 
         int ready = poll(fds, count, 1000);
@@ -1294,6 +1330,18 @@ static void run_reactor(int listen_fd) {
             short revents = fds[i].revents;
             if (!revents) continue;
             size_t client_index = client_indexes[i - 1];
+            if (clients[client_index].fd < 0) continue;
+            if (watch_events[i - 1]) {
+                if (!clients[client_index].watch) continue;
+                int changed = environment_watch_read(clients[client_index].watch, watch_events[i - 1]);
+                if (changed < 0 || (revents & (POLLERR | POLLHUP | POLLNVAL))) client_close(&clients[client_index]);
+                else if (changed) {
+                    const char *message = "{\"changed\":true}\n";
+                    if (send(clients[client_index].fd, message, strlen(message), 0) != (ssize_t)strlen(message)) client_close(&clients[client_index]);
+                    else clients[client_index].last_activity = time(NULL);
+                }
+                continue;
+            }
             if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
                 client_close(&clients[client_index]);
                 continue;

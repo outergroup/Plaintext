@@ -1,6 +1,7 @@
 #include "environment.h"
+#include <sys/file.h>
 enum { CLIENT_HEADER = 72, CLIENT_RESPONSE = 48, DRAFT_HEADER = 32,
-       CLIENT_TARGETS = 7, CLIENT_PREVIEW = 8, CLIENT_DRAFT = 9, CLIENT_DISK = 10 };
+       CLIENT_TARGETS = 7, CLIENT_PREVIEW = 8, CLIENT_DRAFT = 9, CLIENT_DISK = 10, CLIENT_STATE = 11, CLIENT_PUBLISH = 12, CLIENT_COMMIT = 13 };
 static char *draft_path(const char *target, const char *user, const char *path) {
     const char *state = getenv("XDG_STATE_HOME");
     char *root = NULL;
@@ -63,7 +64,10 @@ static bool restore_draft(const char *path, BinaryReply *reply, uint32_t *flags)
         current = binary_read_string(reply->metadata, 56, get_u32(reply->metadata.data + 32), 64);
         ok = revision && contents && current && utf8((unsigned char *)contents, strlen(contents));
     }
-    if (ok) {
+    if (ok && !strcmp(current, revision) && reply->body.size == strlen(contents) &&
+        (!reply->body.size || !memcmp(reply->body.data, contents, reply->body.size))) {
+        *flags = 0;
+    } else if (ok) {
         *flags = 1 | (strcmp(current, revision) ? 2 : 0);
         bytes_free(&reply->body);
         reply->body = (Bytes){(unsigned char *)contents, strlen(contents)};
@@ -72,6 +76,29 @@ static bool restore_draft(const char *path, BinaryReply *reply, uint32_t *flags)
     } else if (!failure[0]) fail("invalid saved draft");
     free(revision); free(contents); free(current); bytes_free(&saved);
     return ok;
+}
+static int lock_draft(const char *path) {
+    char *name = format("%s.lock", path);
+    int fd = open(name, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    free(name);
+    if (fd < 0 || flock(fd, LOCK_EX)) {
+        if (fd >= 0) close(fd);
+        fail("lock draft: %s", strerror(errno));
+        return -1;
+    }
+    return fd;
+}
+static bool draft_revision(const char *path, char token[65]) {
+    errno = 0;
+    Bytes saved = read_file(path, MAX_TEXT + 128, true);
+    if (!saved.data) {
+        if (errno != ENOENT) return false;
+        failure[0] = 0; strcpy(token, "missing");
+        return true;
+    }
+    digest(saved.data, saved.size, token);
+    bytes_free(&saved);
+    return true;
 }
 static Bytes client_response(BinaryReply reply, Bytes snapshot, uint32_t flags, const char *type) {
     char message[sizeof(failure)];
@@ -101,6 +128,9 @@ Bytes dispatch_binary(Bytes input, const char *method) {
     BinaryReply reply = {0};
     Bytes snapshot = {0}, body = {0};
     uint32_t operation = 0, flags = 0;
+    int draft_lock = -1;
+    char state_token[132] = "", token[65] = "", disk_revision[65] = "";
+    bool shared = false;
     const char *type = "";
     if (failure[0]) goto done;
     if (strcmp(method, "POST")) { fail("environment requests require POST"); goto done; }
@@ -108,7 +138,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         get_u32(input.data + 4) != 1 || get_u32(input.data + 8) != input.size ||
         get_u64(input.data + 16)) { fail("invalid environment request header"); goto done; }
     operation = get_u32(input.data + 12);
-    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == OP_READ || operation == OP_SAVE || operation == OP_MOVE || operation == CLIENT_DRAFT || operation == CLIENT_DISK;
+    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == OP_READ || operation == OP_SAVE || operation == OP_MOVE || operation == CLIENT_DRAFT || operation == CLIENT_DISK || operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT;
     if (!allowed) { fail("operation is not supported by this app"); goto done; }
     target = binary_read_string(input, 24, CLIENT_HEADER, 4096);
     user = binary_read_string(input, 32, CLIENT_HEADER, 256);
@@ -122,7 +152,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         if (!utf8((unsigned char *)fields[i], strlen(fields[i]))) { fail("invalid UTF-8 request"); goto done; }
     size_t offset = get_u32(input.data + 64), length = get_u32(input.data + 68);
     if (offset < CLIENT_HEADER || offset > input.size || length > input.size - offset || length > MAX_TEXT ||
-        ((operation != OP_SAVE && operation != CLIENT_DRAFT) && length)) {
+        ((operation != OP_SAVE && operation != CLIENT_DRAFT && operation != CLIENT_PUBLISH && operation != CLIENT_COMMIT) && length)) {
         fail("invalid request body"); goto done;
     }
     body = (Bytes){input.data + offset, length};
@@ -133,12 +163,52 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         environment_snapshot_free(&environments);
         goto done;
     }
-    request.operation = operation == CLIENT_PREVIEW || operation == CLIENT_DISK ? OP_READ : operation;
+    shared = operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT;
+    request.operation = operation == CLIENT_PREVIEW || operation == CLIENT_DISK || operation == CLIENT_STATE ? OP_READ : operation == CLIENT_COMMIT ? OP_SAVE : operation;
     request.limit = operation == CLIENT_PREVIEW ? MAX_DATA : MAX_TEXT;
     request.data_length = body.size;
-    if (operation == CLIENT_DRAFT || operation == OP_SAVE || operation == OP_MOVE) {
+    if (shared && !strcmp(target, "host")) {
+        char normalized[PATH_MAX];
+        if (!expand_path(request.path, normalized)) goto done;
+        free(request.path); request.path = strdup(normalized);
+    } else if (operation == CLIENT_STATE && request.path[0] != '/') {
+        BinaryReply resolved_reply = environment_binary_operation(target, user, &request, (Bytes){0});
+        char *resolved = !failure[0] && response_validate(resolved_reply, OP_READ)
+            ? binary_read_string(resolved_reply.metadata, 48, get_u32(resolved_reply.metadata.data + 32), PATH_MAX - 1) : NULL;
+        binary_reply_free(&resolved_reply);
+        if (!resolved) goto done;
+        free(request.path); request.path = resolved;
+    }
+    if (operation == CLIENT_DRAFT || operation == OP_SAVE || operation == OP_MOVE || shared) {
         draft = draft_path(target, user, request.path);
         if (!draft) goto done;
+        draft_lock = lock_draft(draft);
+        if (draft_lock < 0) goto done;
+        if (shared && operation != CLIENT_STATE) {
+            if (!draft_revision(draft, token)) goto done;
+            if (strcmp(token, request.destination)) {
+                flags |= 4; fail("The shared draft changed on another device. Review changes before saving."); goto done;
+            }
+        }
+    }
+    if (operation == CLIENT_PUBLISH) {
+        Request check = request; check.operation = OP_READ; check.data_length = 0;
+        BinaryReply disk = environment_binary_operation(target, user, &check, (Bytes){0});
+        char *actual = !failure[0] && response_validate(disk, OP_READ)
+            ? binary_read_string(disk.metadata, 56, get_u32(disk.metadata.data + 32), 64) : NULL;
+        bool matches = actual && !strcmp(actual, request.revision);
+        free(actual); binary_reply_free(&disk);
+        if (!matches) {
+            if (!failure[0]) { flags |= 4; fail("The saved file changed. Review changes before continuing."); }
+            goto done;
+        }
+        if (write_draft(draft, request.revision, body) && draft_revision(draft, token)) {
+            reply = response_create(OP_SAVE, 0, 0);
+            binary_string(&reply.metadata, 48, request.path);
+            binary_string(&reply.metadata, 56, request.revision);
+            snprintf(state_token, sizeof(state_token), "%s:%s", token, request.revision); type = state_token;
+        }
+        goto done;
     }
     if (operation == CLIENT_DRAFT) {
         if (write_draft(draft, request.revision, body)) reply = response_create(OP_SAVE, 0, 0);
@@ -146,18 +216,27 @@ Bytes dispatch_binary(Bytes input, const char *method) {
     }
     reply = environment_binary_operation(target, user, &request, body);
     if (failure[0] || !response_validate(reply, request.operation)) goto done;
-    if (operation == OP_READ || operation == CLIENT_DISK) {
+    if (operation == OP_READ || operation == CLIENT_DISK || operation == CLIENT_STATE) {
         char hash[65];
         digest(reply.body.data, reply.body.size, hash);
         char *resolved = binary_read_string(reply.metadata, 48, get_u32(reply.metadata.data + 32), PATH_MAX - 1);
         char *revision = binary_read_string(reply.metadata, 56, get_u32(reply.metadata.data + 32), 64);
         if (!resolved || !*resolved || !revision || strcmp(hash, revision) || !utf8(reply.body.data, reply.body.size))
             fail("invalid UTF-8 file or helper read response");
-        if (!failure[0]) draft = draft_path(target, user, resolved);
+        if (!failure[0] && !draft) draft = draft_path(target, user, resolved);
+        if (revision) snprintf(disk_revision, sizeof(disk_revision), "%s", revision);
         free(resolved); free(revision);
         if (draft && operation != CLIENT_DISK) restore_draft(draft, &reply, &flags);
-    } else if (operation == OP_SAVE) {
+        if (draft && operation == CLIENT_STATE && draft_revision(draft, token)) {
+            snprintf(state_token, sizeof(state_token), "%s:%s", token, disk_revision); type = state_token;
+        }
+    } else if (operation == OP_SAVE || operation == CLIENT_COMMIT) {
         if (unlink(draft) && errno != ENOENT) fail("file saved, but draft cleanup failed: %s", strerror(errno));
+        if (operation == CLIENT_COMMIT) {
+            char *saved_revision = binary_read_string(reply.metadata, 56, get_u32(reply.metadata.data + 32), 64);
+            if (saved_revision) { snprintf(state_token, sizeof(state_token), "missing:%s", saved_revision); type = state_token; }
+            free(saved_revision);
+        }
     } else if (operation == OP_MOVE) {
         char *dest = binary_read_string(reply.metadata, 48, get_u32(reply.metadata.data + 32), PATH_MAX - 1);
         char *new_path = dest && *dest ? draft_path(target, user, dest) : NULL;
@@ -167,6 +246,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         free(dest); free(new_path);
     }
 done:
+    if (draft_lock >= 0) close(draft_lock);
     response_finish(&reply);
     Bytes result = client_response(reply, snapshot, flags, type);
     free(target); free(user); free(draft); request_free(&request);

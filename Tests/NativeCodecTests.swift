@@ -24,6 +24,9 @@ struct NativeCodecTests {
         }
         let read = try request(2)
         precondition(read.contents == "original ☃")
+        _ = try request(9, revision: read.revision, contents: read.contents)
+        let identical = try request(2)
+        precondition(!identical.dirty && !identical.conflict && identical.contents == read.contents)
         _ = try request(9, revision: read.revision, contents: "draft")
         let restored = try request(2)
         precondition(restored.dirty && restored.contents == "draft")

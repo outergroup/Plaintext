@@ -13,7 +13,7 @@ async function settled(doc){if(doc.running)await doc.sync();await doc.writes;}
  doc=new Document(records.get(doc.id),options);await doc.persist();assert.equal(doc.contents,'offline text');assert(doc.dirty);
  const untitled=setup({path:''});untitled.doc.edit('untitled draft');await untitled.doc.persist();assert.equal(untitled.records.get(untitled.doc.id).contents,'untitled draft');
  let calls=[],release;
- ({doc,records}=setup({},async(op,values)=>{calls.push({op,...values});if(op==='save')return new Promise(resolve=>release=resolve);return{};}));
+ ({doc,records}=setup({},async(op,values)=>{calls.push({op,...values});if(op==='commit')return new Promise(resolve=>release=resolve);return{};}));
  doc.edit('first edit');await doc.requestSave();await new Promise(setImmediate);doc.edit('newer edit');release({path:'/file.txt',revision:'r1'});await settled(doc);
  assert.equal(calls[0].contents,'first edit');assert(doc.dirty);assert.equal(doc.contents,'newer edit');assert.equal(doc.revision,'r1');assert.equal(doc.pendingSave,null);assert(records.get(doc.id).dirty);
  calls=[];
@@ -24,8 +24,8 @@ async function settled(doc){if(doc.running)await doc.sync();await doc.writes;}
  ({doc,records,options}=setup({},async()=>{throw network;}));doc.edit('queued offline');await doc.requestSave();await settled(doc);
  assert.equal(records.get(doc.id).pendingSave.contents,'queued offline');assert(doc.retryTimer);assert(doc.message.includes('Waiting for connection'));
  const restored=new Document(records.get(doc.id),{...options,api:async()=>({path:'/file.txt',revision:'after-reconnect'})});await restored.sync();assert(!restored.pendingSave);assert(!restored.dirty);
- ({doc}=setup({},async(op,values)=>{if(op==='save')throw network;return {path:'/file.txt',contents:'written',revision:'written-revision'};}));doc.edit('written');await doc.requestSave();await settled(doc);assert(!doc.pendingSave);assert(!doc.dirty);assert.equal(doc.revision,'written-revision');
- ({doc,records}=setup({},async(op)=>{if(op==='save')throw Error('file changed');return {path:'/file.txt',contents:'someone else',revision:'external'};}));doc.edit('my version');await doc.requestSave();await settled(doc);
+ ({doc}=setup({},async(op,values)=>{if(op==='commit')throw network;return {path:'/file.txt',contents:'written',revision:'written-revision'};}));doc.edit('written');await doc.requestSave();await settled(doc);assert(!doc.pendingSave);assert(!doc.dirty);assert.equal(doc.revision,'written-revision');
+ ({doc,records}=setup({},async(op)=>{if(op==='commit')throw Error('file changed');return {path:'/file.txt',contents:'someone else',revision:'external'};}));doc.edit('my version');await doc.requestSave();await settled(doc);
  assert(doc.conflict);assert.equal(records.get(doc.id).contents,'my version');assert(!doc.retryTimer);
  let usedRevision;doc.api=async(op,values)=>{usedRevision=values.revision;return{path:'/file.txt',revision:'resolved'};};await doc.resolveConflict('external');await settled(doc);assert.equal(usedRevision,'external');assert(!doc.conflict);
  ({doc,store}=setup());store.put=async()=>{throw Error('Quota exceeded')};doc.edit('keep me');assert.equal(await doc.persist(),false);assert(doc.message.includes('Not saved on this device'));assert.equal(await doc.requestSave(),false);assert.equal(doc.contents,'keep me');

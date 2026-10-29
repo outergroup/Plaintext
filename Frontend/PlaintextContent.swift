@@ -506,13 +506,24 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             updateColors()
             updateTextContent(force: true)
         case .windowActiveUpdate(let isActive):
+            if !isActive {
+                endUndoGroup()
+                findInputController.breakUndoCoalescing()
+                filePickerNameInputController.breakUndoCoalescing()
+            }
             windowIsActive = isActive
             updateSelectionLayers(force: true)
             updateCursor()
         case .viewFocusChanged(let isFocused):
+            if !isFocused {
+                endUndoGroup()
+                findInputController.breakUndoCoalescing()
+                filePickerNameInputController.breakUndoCoalescing()
+            }
             viewIsFocused = isFocused
             updateCursor()
         case .mouseDown(let point, let modifierFlags, let clickCount):
+            endUndoGroup()
             if modifierFlags.contains(.control) {
                 if pendingFilePicker != nil {
                     _ = handleFilePickerMouseDown(point: point, clickCount: clickCount)
@@ -1499,6 +1510,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func showOpenFilePicker() {
+        endUndoGroup()
         cancelPathPrompt()
         let shouldAnimate = pendingFilePicker == nil || filePickerOverlayLayer.isHidden
         prepareFilePickerOverlayForPresentation(animated: shouldAnimate)
@@ -1904,6 +1916,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func showFind(selectCurrentSelection: Bool) {
+        endUndoGroup()
         if selectCurrentSelection, let selected = selectedString(), !selected.isEmpty {
             findInputController.setText(selected)
         }
@@ -1970,6 +1983,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func activateFindMatch(at index: Int) {
+        endUndoGroup()
         guard findMatches.indices.contains(index) else { return }
         let match = findMatches[index]
         activeFindMatchIndex = index
@@ -2064,6 +2078,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func activate(_ doc: PlaintextDocument) {
+        endUndoGroup()
         document = doc; reviewedDisk = nil; showingServerVersion = false
         filePath = doc.draft.path; text = doc.draft.contents
         cursorOffset = 0; selectionAnchor = nil; scrollOffset = 0
@@ -2124,6 +2139,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                             let result = try await doc.disk()
                             guard document === doc, doc.draft.version == version, !doc.draft.dirty, doc.draft.pending == nil else { return }
                             doc.draft.contents = result.contents; doc.draft.revision = result.revision
+                            doc.draft.savedContents = result.contents; doc.undoHistory.reset()
                             _ = await doc.persist()
                             if document === doc && doc.draft.version == version { text = doc.draft.contents; updateTextContent(force: true) }
                         } catch {
@@ -2144,6 +2160,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func saveNow() {
+        endUndoGroup()
         guard let document, !isLoading, !showingServerVersion else { return }
         if document.draft.conflict { reviewServerVersion(); return }
         if document.draft.path.isEmpty { beginPathPrompt(mode: .saveAs, defaultValue: ""); return }
@@ -2177,6 +2194,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func reviewServerVersion() {
+        endUndoGroup()
         guard let doc = document else { return }
         Task {
             do {
@@ -2257,6 +2275,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func beginPathPrompt(mode: PathPromptMode, defaultValue: String) {
+        endUndoGroup()
         pathPromptMode = mode
         findInputController.blur()
         filePickerNameInputController.blur()
@@ -2404,6 +2423,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func showPathMenu(at point: CGPoint) {
+        endUndoGroup()
         let menuID = UUID()
         pendingPathMenuIDs.insert(menuID)
         let doc = document
@@ -2900,6 +2920,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func setCursorOffset(_ offset: Int, modifySelection: Bool) {
+        endUndoGroup()
         clearMarkedTextState()
         let clamped = clampedOffset(offset)
         if modifySelection {
@@ -2918,36 +2939,69 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         updateEditingCapabilities()
     }
 
-    private func replace(range: NSRange, with replacement: String, clearsMarkedText: Bool = true) {
-        guard !isLoading, !showingServerVersion, document != nil,
+    private var editSelection: TextEditSelection {
+        TextEditSelection(caret: cursorOffset, anchor: selectionAnchor)
+    }
+
+    private var canEditDocument: Bool {
+        document != nil && !isLoading && !showingServerVersion && pendingFilePicker == nil &&
+            pathPromptMode == nil && !findInputController.isFocused
+    }
+
+    private func endUndoGroup() {
+        document?.undoHistory.finishComposition(text: text, selection: editSelection)
+        document?.undoHistory.breakCoalescing()
+        markedTextRange = nil; pendingMarkedTextReplacementRange = nil
+    }
+
+    private func performUndo(redo: Bool = false) {
+        guard canEditDocument, let document else { return }
+        endUndoGroup()
+        clearMarkedTextState()
+        guard let result = redo ? document.undoHistory.redo(text: text) : document.undoHistory.undo(text: text) else { return }
+        text = result.text; cursorOffset = result.selection.caret; selectionAnchor = result.selection.anchor
+        updateTextContent(force: true)
+        ensureCursorVisible(); updateViewport(); updateSelectionLayers(force: true); updateCursor()
+        scheduleSave(); updateEditingCapabilities()
+    }
+
+    private func replace(range: NSRange, with replacement: String, kind: TextUndoHistory.Kind = .replacement, clearsMarkedText: Bool = true) {
+        guard !isLoading, !showingServerVersion, let document,
               let normalized = normalizedReplacementRange(range),
-              let swiftRange = Range(normalized, in: text) else {
-            return
-        }
+              let swiftRange = Range(normalized, in: text) else { return }
+        let before = editSelection
+        let removed = String(text[swiftRange])
+        let composing = document.undoHistory.isComposing
         withoutImplicitAnimations {
             if clearsMarkedText {
                 markedTextRange = nil
                 pendingMarkedTextReplacementRange = nil
             }
             text.replaceSubrange(swiftRange, with: replacement)
-            cursorOffset = normalized.location + (replacement as NSString).length
+            cursorOffset = normalized.location + replacement.utf16.count
             selectionAnchor = nil
+            if composing {
+                if clearsMarkedText { document.undoHistory.finishComposition(text: text, selection: editSelection) }
+            } else {
+                document.undoHistory.record(range: normalized, removed: removed, inserted: replacement,
+                                            before: before, after: editSelection, kind: kind)
+            }
             updateTextContent(force: true)
             ensureCursorVisible()
-            scheduleSave()
+            scheduleSave(); updateEditingCapabilities()
         }
     }
 
-    private func insertText(_ value: String) {
+    private func insertText(_ value: String, kind: TextUndoHistory.Kind = .typing) {
         if let range = markedTextRange ?? pendingMarkedTextReplacementRange {
-            replace(range: range, with: value)
+            replace(range: range, with: value, kind: kind)
             return
         }
         if let selectionRange {
-            replace(range: selectionRange, with: value)
+            replace(range: selectionRange, with: value, kind: kind)
             return
         }
-        replace(range: NSRange(location: cursorOffset, length: 0), with: value)
+        replace(range: NSRange(location: cursorOffset, length: 0), with: value, kind: kind)
     }
 
     private func setMarkedText(_ value: String,
@@ -2962,6 +3016,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             : (markedTextRange ?? selectionRange ?? NSRange(location: cursorOffset, length: 0))
         guard let replacementRange = normalizedReplacementRange(requestedRange) else { return }
 
+        document?.undoHistory.beginComposition(text: text, selection: editSelection)
         let markedLength = (value as NSString).length
         markedTextRange = markedLength > 0 ? NSRange(location: replacementRange.location, length: markedLength) : nil
         pendingMarkedTextReplacementRange = nil
@@ -2992,6 +3047,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func clearMarkedTextState() {
+        endUndoGroup()
         markedTextRange = nil
         pendingMarkedTextReplacementRange = nil
     }
@@ -3002,7 +3058,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             return
         }
         guard cursorOffset > 0 else { return }
-        replace(range: NSRange(location: cursorOffset - 1, length: 1), with: "")
+        let range = (text as NSString).rangeOfComposedCharacterSequence(at: cursorOffset - 1)
+        replace(range: range, with: "", kind: .backwardDelete)
     }
 
     private func deleteForward() {
@@ -3011,11 +3068,19 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             return
         }
         guard cursorOffset < (text as NSString).length else { return }
-        replace(range: NSRange(location: cursorOffset, length: 1), with: "")
+        let range = (text as NSString).rangeOfComposedCharacterSequence(at: cursorOffset)
+        replace(range: range, with: "", kind: .forwardDelete)
     }
 
     private func performTextCommand(_ command: String) {
+        if command.hasPrefix("delete"), let selectionRange {
+            replace(range: selectionRange, with: "", kind: .delete)
+            return
+        }
+        if command.hasPrefix("move") || command.hasPrefix("select") { endUndoGroup() }
         switch command {
+        case "undo": performUndo()
+        case "redo": performUndo(redo: true)
         case "find":
             showFind(selectCurrentSelection: true)
         case "findNext":
@@ -3027,30 +3092,30 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         case "insertNewline":
             insertText("\n")
         case "insertTab":
-            insertText("\t")
+            endUndoGroup(); insertText("\t"); endUndoGroup()
         case "deleteBackward":
             deleteBackward()
         case "deleteForward":
             deleteForward()
         case "deleteWordBackward":
-            replace(range: NSRange(location: previousWordBoundary(from: cursorOffset), length: cursorOffset - previousWordBoundary(from: cursorOffset)), with: "")
+            replace(range: NSRange(location: previousWordBoundary(from: cursorOffset), length: cursorOffset - previousWordBoundary(from: cursorOffset)), with: "", kind: .delete)
         case "deleteWordForward":
             let next = nextWordBoundary(from: cursorOffset)
-            replace(range: NSRange(location: cursorOffset, length: next - cursorOffset), with: "")
+            replace(range: NSRange(location: cursorOffset, length: next - cursorOffset), with: "", kind: .delete)
         case "deleteToBeginningOfLine", "deleteToBeginningOfParagraph":
             let start = lineStart(for: cursorOffset)
-            replace(range: NSRange(location: start, length: cursorOffset - start), with: "")
+            replace(range: NSRange(location: start, length: cursorOffset - start), with: "", kind: .delete)
         case "deleteToEndOfLine", "deleteToEndOfParagraph":
             let end = lineEnd(for: cursorOffset)
-            replace(range: NSRange(location: cursorOffset, length: end - cursorOffset), with: "")
+            replace(range: NSRange(location: cursorOffset, length: end - cursorOffset), with: "", kind: .delete)
         case "moveLeft":
-            move(to: cursorOffset - 1, modifySelection: false)
+            move(to: previousCharacterOffset(), modifySelection: false)
         case "moveRight":
-            move(to: cursorOffset + 1, modifySelection: false)
+            move(to: nextCharacterOffset(), modifySelection: false)
         case "moveLeftAndModifySelection":
-            move(to: cursorOffset - 1, modifySelection: true)
+            move(to: previousCharacterOffset(), modifySelection: true)
         case "moveRightAndModifySelection":
-            move(to: cursorOffset + 1, modifySelection: true)
+            move(to: nextCharacterOffset(), modifySelection: true)
         case "moveWordLeft":
             move(to: previousWordBoundary(from: cursorOffset), modifySelection: false)
         case "moveWordRight":
@@ -3138,6 +3203,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         default:
             if filePickerNameInputController.isFocused { filePickerNameInputController.performCommand(command) }
         }
+    }
+
+    private func previousCharacterOffset() -> Int {
+        guard cursorOffset > 0 else { return 0 }
+        return (text as NSString).rangeOfComposedCharacterSequence(at: cursorOffset - 1).location
+    }
+
+    private func nextCharacterOffset() -> Int {
+        guard cursorOffset < text.utf16.count else { return text.utf16.count }
+        return NSMaxRange((text as NSString).rangeOfComposedCharacterSequence(at: cursorOffset))
     }
 
     private func move(to offset: Int, modifySelection: Bool) {
@@ -3368,9 +3443,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func showEditorContextMenu(at point: CGPoint) {
+        endUndoGroup()
         let hasSelection = selectionRange?.length ?? 0 > 0
         let selectedText = selectedString() ?? ""
-        var items: [OuterframeContextMenuItem] = []
+        var items: [OuterframeContextMenuItem] = [
+            OuterframeContextMenuItem(id: "undo", title: "Undo" + (document?.undoHistory.undoName.map { " " + $0 } ?? ""),
+                                      isEnabled: canEditDocument && document?.undoHistory.canUndo == true),
+            OuterframeContextMenuItem(id: "redo", title: "Redo" + (document?.undoHistory.redoName.map { " " + $0 } ?? ""),
+                                      isEnabled: canEditDocument && document?.undoHistory.canRedo == true),
+            OuterframeContextMenuItem(id: "history-separator", title: "", kind: .separator, isEnabled: false)
+        ]
         if !selectedText.isEmpty {
             let displayText = selectedText.count > 80 ? String(selectedText.prefix(80)) + "..." : selectedText
             let lookupTitle = "Look Up \"\(displayText)\""
@@ -3572,7 +3654,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
         let items = pasteboardItemsForCopy()
         if selectionRange != nil {
-            insertText("")
+            endUndoGroup(); insertText("", kind: .cut); endUndoGroup()
         }
         return items
     }
@@ -3582,14 +3664,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
                let string = String(data: representation.data, encoding: .utf8) {
                 if filePickerNameInputController.isFocused {
-                    filePickerNameInputController.insertText(string)
+                    filePickerNameInputController.pasteText(string)
                     return
                 }
                 if findInputController.isFocused {
-                    findInputController.insertText(string)
+                    findInputController.pasteText(string)
                     return
                 }
-                insertText(string)
+                endUndoGroup(); insertText(string, kind: .paste); endUndoGroup()
                 return
             }
         }
@@ -3648,7 +3730,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if requestedCommands.contains(.findPrevious), !findInputController.text.isEmpty {
             enabledCommands.insert(.findPrevious)
         }
-        return enabledCommands
+        if canEditDocument {
+            if document?.undoHistory.canUndo == true || document?.undoHistory.isComposing == true { enabledCommands.insert(.undo) }
+            if document?.undoHistory.canRedo == true && document?.undoHistory.isComposing == false { enabledCommands.insert(.redo) }
+        } else { enabledCommands.subtract([.cut, .paste]) }
+        return enabledCommands.intersection(requestedCommands)
     }
 
     private func handleContextMenuItem(menuID: UUID, itemID: String) {
@@ -3693,6 +3779,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             return
         }
         switch itemID {
+        case "undo": performUndo()
+        case "redo": performUndo(redo: true)
         case "save":
             saveNow()
         default:
@@ -3727,7 +3815,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         for item in items {
             if let representation = item.representations.first(where: { $0.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue }),
                let string = String(data: representation.data, encoding: .utf8) {
-                filePickerNameInputController.insertText(string)
+                filePickerNameInputController.pasteText(string)
                 return
             }
         }

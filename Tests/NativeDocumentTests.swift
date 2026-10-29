@@ -127,6 +127,21 @@ struct NativeDocumentTests {
         unavailable.edit("keep in memory"); await unavailable.save()
         try check(unavailable.localError != nil && unavailable.draft.contents == "keep in memory" && unavailable.networkError == nil, "storage failure")
         await unavailable.stop()
+        var baseline = PlaintextDraft(); baseline.path = "/note.txt"; baseline.contents = await server.contents; baseline.revision = await server.revision
+        let undoSaved = make(baseline)
+        undoSaved.edit("new text"); precondition(undoSaved.draft.dirty)
+        undoSaved.edit(baseline.contents); precondition(!undoSaved.draft.dirty)
+        await server.setPause()
+        undoSaved.edit("save in flight"); await undoSaved.save()
+        try await until { await server.waiting != nil }
+        undoSaved.edit(baseline.contents)
+        await server.release()
+        try await until { undoSaved.draft.pending == nil }
+        precondition(undoSaved.draft.dirty && undoSaved.draft.savedContents == "save in flight")
+        undoSaved.edit("save in flight"); precondition(!undoSaved.draft.dirty)
+        await undoSaved.stop()
+        let restoredClean = try await store.all().first { $0.id == undoSaved.draft.id }
+        precondition(restoredClean?.savedContents == "save in flight" && restoredClean?.dirty == false)
         await store.closeStore()
         print("PASS native drafts: recovery, locks, queue, reconnect, snapshots, serialized saves, lost response, conflicts, storage errors")
     }

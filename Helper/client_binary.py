@@ -1,10 +1,10 @@
 import struct
-OPS={'list':1,'read':2,'save':3,'move':4,'signal':6,'targets':7,'preview':8,'draft':9,'disk':10}
+OPS={'list':1,'read':2,'save':3,'move':4,'signal':6,'targets':7,'preview':8,'draft':9,'disk':10,'state':11,'publish':12,'commit':13}
 def encode_client(operation, **values):
     b=bytearray(72)
     struct.pack_into('<IIII',b,0,0x51434c50,1,0,OPS[operation])
     for field,key,default in [(24,'target','host'),(32,'user',''),(40,'path','~'),(48,'destination',''),(56,'revision',''),(64,'contents','')]:
-        value=values.get(key,default)
+        value=values.get('draftRevision',values.get(key,default)) if key=='destination' else values.get(key,default)
         data=value.encode() if isinstance(value,str) else value
         struct.pack_into('<II',b,field,len(b),len(data));b.extend(data)
     struct.pack_into('<I',b,8,len(b))
@@ -29,6 +29,8 @@ def decode_client(b):
     if n(meta,8)==1:
         result['parent']=text(meta,56)
         result['entries']=[dict(name=text(meta,64+i*48),path=text(meta,72+i*48)) for i in range(n(meta,20))]
+    if text(b,32).count(':')==1:
+        result['draftRevision'],result['diskRevision']=text(b,32).split(':')
     return result
 
 def run_client(driver, operation, env=None, **values):

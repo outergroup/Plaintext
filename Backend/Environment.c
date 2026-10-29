@@ -3,11 +3,13 @@
 #include "../Helper/binary.c"
 #include "../Helper/child.c"
 #include "../Helper/files.c"
+#include "../Helper/watch.c"
 #include "../Helper/protocol.c"
 #include "../Helper/vendor/sha256.c"
 #include "Environment/runtime.inc"
 #include "Environment/snapshot.inc"
 #include "Environment/client.inc"
+#include "Environment/watch.inc"
 
 static pthread_mutex_t environment_mutex = PTHREAD_MUTEX_INITIALIZER;
 char *environment_request(const void *body, size_t length, size_t *result_length) {

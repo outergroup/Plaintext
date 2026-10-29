@@ -8,6 +8,62 @@ const documents = new Map();
 let recoveryWarning = '';
 const state = {target:query.get('target') || 'host', targets:[], active:null, replacing:false, pickerPath:'~', pickerSelected:null, pickerVersion:0};
 function status(text){$('#status').textContent=text;}
+function configureEditorFocusScrolling(){
+ const editor=$('#editor'),viewport=window.visualViewport;
+ if(!viewport)return;
+ let scheduled=false,height=viewport.height;
+ function revealCaret(){
+  if(scheduled||document.activeElement!==editor)return;
+  scheduled=true;
+  requestAnimationFrame(()=>{
+   scheduled=false;
+   if(document.activeElement!==editor)return;
+   const mirror=document.createElement('div'),style=getComputedStyle(editor);
+   for(const name of style)mirror.style.setProperty(name,style.getPropertyValue(name));
+   mirror.style.cssText+=';position:absolute;left:0;top:0;visibility:hidden;pointer-events:none;height:auto;min-height:0;max-height:none;overflow:hidden;';
+   mirror.style.width=editor.getBoundingClientRect().width+'px';
+   mirror.setAttribute('aria-hidden','true');
+   const caret=editor.selectionDirection==='backward'?editor.selectionStart:editor.selectionEnd;
+   mirror.append(document.createTextNode(editor.value.slice(0,caret)));
+   const tail=document.createElement('span');
+   tail.textContent=editor.value.slice(caret)||'\u200b';
+   mirror.append(tail);document.body.append(mirror);
+   const rect=tail.getClientRects()[0];
+   if(!rect){mirror.remove();return;}
+   const top=editor.getBoundingClientRect().top+rect.top-mirror.getBoundingClientRect().top;
+   const bottom=top+(parseFloat(style.lineHeight)||parseFloat(style.fontSize)*1.5);
+   const topLimit=$('.document-toolbar').getBoundingClientRect().bottom+12;
+   const bottomLimit=viewport.offsetTop+viewport.height-12;
+   mirror.remove();
+   if(bottom>bottomLimit)window.scrollBy({top:bottom-bottomLimit,behavior:'instant'});
+   else if(top<topLimit)window.scrollBy({top:top-topLimit,behavior:'instant'});
+  });
+ }
+ function focusWithoutScrolling(){
+  if(document.activeElement!==editor&&!editor.disabled)editor.focus({preventScroll:true});
+ }
+ editor.addEventListener('pointerup',focusWithoutScrolling);
+ editor.addEventListener('mousedown',focusWithoutScrolling);
+ viewport.addEventListener('resize',()=>{
+  const next=viewport.height;
+  if(next<height)revealCaret();
+  height=next;
+ });
+}
+configureEditorFocusScrolling();
+const wrapLinesKey='plaintext.wrapLines';
+function setLineWrapping(enabled){
+ $('#editor').setAttribute('wrap',enabled?'soft':'off');
+ $('#wrap-lines').setAttribute('aria-pressed',String(enabled));
+ if(enabled)$('#editor').scrollLeft=0;
+}
+let wrapLines=true;
+try{wrapLines=localStorage.getItem(wrapLinesKey)!=='false';}catch{}
+setLineWrapping(wrapLines);
+$('#wrap-lines').onclick=()=>{
+ wrapLines=!wrapLines;setLineWrapping(wrapLines);
+ try{localStorage.setItem(wrapLinesKey,String(wrapLines));}catch{}
+};
 function targetName(target){return state.targets.find(t=>t.id===target)?.name || (target==='host'?'Host':'Unavailable container');}
 async function api(operation, values={}, context=state){
  const body=EnvironmentBinary.encode(operation,{target:context.target,...values});
@@ -24,20 +80,46 @@ async function discover(){
  try{const result=await api('targets');state.targets=result.targets;const select=$('#environment');select.replaceChildren(...result.targets.map(t=>{const option=new Option(t.id==='host'?`Host — ${t.name}`:t.name+(t.state==='running'?'':` · ${t.state}`),t.id);option.disabled=t.state!=='running';return option}));if(!state.targets.some(t=>t.id===state.target))select.add(new Option('Unavailable container',state.target));select.value=state.target;$('#environment-errors').textContent=result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · ');if(state.active)showPath(state.active);else $('#targetLabel').textContent=targetName(state.target);renderDocument()}catch(e){$('#environment-errors').textContent=e.message}
 }
 function renderDocument(){
- $('#dirty').textContent=state.active?.dirty?'Edited':'';
+ const doc=state.active,dirty=!!(doc?.dirty||doc?.pendingSave);
+ const saving=!!doc?.pendingSave&&doc.pendingSave.version===doc.version&&!doc.localError&&!doc.networkError&&!doc.conflict;
+ $('#dirty').textContent=dirty?'Edited':'';
+ $('#save').textContent=saving?'Saving…':'Save';
  $('#review').hidden=!state.active?.conflict;
  $('#editor').disabled=!state.active||state.replacing;
- $('#save').disabled=!state.active||state.replacing;$('#move').disabled=!state.active?.path||state.replacing;
- for(const id of ['new','open','path','location-target'])$('#'+id).disabled=state.replacing;
+ $('#save').disabled=!doc||state.replacing||saving||(!dirty&&!!doc.path);$('#move').disabled=!state.active?.path||state.replacing;
+ for(const id of ['new','open','mobile-new','mobile-open','mobile-location','path','location-target'])$('#'+id).disabled=state.replacing;
  $('#download').disabled=!state.active;
- document.title=(state.active?.dirty?'• ':'')+(state.active?(state.active.path.split('/').pop()||'Untitled'):'Plaintext');
+ document.title=(dirty?'• ':'')+(state.active?(state.active.path.split('/').pop()||'Untitled'):'Plaintext');
 }
 function showPath(doc){$('#targetLabel').textContent=targetName(doc.target);const label=$('#pathLabel');label.replaceChildren();const parts=doc.path.split('/').filter(Boolean);const filename=document.createElement('strong');filename.textContent=parts.pop()||'Untitled';if(parts.length){const parent=document.createElement('span');parent.className='parent-path';parent.textContent=parts.join(' / ')+' / ';label.append(parent)}label.append(filename);$('#path').title=doc.path||'Untitled';history.replaceState(null,'','?'+new URLSearchParams({file:doc.path,target:doc.target,draft:doc.id}).toString().replace(/%2F/gi,'/'));}
+let fileNotifications=null;
+function updateFileNotifications(restart=false){
+ const doc=state.active;
+ const key=doc?.path&&doc.watching&&!doc.stopped&&!document.hidden?JSON.stringify([doc.id,doc.target,doc.user,doc.path]):null;
+ if(!restart&&fileNotifications?.key===key)return;
+ fileNotifications?.stream.stop();fileNotifications=null;
+ if(!key)return;
+ const body=EnvironmentBinary.encode('disk',{target:doc.target,path:doc.path});
+ const stream=new PlaintextDrafts.Notifications({
+  open:signal=>fetch('/api/watch',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Environment-Request':'1'},body,signal}),
+  changed:()=>{void doc.refresh();}
+ });
+ fileNotifications={key,stream};void stream.connect();
+}
 function documentChanged(doc){
  if(state.active!==doc)return;
+ const editor=$('#editor');
+ if(editor.value!==doc.contents){
+  const {selectionStart,selectionEnd,selectionDirection,scrollLeft}=editor;
+  const x=window.scrollX,y=window.scrollY;
+  editor.value=doc.contents;
+  editor.setSelectionRange(Math.min(selectionStart,doc.contents.length),Math.min(selectionEnd,doc.contents.length),selectionDirection);
+  editor.scrollLeft=scrollLeft;window.scrollTo(x,y);
+ }
  const locationKey=JSON.stringify([doc.id,doc.path,doc.target,targetName(doc.target)]);
  if(state.locationKey!==locationKey){state.locationKey=locationKey;showPath(doc);}
- renderDocument();status(doc.message+(recoveryWarning?' · '+recoveryWarning:''));
+ updateFileNotifications();
+ renderDocument();status([doc.message,recoveryWarning].filter(Boolean).join(' · '));
 }
 async function createDocument(record, forkIfLocked=true){
  if(documents.has(record.id))return documents.get(record.id);
@@ -57,7 +139,7 @@ async function createDocument(record, forkIfLocked=true){
  await doc.persist();
  return doc;
 }
-function activate(doc){state.active=doc;state.target=doc.target;$('#editor').value=doc.contents;documentChanged(doc);doc.resume();}
+function activate(doc){state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;$('#editor').value=doc.contents;window.scrollTo(0,0);documentChanged(doc);doc.resume();}
 async function replaceDocument(replacement){
  if(state.replacing)return;
  state.replacing=true;renderDocument();
@@ -82,23 +164,12 @@ async function load(path, context={target:state.target}, draftID=null){
   const local=draftID?records.find(d=>d.id===draftID&&d.target===context.target):records.find(d=>d.path===path&&d.target===context.target);
   if(local){
    const doc=await createDocument(local);activate(doc);
-   if(!doc.dirty&&!doc.pendingSave)void refreshDocument(doc);
    return;
   }
   if(!path){activate(await createDocument({target:context.target,user:storageUser}));return;}
-  const result=await api('read',{path},context);
-  activate(await createDocument({...context,user:storageUser,path:result.path,contents:result.contents,revision:result.revision,dirty:result.dirty,conflict:result.draftConflict}));
+  const result=await api('state',{path},context);
+  activate(await createDocument({...context,user:storageUser,path:result.path,contents:result.contents,revision:result.revision,dirty:result.dirty,conflict:result.draftConflict,draftRevision:result.draftRevision,remoteVersion:0}));
  });
-}
-async function refreshDocument(doc){
- const version=doc.version;
- try{
-  const result=await api('read',{path:doc.path},doc);
-  if(doc.version!==version||doc.dirty||doc.pendingSave)return;
-  Object.assign(doc,{contents:result.contents,revision:result.revision,dirty:result.dirty,conflict:result.draftConflict});
-  await doc.persist();
-  if(state.active===doc&&doc.version===version)$('#editor').value=doc.contents;
- }catch(e){doc.networkError=e.network?'Offline copy · Waiting for connection.':e.message;doc.notify();}
 }
 function ask(title, value=null, action='Save'){
  return new Promise(resolve=>{
@@ -139,20 +210,23 @@ async function recoverDraft(){
 async function reviewChanges(){
  const doc=state.active;if(!doc?.path)return;
  try{
-  const disk=await api('disk',{path:doc.path},doc);
+  const shared=await api('state',{path:doc.path},doc);
+  const disk=shared.dirty?await api('disk',{path:doc.path},doc):shared;
   const dialog=document.createElement('dialog');dialog.className='conflict-dialog';
-  const heading=document.createElement('h3');heading.textContent='The file changed elsewhere';
+  const heading=document.createElement('h3');heading.textContent='Changes were made on another device';
   const comparison=document.createElement('div');comparison.className='comparison';
-  for(const [label,text] of [['Your draft',doc.contents],['File on server',disk.contents]]){
+  for(const [label,text] of [['Your draft',doc.contents],...(shared.dirty?[['Shared draft',shared.contents]]:[]),['Saved file',disk.contents]]){
    const panel=document.createElement('label');panel.textContent=label;const area=document.createElement('textarea');area.readOnly=true;area.value=text;panel.append(area);comparison.append(panel);
   }
   const actions=document.createElement('div');actions.className='conflict-actions';
-  for(const [title,action] of [['Close',()=>{}],['Save a copy…',async()=>{const path=await ask('Save a copy as',doc.path+'.copy');if(path)await doc.saveCopy(path);}],['Replace server file with my draft',()=>doc.resolveConflict(disk.revision)]]){
+  for(const [title,action] of [['Close',()=>{}],['Save a copy…',async()=>{const path=await ask('Save a copy as',doc.path+'.copy');if(path)await doc.saveCopy(path);}],['Replace server file with my draft',()=>doc.resolveConflict(disk.revision,shared.draftRevision)]]){
    const button=document.createElement('button');button.textContent=title;button.onclick=()=>{dialog.close();void action();};actions.append(button);
   }
   dialog.append(heading,comparison,actions);dialog.onclose=()=>dialog.remove();document.body.append(dialog);dialog.showModal();
  }catch(e){status('Your draft is kept on this device. Cannot compare the server file: '+e.message);}
 }
+$('#editor').addEventListener('compositionstart',()=>{if(state.active)state.active.composing=true;});
+$('#editor').addEventListener('compositionend',()=>{if(state.active){state.active.composing=false;if(state.active.refreshNeeded)void state.active.refresh();}});
 $('#editor').addEventListener('input',()=>{if(state.active&&!state.replacing)state.active.edit($('#editor').value);});
 $('#editor').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='s'){e.preventDefault();void save();}else if(e.key==='Tab'){e.preventDefault();const t=e.currentTarget;t.setRangeText('\t',t.selectionStart,t.selectionEnd,'end');t.dispatchEvent(new Event('input'));}});
 $('#save').onclick=()=>save();$('#new').onclick=newDocument;
@@ -162,7 +236,7 @@ $('#move').onclick=async()=>{
  if(doc.dirty||doc.pendingSave){status('Save this file and wait for confirmation before moving it.');return;}
  const destination=await ask('Move or rename file',doc.path,'Move');if(!destination||destination===doc.path)return;
  state.replacing=true;renderDocument();
- try{const result=await api('move',{path:doc.path,destination,revision:doc.revision},doc);doc.path=result.path;await doc.persist();documentChanged(doc);}
+ try{const result=await api('move',{path:doc.path,destination,revision:doc.revision},doc);doc.path=result.path;doc.draftRevision='missing';await doc.persist();documentChanged(doc);}
  catch(e){status(e.message);}finally{state.replacing=false;renderDocument();}
 };
 async function pickerLoad(path){
@@ -175,6 +249,7 @@ async function pickerLoad(path){
 function openPicker(){state.target=state.active?.target||state.target;$('#environment').value=state.target;if(!$('#picker').open)$('#picker').showModal();const path=state.active?.path;pickerLoad(path&&path.includes('/')?path.slice(0,path.lastIndexOf('/'))||'/':'~');}
 function choose(path){const context={target:state.target};$('#picker').close();load(path,context);}
 $('#choose').onclick=e=>{e.preventDefault();if(state.pickerSelected&&!state.pickerSelected.directory)choose(state.pickerSelected.path);};
+$('#mobile-new').onclick=newDocument;$('#mobile-open').onclick=openPicker;$('#mobile-location').onclick=openPicker;
 $('#open').onclick=openPicker;$('#path').onclick=openPicker;$('#location-target').onclick=openPicker;
 $('#environment').onchange=()=>{state.target=$('#environment').value;pickerLoad('~');};
 $('#environment-refresh').onclick=discover;
@@ -182,15 +257,15 @@ $('#picker').addEventListener('close',()=>{state.pickerVersion++;state.target=st
 $('#document-menu').addEventListener('click',e=>{if(e.target.closest('button'))$('#document-menu').open=false;});
 document.addEventListener('pointerdown',e=>{if(!e.target.closest('#document-menu'))$('#document-menu').open=false;});
 window.addEventListener('beforeunload',e=>{if([...documents.values()].some(doc=>doc.localError||doc.localVersion<doc.version)){e.preventDefault();e.returnValue='';}});
-window.addEventListener('online',()=>{for(const doc of documents.values())doc.resume();void discover();});
-document.addEventListener('visibilitychange',()=>{for(const doc of documents.values()){void doc.persist();if(!document.hidden)doc.resume();}});
-window.addEventListener('pagehide',()=>{for(const doc of documents.values()){void doc.persist();doc.stop();}});
-window.addEventListener('pageshow',event=>{if(event.persisted)for(const doc of documents.values())doc.resume();});
+window.addEventListener('online',()=>{updateFileNotifications(true);for(const doc of documents.values())doc.resume();void discover();});
+document.addEventListener('visibilitychange',()=>{for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});
+window.addEventListener('focus',()=>{if(!document.hidden){updateFileNotifications(true);state.active?.resume();}});
+window.addEventListener('pagehide',()=>{fileNotifications?.stream.stop();fileNotifications=null;for(const doc of documents.values()){void doc.persist();doc.stop();}});
+window.addEventListener('pageshow',event=>{if(event.persisted){updateFileNotifications(true);for(const doc of documents.values())doc.resume();}});
 async function prepareOfflineShell(){
- if(!('serviceWorker' in navigator)){recoveryWarning='Offline reload is unavailable in this browser';return;}
+ if(!('serviceWorker' in navigator))return;
  try{await navigator.serviceWorker.register('/sw.js',{scope:'/'});await navigator.serviceWorker.ready;}
- catch(e){recoveryWarning='Offline reload unavailable: '+e.message;}
- state.active?.notify();
+ catch{}
 }
 $('#editor').disabled=true;renderDocument();
 void prepareOfflineShell();void discover();

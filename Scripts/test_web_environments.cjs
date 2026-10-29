@@ -13,6 +13,6 @@ const {Document}=require(path.resolve(process.argv[2]||path.resolve(__dirname,'.
  release();await doc.sync();await doc.sync();
  assert.deepEqual(calls.map(c=>[c.contents,c.revision,c.target]),[['first','original','docker:abc'],['second','revision-1','docker:abc']]);
  assert(!doc.dirty);assert.equal(doc.revision,'revision-2');
- doc.edit('draft');await doc.sync();assert.equal(calls[2].operation,'draft');assert.equal(doc.revision,'revision-2');
+ doc.edit('draft');await doc.sync();assert.equal(calls[2].operation,'publish');assert.equal(doc.revision,'revision-2');
  console.log('PASS serialized saves preserve latest contents, revision, environment, and draft state');
 })().catch(e=>{console.error(e);process.exitCode=1;});

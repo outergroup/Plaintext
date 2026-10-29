@@ -21,6 +21,7 @@ struct PlaintextDraft: Codable, Sendable {
     var conflict = false
     var updated = Date()
     var pending: PlaintextSave?
+    var savedContents: String?
 }
 
 struct PlaintextReply: Sendable {
@@ -210,6 +211,7 @@ actor PlaintextDraftStore {
 final class PlaintextDocument {
     typealias API = @Sendable (UInt32, String, String, String, String) async throws -> PlaintextReply
     var draft: PlaintextDraft
+    let undoHistory = TextUndoHistory()
     let store: PlaintextDraftStore
     let api: API
     var changed: (() -> Void)?
@@ -237,10 +239,11 @@ final class PlaintextDocument {
 
     init(draft: PlaintextDraft, store: PlaintextDraftStore, api: @escaping API) {
         self.draft = draft; self.store = store; self.api = api
+        if !draft.dirty && draft.savedContents == nil { self.draft.savedContents = draft.contents }
     }
 
     func edit(_ contents: String) {
-        draft.contents = contents; draft.version += 1; draft.dirty = true; draft.updated = Date()
+        draft.contents = contents; draft.version += 1; draft.dirty = draft.savedContents.map { !$0.utf16.elementsEqual(contents.utf16) } ?? true; draft.updated = Date()
         if localTimer == nil {
             localTimer = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: 100_000_000)
@@ -276,7 +279,8 @@ final class PlaintextDocument {
 
     func save(path: String? = nil) async {
         guard !draft.conflict else { changed?(); return }
-        if let path, path != draft.path { draft.path = path; draft.revision = "missing" }
+        undoHistory.breakCoalescing()
+        if let path, path != draft.path { draft.path = path; draft.revision = "missing"; draft.savedContents = nil; draft.dirty = true }
         guard !draft.path.isEmpty else { return }
         draft.pending = PlaintextSave(path: draft.path, contents: draft.contents, revision: draft.revision, version: draft.version)
         guard await persist() else { return }
@@ -297,7 +301,7 @@ final class PlaintextDocument {
         while !draft.conflict && !Task.isCancelled {
             guard await persist() else { return }
             let saved = draft.pending, version = draft.version
-            guard saved != nil || (draft.dirty && remoteVersion < version) else { return }
+            guard saved != nil || (remoteVersion < version && (draft.dirty || version > 0)) else { return }
             do {
                 if let saved {
                     let result: PlaintextReply
@@ -307,7 +311,7 @@ final class PlaintextDocument {
                         let disk: PlaintextReply
                         do { disk = try await api(10, draft.target, saved.path, "", "") }
                         catch { throw original }
-                        if disk.contents == saved.contents { result = disk }
+                        if disk.contents.utf16.elementsEqual(saved.contents.utf16) { result = disk }
                         else if disk.revision != saved.revision {
                             draft.conflict = true; networkError = nil; _ = await persist(); return
                         } else { throw original }
@@ -316,7 +320,8 @@ final class PlaintextDocument {
                     draft.revision = result.revision
                     if draft.pending?.id == saved.id { draft.pending = nil }
                     else if draft.pending?.revision == saved.revision { draft.pending?.revision = result.revision }
-                    if draft.version == saved.version { draft.dirty = false }
+                    draft.savedContents = saved.contents
+                    draft.dirty = !draft.contents.utf16.elementsEqual(saved.contents.utf16)
                     remoteVersion = saved.version
                     guard await persist() else { return }
                 } else {
