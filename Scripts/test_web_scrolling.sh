@@ -18,11 +18,12 @@ markup = source[source.index('<main>'):source.index('</main>') + 7]
 contents = ''.join(f'{i:03d} A long line for keyboard, scrolling, and wrapping checks.\n' for i in range(100))
 markup = markup.replace('aria-label="Text editor"></textarea>', 'aria-label="Text editor">' + html.escape(contents) + '</textarea>')
 markup = markup.replace('Open a file or create a new document', '')
-fixture = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>' + (web / 'app.css').read_text() + '</style>' + markup
+fixture = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>' + (web / 'app.css').read_text() + '</style>' + markup
 script = (web / 'app.js').read_text()
-start = script.index('function configureEditorFocusScrolling()')
+start = script.index('function configurePopoverDismissal()')
 end = script.index('const wrapLinesKey=', start)
-fixture += '<script>const $=selector=>document.querySelector(selector);' + script[start:end] + '</script>'
+render = script[script.index('function renderDocument()'):script.index('function showPath(')]
+fixture += '<script>const $=selector=>document.querySelector(selector);const state={active:{path:"/folder/example.txt",target:"host",dirty:false},replacing:false};const targetName=()=>"Host";' + script[start:end] + render + 'renderDocument();</script>'
 (output / 'Scrolling.app/fixture.html').write_text(fixture)
 source = (outerloop / 'OuterLoop/MobileBrowser/MobileBrowserView.swift').read_text()
 a = source.index('private struct MobilePageDragValue')
@@ -35,7 +36,8 @@ keyboard = keyboard.replace('private struct MobileBrowserKeyboard', 'struct Mobi
 (output / 'WebView.swift').write_text('import SwiftUI\nimport WebKit\n' + source[a:b].replace('private struct', 'struct') + source[c:d].replace('private struct MobileWebView', 'struct MobileWebView') + '\n' + keyboard)
 (output / 'Scrolling.app/Info.plist').write_bytes(plistlib.dumps(dict(
     CFBundleIdentifier='dev.outerloop.plaintext-scrolling-tests', CFBundleExecutable='Scrolling',
-    CFBundlePackageType='APPL', CFBundleName='Scrolling Tests', UILaunchScreen={}, LSRequiresIPhoneOS=True)))
+    CFBundlePackageType='APPL', CFBundleName='Scrolling Tests', UILaunchScreen={}, LSRequiresIPhoneOS=True,
+    UISupportedInterfaceOrientations=['UIInterfaceOrientationPortrait','UIInterfaceOrientationLandscapeLeft','UIInterfaceOrientationLandscapeRight'])))
 PY
 xcrun --sdk iphonesimulator swiftc -target "$(uname -m)-apple-ios26.0-simulator" \
     -sdk "$(xcrun --sdk iphonesimulator --show-sdk-path)" -module-cache-path "$TEST_ROOT/modules" \
@@ -43,5 +45,10 @@ xcrun --sdk iphonesimulator swiftc -target "$(uname -m)-apple-ios26.0-simulator"
     "$OUTERLOOP_ROOT/OuterLoop/MobileBrowser/MobilePortraitChromeLayout.swift" \
     "$OUTERLOOP_ROOT/OuterLoop/MobileBrowser/MobilePortraitChromeSurface.swift" -o "$APP/Scrolling"
 xcrun simctl install "$DEVICE" "$APP"
-xcrun simctl launch --console "$DEVICE" "$BUNDLE_ID" | tee "$TEST_ROOT/result.log"
+xcrun simctl launch --console "$DEVICE" "$BUNDLE_ID" | tee "$TEST_ROOT/result.log" | while IFS= read -r line; do
+    printf '%s\n' "$line"
+    if [[ "$line" == CAPTURE\ * ]]; then
+        xcrun simctl io "$DEVICE" screenshot "/tmp/plaintext-${DEVICE}-${line#CAPTURE }.png" >/dev/null
+    fi
+done
 grep -q 'PASS all web document scrolling checks' "$TEST_ROOT/result.log"

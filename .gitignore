@@ -38,3 +38,5 @@ target.env
 *.tmp
 *.swp
 *.swo
+
+__pycache__/

@@ -8,6 +8,61 @@ const documents = new Map();
 let recoveryWarning = '';
 const state = {target:query.get('target') || 'host', targets:[], active:null, replacing:false, pickerPath:'~', pickerSelected:null, pickerVersion:0};
 function status(text){$('#status').textContent=text;}
+function configurePopoverDismissal(){
+ const panels=[$('#document-menu'),$('#document-info')];
+ let dismissing=false;
+ function consume(event){event.preventDefault();event.stopImmediatePropagation();}
+ document.addEventListener('pointerdown',event=>{
+  dismissing=false;
+  const open=panels.find(panel=>panel.open);
+  if(!open||open.contains(event.target))return;
+  dismissing=true;
+  for(const panel of panels)panel.open=false;
+  consume(event);
+ },{capture:true,passive:false});
+ for(const type of ['pointerup','mousedown','mouseup','click','touchstart','touchend']){
+  document.addEventListener(type,event=>{
+   if(!dismissing||(type==='click'&&event.detail===0))return;
+   consume(event);
+   if(type==='click')dismissing=false;
+  },{capture:true,passive:false});
+ }
+ document.addEventListener('pointercancel',()=>{dismissing=false;},true);
+}
+configurePopoverDismissal();
+for(const type of ['pointerdown','mousedown']){
+ $('#save').addEventListener(type,event=>{
+  if(document.activeElement===$('#editor'))event.preventDefault();
+ });
+}
+function configureLandscapeRail(){
+ const root=document.documentElement,probe=document.createElement('div');
+ probe.setAttribute('aria-hidden','true');
+ probe.style.cssText='position:fixed;left:0;top:0;visibility:hidden;pointer-events:none;width:env(safe-area-inset-left,0px);height:env(safe-area-inset-right,0px)';
+ document.body.append(probe);
+ function update(){
+  const bounds=probe.getBoundingClientRect(),left=bounds.width,right=bounds.height;
+  const angle=((screen.orientation?.angle??window.orientation??0)+360)%360;
+  const side=angle===90?'right':angle===270?'left':null;
+  const inset=side==='left'?left:right;
+  const fullWidth=innerWidth>=Math.max(screen.width,screen.height)-2;
+  const enabled=side&&inset>=52&&fullWidth&&matchMedia('(pointer:coarse)').matches;
+  if(enabled)root.dataset.rail=side;else delete root.dataset.rail;
+  const height=window.visualViewport?.height??innerHeight;
+  const overflow=!!enabled&&(innerHeight-height>100||height<160);
+  root.toggleAttribute('data-rail-overflow',overflow);
+  if(overflow)$('#document-info').open=false;
+  root.style.setProperty('--visible-height',height+'px');
+ }
+ let scheduled=false;
+ function schedule(){if(!scheduled){scheduled=true;requestAnimationFrame(()=>{scheduled=false;update();});}}
+ new ResizeObserver(schedule).observe(probe);
+ for(const event of ['resize','orientationchange','pageshow','load'])window.addEventListener(event,schedule);
+ screen.orientation?.addEventListener('change',schedule);
+ window.visualViewport?.addEventListener('resize',schedule);
+ update();schedule();
+}
+configureLandscapeRail();
 function configureEditorFocusScrolling(){
  const editor=$('#editor'),viewport=window.visualViewport;
  if(!viewport)return;
@@ -32,7 +87,7 @@ function configureEditorFocusScrolling(){
    if(!rect){mirror.remove();return;}
    const top=editor.getBoundingClientRect().top+rect.top-mirror.getBoundingClientRect().top;
    const bottom=top+(parseFloat(style.lineHeight)||parseFloat(style.fontSize)*1.5);
-   const topLimit=$('.document-toolbar').getBoundingClientRect().bottom+12;
+   const topLimit=document.documentElement.dataset.rail?12:$('.document-toolbar').getBoundingClientRect().bottom+12;
    const bottomLimit=viewport.offsetTop+viewport.height-12;
    mirror.remove();
    if(bottom>bottomLimit)window.scrollBy({top:bottom-bottomLimit,behavior:'instant'});
@@ -83,7 +138,15 @@ function renderDocument(){
  const doc=state.active,dirty=!!(doc?.dirty||doc?.pendingSave);
  const saving=!!doc?.pendingSave&&doc.pendingSave.version===doc.version&&!doc.localError&&!doc.networkError&&!doc.conflict;
  $('#dirty').textContent=dirty?'Edited':'';
+ $('#save').hidden=!dirty;
  $('#save').textContent=saving?'Saving…':'Save';
+ $('#save').setAttribute('aria-label',saving?'Saving…':'Save');$('#save').title=saving?'Saving…':'Save';
+ $('#info-name').textContent=doc?.path.split('/').pop()||'Untitled';
+ $('#info-target').textContent=targetName(doc?.target||state.target);
+ $('#info-path').textContent=doc?.path||'Not saved to a file';
+ for(const field of ['name','target','path'])$('#overflow-info-'+field).textContent=$('#info-'+field).textContent;
+ $('#document-menu summary').setAttribute('aria-label',dirty?'Document actions, edited':'Document actions');
+ document.documentElement.toggleAttribute('data-edited',dirty);
  $('#review').hidden=!state.active?.conflict;
  $('#editor').disabled=!state.active||state.replacing;
  $('#save').disabled=!doc||state.replacing||saving||(!dirty&&!!doc.path);$('#move').disabled=!state.active?.path||state.replacing;
@@ -255,7 +318,10 @@ $('#environment').onchange=()=>{state.target=$('#environment').value;pickerLoad(
 $('#environment-refresh').onclick=discover;
 $('#picker').addEventListener('close',()=>{state.pickerVersion++;state.target=state.active?.target||state.target;});
 $('#document-menu').addEventListener('click',e=>{if(e.target.closest('button'))$('#document-menu').open=false;});
-document.addEventListener('pointerdown',e=>{if(!e.target.closest('#document-menu'))$('#document-menu').open=false;});
+for(const id of ['document-menu','document-info']){
+ const panel=$('#'+id);
+ panel.addEventListener('toggle',()=>{if(panel.open)$('#'+(id==='document-menu'?'document-info':'document-menu')).open=false;});
+}
 window.addEventListener('beforeunload',e=>{if([...documents.values()].some(doc=>doc.localError||doc.localVersion<doc.version)){e.preventDefault();e.returnValue='';}});
 window.addEventListener('online',()=>{updateFileNotifications(true);for(const doc of documents.values())doc.resume();void discover();});
 document.addEventListener('visibilitychange',()=>{for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});

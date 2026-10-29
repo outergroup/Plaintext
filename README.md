@@ -186,3 +186,22 @@ Find and file-picker text fields have independent undo histories using the same
 vendored engine; their focused field receives Undo/Redo instead of the document.
 `Scripts/test_native_documents.sh` includes grouping, Unicode, composition,
 selection, save-race, and backend draft-cleanliness tests.
+
+## iPhone landscape layout
+
+The HTML editor opts into `viewport-fit=cover`. When the browser exposes the full
+landscape width and the opposite-to-camera safe-area margin is at least 52 CSS
+pixels wide, the top toolbar becomes an icon stack in that margin: file information, Save
+(only when edited), and the document menu. Save is a contextual text button in both orientations. With the keyboard open,
+all controls and file information move into the document menu, leaving one
+44-pixel ellipsis control in the margin. Safe-area size changes are observed so
+arriving on the page already in landscape activates the layout after WebKit
+finishes initializing the viewport.
+The document retains both safe-area margins; the controls consume no document
+width. Screen orientation changes move the menu to the opposite side. A smaller
+or already-inset viewport keeps the regular toolbar.
+
+Outer Loop lets WebKit manage viewport fitting and safe-area insets, including
+ordinary pages that do not opt into cover. The scrolling simulator test checks
+both landscape orientations, keyboard visibility, menu access, the default and
+cover viewport behaviors, and portrait keyboard animation stability.
