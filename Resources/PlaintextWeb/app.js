@@ -6,18 +6,20 @@ const drafts = new PlaintextDrafts.Store();
 const storageUser = window.outerLoop?.sessionContext?.username || '';
 const documents = new Map();
 let recoveryWarning = '';
+let movingDocument=null;
 const state = {target:query.get('target') || 'host', targets:[], active:null, replacing:false, pickerPath:'~', pickerSelected:null, pickerVersion:0};
 function status(text){$('#status').textContent=text;$('#start-overlay-status').textContent=$('#start-overlay').open?text:'';}
 function configurePopoverDismissal(){
- const panels=[$('#document-menu'),$('#document-info')];
+ const panels=[$('#start-overlay'),$('#document-menu'),$('#document-info')].filter(Boolean);
  let dismissing=false;
  function consume(event){event.preventDefault();event.stopImmediatePropagation();}
  document.addEventListener('pointerdown',event=>{
   dismissing=false;
+  if(document.querySelector('dialog:modal'))return;
   const open=panels.find(panel=>panel.open);
-  if(!open||open.contains(event.target))return;
+  if(!open||open.contains(event.target)||(open.id==='start-overlay'&&(movingDocument?$('#path'):$('#home')).contains(event.target)))return;
   dismissing=true;
-  for(const panel of panels)panel.open=false;
+  for(const panel of panels){if(panel instanceof HTMLDialogElement)panel.close();else panel.open=false;}
   consume(event);
  },{capture:true,passive:false});
  for(const type of ['pointerup','mousedown','mouseup','click','touchstart','touchend']){
@@ -122,6 +124,7 @@ $('#wrap-lines').onclick=()=>{
 function targetName(target){return state.targets.find(t=>t.id===target)?.name || (target==='host'?'Host':'Unavailable container');}
 async function api(operation, values={}, context=state){
  const body=EnvironmentBinary.encode(operation,{target:context.target,...values});
+ activeRequests++;
  const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),10000);
  try{
   let response,buffer;
@@ -129,17 +132,20 @@ async function api(operation, values={}, context=state){
   catch(cause){const error=Error('Waiting for connection.');error.network=true;throw error;}
   if(!response.ok){const error=Error(new TextDecoder().decode(buffer));error.network=response.status>=500;throw error;}
   return EnvironmentBinary.decode(buffer,operation);
- }finally{clearTimeout(timeout);}
+ }finally{activeRequests--;clearTimeout(timeout);}
 }
 async function discover(){
  try{const result=await api('targets');state.targets=result.targets;const select=$('#environment');select.replaceChildren(...result.targets.map(t=>{const option=new Option(t.id==='host'?`Host — ${t.name}`:t.name+(t.state==='running'?'':` · ${t.state}`),t.id);option.disabled=t.state!=='running';return option}));if(!state.targets.some(t=>t.id===state.target))select.add(new Option('Unavailable container',state.target));select.value=state.target;$('#environment-errors').textContent=result.errors.map(e=>`${e.runtime}: ${e.error}`).join(' · ');if(state.active)showPath(state.active);else $('#targetLabel').textContent=targetName(state.target);renderDocument();if(!state.active)void renderRecentFiles()}catch(e){$('#environment-errors').textContent=e.message}
 }
 function renderDocument(){
- document.documentElement.toggleAttribute('data-start',!state.active);
- $('#start-screen').hidden=!!state.active&&!$('#start-overlay')?.open;
- for(const id of ['start-new','start-open'])$('#'+id).disabled=state.replacing;
- for(const button of document.querySelectorAll('.recent-file'))button.disabled=state.replacing;
+ $('#start-screen').hidden=!$('#start-overlay')?.open;
+ for(const id of ['start-new','start-open','start-recent'])$('#'+id).disabled=state.replacing;
+ for(const button of document.querySelectorAll('.recent-file,.recent-remove'))button.disabled=state.replacing;
  const doc=state.active,dirty=!!(doc?.dirty||doc?.pendingSave);
+ const onHost=(doc?.target||state.target)==='host';
+ $('#location-target').hidden=onHost;$('.location-separator').hidden=onHost;
+ $('.document-toolbar').toggleAttribute('data-preparing-document',state.replacing&&!doc);
+ if(!doc){$('#pathLabel').textContent='Untitled';$('#path').title='Move / Rename… — Untitled';}
  const saving=!!doc?.pendingSave&&doc.pendingSave.version===doc.version&&!doc.localError&&!doc.networkError&&!doc.conflict;
  $('#dirty').textContent=dirty?'Edited':'';
  $('#save').hidden=!dirty;
@@ -171,25 +177,46 @@ function rememberFile(doc){
  records.unshift({path:doc.path,target:doc.target,openedAt:Date.now()});
  try{localStorage.setItem(recentFilesKey,JSON.stringify(records.slice(0,30)));}catch{}
 }
+const removedRecentFilesKey=recentFilesKey+'.removed';
+function removedRecentFiles(){
+ try{const keys=JSON.parse(localStorage.getItem(removedRecentFilesKey)||'[]');return new Set(Array.isArray(keys)?keys.filter(key=>typeof key==='string'):[]);}catch{return new Set();}
+}
+function recentFileKey(record){return JSON.stringify([record.target,record.path]);}
+function restoreRecentFile(doc){
+ const removed=removedRecentFiles();
+ if(removed.delete(recentFileKey(doc)))try{localStorage.setItem(removedRecentFilesKey,JSON.stringify([...removed]));}catch{}
+}
+function removeRecentFile(record){
+ const removed=removedRecentFiles();removed.add(recentFileKey(record));
+ try{
+  localStorage.setItem(removedRecentFilesKey,JSON.stringify([...removed]));
+  localStorage.setItem(recentFilesKey,JSON.stringify(recentFiles().filter(item=>recentFileKey(item)!==recentFileKey(record))));
+  void renderRecentFiles();
+ }catch{status('Could not remove this item from recent files.');}
+}
 async function renderRecentFiles(){
- const records=recentFiles(),known=new Set(records.map(r=>JSON.stringify([r.target,r.path])));
- for(const record of await localRecords()){
+ const drafts=await localRecords(),removed=removedRecentFiles();
+ const records=recentFiles().filter(record=>!removed.has(recentFileKey(record))),known=new Set(records.map(recentFileKey));
+ for(const record of drafts){
   const key=JSON.stringify([record.target,record.path]);
-  if(record.path&&!known.has(key)){records.push({path:record.path,target:record.target,openedAt:record.updatedAt||0});known.add(key);}
+  if(record.path&&!known.has(key)&&!removed.has(key)){records.push({path:record.path,target:record.target,openedAt:record.updatedAt||0});known.add(key);}
  }
  if(state.active&&!$('#start-overlay').open)return;
  records.sort((a,b)=>b.openedAt-a.openedAt);
  $('#recent-files').replaceChildren(...records.slice(0,30).map(record=>{
-  const button=document.createElement('button'),name=document.createElement('strong'),detail=document.createElement('span');
+  const row=document.createElement('div'),button=document.createElement('button'),name=document.createElement('strong'),detail=document.createElement('span'),remove=document.createElement('button');
+  row.className='recent-row';
   button.className='recent-file';button.disabled=state.replacing;
   name.textContent=record.path.split('/').pop();detail.textContent=targetName(record.target)+' · '+record.path;
   button.title=detail.textContent;button.append(name,detail);
-  button.onclick=()=>load(record.path,{target:record.target});return button;
+  button.onclick=()=>load(record.path,{target:record.target});
+  remove.className='recent-remove';remove.textContent='×';remove.title='Remove from recents';remove.setAttribute('aria-label','Remove '+name.textContent+' from recents');remove.disabled=state.replacing;
+  remove.onclick=()=>removeRecentFile(record);row.append(button,remove);return row;
  }));
  $('#recent-empty').hidden=records.length>0;
 }
 function documentURL(doc){return '?'+new URLSearchParams({file:doc.path,target:doc.target,draft:doc.id}).toString().replace(/%2F/gi,'/');}
-function showPath(doc){rememberFile(doc);$('#targetLabel').textContent=targetName(doc.target);const label=$('#pathLabel');label.replaceChildren();const parts=doc.path.split('/').filter(Boolean);const filename=document.createElement('strong');filename.textContent=parts.pop()||'Untitled';if(parts.length){const parent=document.createElement('span');parent.className='parent-path';parent.textContent=parts.join(' / ')+' / ';label.append(parent)}label.append(filename);$('#path').title='Move / Rename… — '+(doc.path||'Untitled');if(new URLSearchParams(location.search).get('draft')===doc.id)history.replaceState(null,'',documentURL(doc));}
+function showPath(doc){rememberFile(doc);$('#targetLabel').textContent=targetName(doc.target);const label=$('#pathLabel');label.replaceChildren();const parts=doc.path.split('/').filter(Boolean);const filename=document.createElement('strong');filename.textContent=parts.pop()||'Untitled';if(parts.length||doc.path.startsWith('/')){const parent=document.createElement('span');parent.className='parent-path';parent.textContent=(doc.path.startsWith('/')?'/':'')+(parts.length?parts.join('/')+'/':'');label.append(parent)}label.append(filename);$('#path').title='Move / Rename… — '+(doc.path||'Untitled');if(new URLSearchParams(location.search).get('draft')===doc.id)history.replaceState(null,'',documentURL(doc));}
 let fileNotifications=null;
 function updateFileNotifications(restart=false){
  const doc=state.active;
@@ -244,25 +271,26 @@ function currentRoute(){
  return parameters.has('file')||parameters.has('draft')?{path:parameters.get('file')||'',target:parameters.get('target')||'host',draftID:parameters.get('draft')}:null;
 }
 function navigateRoute(route,mode='push'){
+ if(updateFrozen)return Promise.resolve();
  const version=++navigationVersion;
  navigationTask=navigationTask.then(async()=>{
   if(version!==navigationVersion)return;
   state.replacing=true;renderDocument();
   try{
    if(state.active&&!(await state.active.persist()))throw Error(state.active.message);
-   if(route)status('Opening…');
+   if(route?.path||route?.draftID)status('Opening…');
    const doc=route?await resolveDocument(route):null;
    if(version!==navigationVersion)return;
    history[mode==='push'?'pushState':'replaceState'](null,'',doc?documentURL(doc):location.pathname);
    $('#document-menu').open=false;$('#document-info').open=false;
-   if($('#picker').open)$('#picker').close();
    if($('#start-overlay').open)$('#start-overlay').close();
    state.locationKey=null;
-   if(doc)activate(doc);
+   if(doc){restoreRecentFile(doc);activate(doc);}
    else{
     state.active?.setWatching(false);state.active=null;
     $('#editor').blur();$('#editor').value='';
     updateFileNotifications();renderDocument();status('');window.scrollTo(0,0);
+    showStartOverlay(true);
     await renderRecentFiles();
    }
   }catch(error){
@@ -341,11 +369,15 @@ async function reviewChanges(){
   for(const [label,text] of [['Your draft',doc.contents],...(shared.dirty?[['Shared draft',shared.contents]]:[]),['Saved file',disk.contents]]){
    const panel=document.createElement('label');panel.textContent=label;const area=document.createElement('textarea');area.readOnly=true;area.value=text;panel.append(area);comparison.append(panel);
   }
+  const explanation=document.createElement('p');explanation.textContent=shared.dirty?'You can keep your draft, save a copy, or discard your draft and the shared draft to use the saved file. Discarding does not change the saved file.':'You can keep your draft, save a copy, or discard your draft to use the saved file. Discarding does not change the saved file.';
   const actions=document.createElement('div');actions.className='conflict-actions';
-  for(const [title,action] of [['Close',()=>{}],['Save a copy…',async()=>{const path=await ask('Save a copy as',doc.path+'.copy');if(path)await doc.saveCopy(path);}],['Replace server file with my draft',()=>doc.resolveConflict(disk.revision,shared.draftRevision)]]){
-   const button=document.createElement('button');button.textContent=title;button.onclick=()=>{dialog.close();void action();};actions.append(button);
+  for(const [title,action] of [['Keep my draft',()=>{}],[shared.dirty?'Discard drafts and use saved file':'Discard my draft and use saved file',()=>doc.discardConflict(disk.revision,shared.draftRevision)],['Save a copy…',async()=>{const path=await ask('Save a copy as',doc.path+'.copy');if(path)await doc.saveCopy(path);}],['Replace server file with my draft',()=>doc.resolveConflict(disk.revision,shared.draftRevision)]]){
+   const button=document.createElement('button');button.textContent=title;button.onclick=async()=>{
+    const buttons=[...actions.querySelectorAll('button')];buttons.forEach(item=>item.disabled=true);
+    try{await action();dialog.close();}catch(error){explanation.textContent=error.message;buttons.forEach(item=>item.disabled=false);}
+   };actions.append(button);
   }
-  dialog.append(heading,comparison,actions);dialog.onclose=()=>dialog.remove();document.body.append(dialog);dialog.showModal();
+  dialog.append(heading,explanation,comparison,actions);dialog.onclose=()=>dialog.remove();document.body.append(dialog);dialog.showModal();
  }catch(e){status('Your draft is kept on this device. Cannot compare the server file: '+e.message);}
 }
 $('#editor').addEventListener('compositionstart',()=>{if(state.active)state.active.composing=true;});
@@ -353,63 +385,232 @@ $('#editor').addEventListener('compositionend',()=>{if(state.active){state.activ
 $('#editor').addEventListener('input',()=>{if(state.active&&!state.replacing)state.active.edit($('#editor').value);});
 $('#editor').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='s'){e.preventDefault();void save();}else if(e.key==='Tab'){e.preventDefault();const t=e.currentTarget;t.setRangeText('\t',t.selectionStart,t.selectionEnd,'end');t.dispatchEvent(new Event('input'));}});
 $('#save').onclick=()=>save();
-function showStartOverlay(){
- const overlay=$('#start-overlay');
- if(overlay.open||state.replacing)return;
- $('#document-menu').open=false;$('#document-info').open=false;
- $('#start-overlay-status').textContent='';overlay.insertBefore($('#start-screen'),$('#start-overlay-status'));$('#start-screen').hidden=false;
- overlay.showModal();void renderRecentFiles();
+function positionStartOverlay(){
+ const panel=$('#start-overlay');if(!panel.open)return;
+ const home=movingDocument?$('#path'):$('#home'),anchor=home.getBoundingClientRect().width?home:$(movingDocument?'#document-info>summary':'#document-menu>summary');
+ const rect=anchor.getBoundingClientRect(),viewport=window.visualViewport;
+ const left=viewport?.offsetLeft||0,top=viewport?.offsetTop||0;
+ const right=left+(viewport?.width||innerWidth),bottom=top+(viewport?.height||innerHeight);
+ const side=document.documentElement.dataset.rail;
+ const width=Math.min(560,right-left-16-(side?rect.width+12:0));
+ let x=side==='left'?rect.right+12:side==='right'?rect.left-width-12:rect.left;
+ x=Math.max(left+8,Math.min(x,right-width-8));
+ const y=Math.max(top+8,side?rect.top:rect.bottom+12);
+ panel.style.width=width+'px';panel.style.left=x+'px';panel.style.top=y+'px';
+ panel.style.maxHeight=Math.max(44,bottom-y-8)+'px';
+ panel.style.setProperty('--available-height',Math.max(44,bottom-y-10)+'px');
+ panel.dataset.pointer=side||'top';
+ const pointer=side?rect.top+rect.height/2-y:rect.left+rect.width/2-x;
+ panel.style.setProperty('--pointer-offset',Math.max(18,Math.min(pointer,(side?Math.max(44,bottom-y-8):width)-18))+'px');
+ panel.style.transformOrigin=side==='right'?'right top':'left top';
 }
-$('#home').onclick=showStartOverlay;$('#overflow-home').onclick=showStartOverlay;
-$('#start-close').onclick=()=>$('#start-overlay').close();
+let startPositionScheduled=false;
+function scheduleStartPosition(){
+ if(startPositionScheduled)return;
+ startPositionScheduled=true;requestAnimationFrame(()=>{startPositionScheduled=false;positionStartOverlay();});
+}
+for(const event of ['resize','orientationchange'])window.addEventListener(event,scheduleStartPosition);
+window.visualViewport?.addEventListener('resize',scheduleStartPosition);
+window.visualViewport?.addEventListener('scroll',scheduleStartPosition);
+new ResizeObserver(scheduleStartPosition).observe($('.document-toolbar'));
+function showStartOverlay(duringNavigation=false){
+ const overlay=$('#start-overlay');
+ if(overlay.open||(!duringNavigation&&state.replacing))return;
+ movingDocument=null;overlay.dataset.mode='open';overlay.setAttribute('aria-label','Open files');$('#move-fields').hidden=true;$('#choose').textContent='Open file';$('#picker').setAttribute('aria-labelledby','start-open');
+ $('#document-menu').open=false;$('#document-info').open=false;
+ selectStartTab('recent');$('#start-overlay-status').textContent='';$('#start-overlay-content').insertBefore($('#start-screen'),$('#start-overlay-status'));$('#start-screen').hidden=false;
+ overlay.show();$('#home').setAttribute('aria-expanded','true');positionStartOverlay();void renderRecentFiles();
+}
+$('#home').onclick=()=>{$('#start-overlay').open?$('#start-overlay').close():showStartOverlay();};$('#overflow-home').onclick=()=>showStartOverlay();
+document.addEventListener('keydown',event=>{
+ if(event.key==='Escape'&&$('#start-overlay').open&&!document.querySelector('dialog:modal')){
+  event.preventDefault();$('#start-overlay').close();(movingDocument?$('#path'):$('#home')).focus({preventScroll:true});
+ }
+});
 $('#start-overlay').addEventListener('close',()=>{
+ if($('#start-overlay').open)return;
+ $('#home').setAttribute('aria-expanded','false');$('#path').setAttribute('aria-expanded','false');movingDocument=null;
+ state.pickerVersion++;state.target=state.active?.target||state.target;
  document.querySelector('main').prepend($('#start-screen'));renderDocument();
+ if(!state.active&&!state.replacing)void newDocument();
 });
 $('#recover').onclick=recoverDraft;$('#download').onclick=downloadDocument;$('#review').onclick=reviewChanges;
 async function moveDocument(){
  const doc=state.active;if(!doc)return;
+ if($('#start-overlay').open&&movingDocument){$('#start-overlay').close();return;}
  if(!doc.path){await save(doc);return;}
  if(doc.dirty||doc.pendingSave){status('Save this file and wait for confirmation before moving it.');return;}
- const destination=await ask('Move or rename file',doc.path,'Move');if(!destination||destination===doc.path)return;
- state.replacing=true;renderDocument();
- try{const result=await api('move',{path:doc.path,destination,revision:doc.revision},doc);doc.path=result.path;doc.draftRevision='missing';await doc.persist();documentChanged(doc);}
- catch(e){status(e.message);}finally{state.replacing=false;renderDocument();}
+ showStartOverlay();movingDocument=doc;$('#start-overlay').dataset.mode='move';$('#start-overlay').setAttribute('aria-label','Move or rename file');
+ $('#home').setAttribute('aria-expanded','false');$('#path').setAttribute('aria-expanded','true');
+ $('#move-fields').hidden=false;$('#move-name').value=doc.path.split('/').pop();$('#choose').textContent='Move';
+ $('#picker').setAttribute('aria-labelledby','move-heading');selectStartTab('open');
+ state.target=doc.target;positionStartOverlay();
+ void pickerLoad(doc.path.slice(0,doc.path.lastIndexOf('/'))||'/');
 }
+function updatePickerAction(){
+ if(!movingDocument){$('#choose').disabled=!state.pickerSelected||state.pickerSelected.directory;return;}
+ const name=$('#move-name').value;
+ $('#choose').disabled=state.replacing||!state.pickerReady||!name.trim()||name==='.'||name==='..'||name.includes('/')||name.includes('\0');
+}
+async function confirmMove(){
+ const doc=movingDocument;if(!doc||$('#choose').disabled)return;
+ if(doc!==state.active||doc.dirty||doc.pendingSave){$('#start-overlay-status').textContent='Save this file before moving it.';return;}
+ const destination=state.pickerPath.replace(/\/$/,'')+'/'+$('#move-name').value;
+ if(destination===doc.path){$('#start-overlay').close();return;}
+ state.replacing=true;renderDocument();updatePickerAction();$('#move-name').disabled=true;
+ try{
+  const result=await api('move',{path:doc.path,destination,revision:doc.revision},doc);
+  doc.path=result.path;doc.draftRevision='missing';await doc.persist();documentChanged(doc);$('#start-overlay').close();
+ }catch(e){$('#start-overlay-status').textContent=e.message;}
+ finally{state.replacing=false;$('#move-name').disabled=false;renderDocument();updatePickerAction();}
+}
+$('#move-name').addEventListener('input',updatePickerAction);
+$('#move-name').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();void confirmMove();}});
 $('#move').onclick=()=>{$('#document-info').open=false;void moveDocument();};$('#path').onclick=moveDocument;
+const pickerSelection={entries:[],selected:null,typeaheadPrefix:'',typeaheadLastUpdated:0,parent:null};
+function pickerSelectedIndex(){return pickerSelection.selected?pickerSelection.entries.findIndex(entry=>entry.path===pickerSelection.selected.path):-1;}
+function selectPickerIndex(index){
+ if(!pickerSelection.entries.length)return;
+ index=Math.max(0,Math.min(index,pickerSelection.entries.length-1));
+ const list=$('#pickerRows'),entry=pickerSelection.entries[index];
+ for(const [i,row] of [...list.children].entries()){row.classList.toggle('selected',i===index);row.setAttribute('aria-selected',String(i===index));}
+ const row=list.children[index];list.setAttribute('aria-activedescendant',row.id);
+ state.pickerSelected=entry;pickerSelection.selected=entry;updatePickerAction();
+ list.focus({preventScroll:true});row.scrollIntoView({block:'nearest'});
+}
+function resetTypeahead(){pickerSelection.typeaheadPrefix='';pickerSelection.typeaheadLastUpdated=0}
+function selectEntryMatchingPrefix(prefix,startingAfterSelection){if(!prefix)return false;const selected=pickerSelectedIndex(),start=startingAfterSelection?(selected<0?0:selected+1):0;for(let offset=0;offset<pickerSelection.entries.length;offset++){const index=(start+offset)%pickerSelection.entries.length;if(pickerSelection.entries[index].name.toLocaleLowerCase().startsWith(prefix)){selectPickerIndex(index);return true}}return false}
+function handleTypeahead(text){if(!pickerSelection.entries.length)return;const now=Date.now();if(pickerSelection.typeaheadLastUpdated&&now-pickerSelection.typeaheadLastUpdated>1000)pickerSelection.typeaheadPrefix='';pickerSelection.typeaheadLastUpdated=now;pickerSelection.typeaheadPrefix+=text.toLocaleLowerCase();if(selectEntryMatchingPrefix(pickerSelection.typeaheadPrefix,false))return;pickerSelection.typeaheadPrefix=text.toLocaleLowerCase();selectEntryMatchingPrefix(pickerSelection.typeaheadPrefix,true)}
+function typeaheadText(key){return key&&![...key].some(character=>/[\u0000-\u001f\u007f-\u009f\r\n]/u.test(character))&&[...key].length===1?key:null}
+document.addEventListener('keydown',event=>{
+ if(!$('#start-overlay').open||$('#picker').hidden||state.replacing||event.defaultPrevented||event.isComposing||event.metaKey||event.ctrlKey||event.altKey||event.target.closest('input,textarea,select,[contenteditable="true"]'))return;
+ const index=pickerSelectedIndex(),inList=event.target===$('#pickerRows');
+ if(event.key==='ArrowUp'||event.key==='ArrowDown'){
+  event.preventDefault();resetTypeahead();selectPickerIndex(index<0?(event.key==='ArrowUp'?pickerSelection.entries.length-1:0):index+(event.key==='ArrowUp'?-1:1));
+ }else if(event.key==='Enter'&&inList&&index>=0){
+  event.preventDefault();const entry=pickerSelection.entries[index];entry.directory?pickerLoad(entry.path):choose(entry.path);
+ }else if(event.key==='Backspace'&&inList&&pickerSelection.parent){event.preventDefault();pickerLoad(pickerSelection.parent);}
+ else{const text=typeaheadText(event.key);if(text){event.preventDefault();handleTypeahead(text);}}
+});
 async function pickerLoad(path){
- const version=++state.pickerVersion;state.pickerSelected=null;$('#choose').disabled=true;$('#pickerRows').replaceChildren();$('#pickerPath').textContent='Loading…';
- try{const value=await api('list',{path});if(version!==state.pickerVersion)return;state.pickerPath=value.path;state.pickerSelected=null;$('#choose').disabled=true;$('#pickerPath').textContent=value.path;
- const entries=[...(value.parent?[{name:'..',path:value.parent,directory:true}]:[]),...value.entries];
- $('#pickerRows').replaceChildren(...entries.map(entry=>{const row=document.createElement('div');row.className='picker-row';const icon=document.createElement('span');icon.textContent=entry.directory?'📁':'📄';const text=document.createElement('span');text.textContent=entry.name;row.append(icon,text);row.onclick=()=>{document.querySelectorAll('.picker-row.selected').forEach(r=>r.classList.remove('selected'));row.classList.add('selected');state.pickerSelected=entry;$('#choose').disabled=entry.directory;};row.ondblclick=()=>entry.directory?pickerLoad(entry.path):choose(entry.path);return row;}));
+ resetTypeahead();pickerSelection.entries=[];pickerSelection.selected=null;pickerSelection.parent=null;
+ const version=++state.pickerVersion;state.pickerReady=false;state.pickerSelected=null;$('#choose').disabled=true;$('#pickerRows').replaceChildren();$('#pickerRows').removeAttribute('aria-activedescendant');$('#pickerRows').scrollTop=0;$('#pickerPath').textContent='Loading…';
+ try{const value=await api('list',{path});if(version!==state.pickerVersion)return;state.pickerPath=value.path;$('#pickerPath').textContent=value.path;
+ pickerSelection.parent=value.parent;
+ const entries=[...(value.parent?[{name:'..',path:value.parent,directory:true}]:[]),...value.entries.filter(entry=>!movingDocument||entry.directory)];pickerSelection.entries=entries;
+ $('#pickerRows').replaceChildren(...entries.map((entry,index)=>{
+  const row=document.createElement('div');row.className='picker-row';row.id='picker-row-'+index;row.setAttribute('role','option');row.setAttribute('aria-selected','false');
+  const icon=document.createElement('span');icon.textContent=entry.directory?'📁':'📄';icon.setAttribute('aria-hidden','true');
+  const text=document.createElement('span');text.textContent=entry.name;row.append(icon,text);
+  row.onclick=()=>{resetTypeahead();if(entry.directory){$('#pickerRows').focus({preventScroll:true});pickerLoad(entry.path);}else selectPickerIndex(index);};
+  row.ondblclick=()=>{if(!entry.directory)choose(entry.path);};return row;
+ }));
+ state.pickerReady=true;updatePickerAction();
  }catch(e){if(version===state.pickerVersion){$('#pickerRows').replaceChildren();$('#pickerPath').textContent=e.message;}}
 }
-function openPicker(){state.target=state.active?.target||state.target;$('#environment').value=state.target;if(!$('#picker').open)$('#picker').showModal();const path=state.active?.path;pickerLoad(path&&path.includes('/')?path.slice(0,path.lastIndexOf('/'))||'/':'~');}
-function choose(path){const context={target:state.target};$('#picker').close();load(path,context);}
-$('#choose').onclick=e=>{e.preventDefault();if(state.pickerSelected&&!state.pickerSelected.directory)choose(state.pickerSelected.path);};
+function selectStartTab(tab){
+ resetTypeahead();
+ for(const name of ['recent','open']){
+  const selected=name===tab,button=$('#start-'+name);
+  button.setAttribute('aria-selected',String(selected));button.tabIndex=selected?0:-1;
+ }
+ $('#recent-panel').hidden=tab!=='recent';$('#picker').hidden=tab!=='open';
+ $('#start-overlay').dataset.tab=tab;
+ scheduleStartPosition();
+}
+function openPicker(){
+ showStartOverlay();selectStartTab('open');
+ state.target=state.active?.target||state.target;$('#environment').value=state.target;
+ const path=state.active?.path;pickerLoad(path&&path.includes('/')?path.slice(0,path.lastIndexOf('/'))||'/':'~');
+}
+function choose(path){load(path,{target:state.target});}
+$('#start-recent').onclick=()=>{state.pickerVersion++;selectStartTab('recent');};
+$('.start-tabs').addEventListener('keydown',event=>{
+ if(!['ArrowLeft','ArrowRight','Home','End'].includes(event.key))return;
+ event.preventDefault();
+ const tab=event.key==='Home'?'recent':event.key==='End'?'open':$('#start-recent').getAttribute('aria-selected')==='true'?'open':'recent';
+ $('#start-'+tab).click();$('#start-'+tab).focus();
+});
+$('#choose').onclick=e=>{e.preventDefault();if(movingDocument){void confirmMove();return;}if(state.pickerSelected&&!state.pickerSelected.directory)choose(state.pickerSelected.path);};
 $('#mobile-location').onclick=openPicker;
 $('#start-open').onclick=openPicker;$('#start-new').onclick=newDocument;
 $('#location-target').onclick=openPicker;
 $('#environment').onchange=()=>{state.target=$('#environment').value;pickerLoad('~');};
 $('#environment-refresh').onclick=discover;
-$('#picker').addEventListener('close',()=>{state.pickerVersion++;state.target=state.active?.target||state.target;});
 $('#document-menu').addEventListener('click',e=>{if(e.target.closest('button'))$('#document-menu').open=false;});
 for(const id of ['document-menu','document-info']){
  const panel=$('#'+id);
  panel.addEventListener('toggle',()=>{if(panel.open)$('#'+(id==='document-menu'?'document-info':'document-menu')).open=false;});
 }
 window.addEventListener('beforeunload',e=>{if([...documents.values()].some(doc=>doc.localError||doc.localVersion<doc.version)){e.preventDefault();e.returnValue='';}});
-window.addEventListener('storage',event=>{if(event.key===recentFilesKey&&(!state.active||$('#start-overlay').open))void renderRecentFiles();});
-window.addEventListener('online',()=>{updateFileNotifications(true);for(const doc of documents.values())doc.resume();void discover();});
-document.addEventListener('visibilitychange',()=>{for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});
-window.addEventListener('focus',()=>{if(!document.hidden){updateFileNotifications(true);state.active?.resume();}});
+window.addEventListener('storage',event=>{if((event.key===recentFilesKey||event.key===removedRecentFilesKey)&&(!state.active||$('#start-overlay').open))void renderRecentFiles();});
+window.addEventListener('online',()=>{if(updateFrozen)return;updateFileNotifications(true);for(const doc of documents.values())doc.resume();void discover();});
+document.addEventListener('visibilitychange',()=>{if(updateFrozen)return;for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});
+window.addEventListener('focus',()=>{if(!updateFrozen&&!document.hidden){updateFileNotifications(true);state.active?.resume();}});
 window.addEventListener('pagehide',()=>{fileNotifications?.stream.stop();fileNotifications=null;for(const doc of documents.values()){void doc.persist();doc.stop();}});
 window.addEventListener('pageshow',event=>{if(event.persisted){state.replacing=false;renderDocument();updateFileNotifications(true);for(const doc of documents.values())doc.resume();if(!state.active)void renderRecentFiles();}});
+let shellUpdates=null,updateFrozen=false,updateEpoch=0,bootFinished=false,lastInteraction=0,activeRequests=0;
+let updateView=null;
+const updateViewKey='plaintext.update-view';
+for(const type of ['keydown','pointerdown','beforeinput','compositionstart','compositionend','input']){
+ document.addEventListener(type,event=>{
+  if(updateFrozen){event.preventDefault();event.stopImmediatePropagation();return;}
+  lastInteraction=Date.now();
+ },true);
+}
+async function checkpointForUpdate(){
+ if(!bootFinished||state.replacing||activeRequests||Date.now()-lastInteraction<1500||
+    document.querySelector('dialog[open]:not(#start-overlay), #start-overlay:modal')||[...documents.values()].some(doc=>doc.composing))return false;
+ if(!updateFrozen){
+  const editor=$('#editor');
+  updateView={url:location.href,id:state.active?.id,openPanel:$('#start-overlay').open,start:editor.selectionStart,end:editor.selectionEnd,
+   direction:editor.selectionDirection,x:window.scrollX,y:window.scrollY,left:editor.scrollLeft,focused:document.activeElement===editor};
+  updateFrozen=true;document.body.inert=true;
+  fileNotifications?.stream.stop();fileNotifications=null;
+  for(const doc of documents.values())doc.stop();
+ }
+ const epoch=updateEpoch;
+ const saved=await Promise.all([...documents.values()].map(doc=>doc.persist()));
+ if(epoch!==updateEpoch||!updateFrozen)return false;
+ if(saved.some(value=>!value)){releaseUpdate();return false;}
+ try{sessionStorage.setItem(updateViewKey,JSON.stringify(updateView));}
+ catch(error){releaseUpdate();status('Could not preserve the editor for an update: '+error.message);return false;}
+ return true;
+}
+function releaseUpdate(){
+ updateEpoch++;
+ if(!updateFrozen)return;
+ updateFrozen=false;document.body.inert=false;
+ if(updateView?.focused)$('#editor').focus({preventScroll:true});
+ for(const doc of documents.values())doc.resume();
+ updateFileNotifications();
+}
+function restoreUpdateView(){
+ try{
+  const value=JSON.parse(sessionStorage.getItem(updateViewKey)||'null');
+  sessionStorage.removeItem(updateViewKey);
+  if(!value||value.url!==location.href||value.id!==state.active?.id)return;
+  const editor=$('#editor');
+  editor.setSelectionRange(value.start,value.end,value.direction);
+  if(value.focused)editor.focus({preventScroll:true});
+  editor.scrollLeft=value.left;window.scrollTo(value.x,value.y);
+  if(value.openPanel)showStartOverlay();
+ }catch{}
+}
 async function prepareOfflineShell(){
  if(!('serviceWorker' in navigator))return;
- try{await navigator.serviceWorker.register('/sw.js',{scope:'/'});await navigator.serviceWorker.ready;}
- catch{}
+ shellUpdates=new PlaintextDrafts.ShellUpdates({
+  workers:navigator.serviceWorker,prepare:checkpointForUpdate,release:releaseUpdate,
+  reload:()=>{history.replaceState(null,'',updateView.url);location.reload();},visible:()=>!document.hidden
+ });
+ await shellUpdates.start();
 }
+window.addEventListener('focus',()=>shellUpdates?.check());
+window.addEventListener('online',()=>shellUpdates?.check());
+window.addEventListener('pageshow',()=>shellUpdates?.check());
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)shellUpdates?.check();});
 $('#editor').disabled=true;renderDocument();
+if(!currentRoute())showStartOverlay(true);
 void prepareOfflineShell();void discover();
 async function boot(){
  await navigateRoute(currentRoute(),'replace');
@@ -420,5 +621,5 @@ async function boot(){
   }
  }
 }
-void boot();
+void boot().then(()=>{bootFinished=true;restoreUpdateView();shellUpdates?.check();});
 })();

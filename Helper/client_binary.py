@@ -1,5 +1,5 @@
 import struct
-OPS={'list':1,'read':2,'save':3,'move':4,'signal':6,'targets':7,'preview':8,'draft':9,'disk':10,'state':11,'publish':12,'commit':13}
+OPS={'list':1,'read':2,'save':3,'move':4,'signal':6,'targets':7,'preview':8,'draft':9,'disk':10,'state':11,'publish':12,'commit':13,'discard':14}
 def encode_client(operation, **values):
     b=bytearray(72)
     struct.pack_into('<IIII',b,0,0x51434c50,1,0,OPS[operation])

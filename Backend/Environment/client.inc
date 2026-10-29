@@ -1,7 +1,7 @@
 #include "environment.h"
 #include <sys/file.h>
 enum { CLIENT_HEADER = 72, CLIENT_RESPONSE = 48, DRAFT_HEADER = 32,
-       CLIENT_TARGETS = 7, CLIENT_PREVIEW = 8, CLIENT_DRAFT = 9, CLIENT_DISK = 10, CLIENT_STATE = 11, CLIENT_PUBLISH = 12, CLIENT_COMMIT = 13 };
+       CLIENT_TARGETS = 7, CLIENT_PREVIEW = 8, CLIENT_DRAFT = 9, CLIENT_DISK = 10, CLIENT_STATE = 11, CLIENT_PUBLISH = 12, CLIENT_COMMIT = 13, CLIENT_DISCARD = 14 };
 static char *draft_path(const char *target, const char *user, const char *path) {
     const char *state = getenv("XDG_STATE_HOME");
     char *root = NULL;
@@ -138,7 +138,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         get_u32(input.data + 4) != 1 || get_u32(input.data + 8) != input.size ||
         get_u64(input.data + 16)) { fail("invalid environment request header"); goto done; }
     operation = get_u32(input.data + 12);
-    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == OP_READ || operation == OP_SAVE || operation == OP_MOVE || operation == CLIENT_DRAFT || operation == CLIENT_DISK || operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT;
+    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == OP_READ || operation == OP_SAVE || operation == OP_MOVE || operation == CLIENT_DRAFT || operation == CLIENT_DISK || operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT || operation == CLIENT_DISCARD;
     if (!allowed) { fail("operation is not supported by this app"); goto done; }
     target = binary_read_string(input, 24, CLIENT_HEADER, 4096);
     user = binary_read_string(input, 32, CLIENT_HEADER, 256);
@@ -163,8 +163,8 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         environment_snapshot_free(&environments);
         goto done;
     }
-    shared = operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT;
-    request.operation = operation == CLIENT_PREVIEW || operation == CLIENT_DISK || operation == CLIENT_STATE ? OP_READ : operation == CLIENT_COMMIT ? OP_SAVE : operation;
+    shared = operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT || operation == CLIENT_DISCARD;
+    request.operation = operation == CLIENT_PREVIEW || operation == CLIENT_DISK || operation == CLIENT_STATE || operation == CLIENT_DISCARD ? OP_READ : operation == CLIENT_COMMIT ? OP_SAVE : operation;
     request.limit = operation == CLIENT_PREVIEW ? MAX_DATA : MAX_TEXT;
     request.data_length = body.size;
     if (shared && !strcmp(target, "host")) {
@@ -216,7 +216,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
     }
     reply = environment_binary_operation(target, user, &request, body);
     if (failure[0] || !response_validate(reply, request.operation)) goto done;
-    if (operation == OP_READ || operation == CLIENT_DISK || operation == CLIENT_STATE) {
+    if (operation == OP_READ || operation == CLIENT_DISK || operation == CLIENT_STATE || operation == CLIENT_DISCARD) {
         char hash[65];
         digest(reply.body.data, reply.body.size, hash);
         char *resolved = binary_read_string(reply.metadata, 48, get_u32(reply.metadata.data + 32), PATH_MAX - 1);
@@ -225,8 +225,14 @@ Bytes dispatch_binary(Bytes input, const char *method) {
             fail("invalid UTF-8 file or helper read response");
         if (!failure[0] && !draft) draft = draft_path(target, user, resolved);
         if (revision) snprintf(disk_revision, sizeof(disk_revision), "%s", revision);
+        if (operation == CLIENT_DISCARD && !failure[0]) {
+            if (strcmp(disk_revision, request.revision)) {
+                flags |= 4; fail("The saved file changed again. Review changes before discarding your draft.");
+            } else if (unlink(draft) && errno != ENOENT) fail("could not discard shared draft: %s", strerror(errno));
+            else { snprintf(state_token, sizeof(state_token), "missing:%s", disk_revision); type = state_token; }
+        }
         free(resolved); free(revision);
-        if (draft && operation != CLIENT_DISK) restore_draft(draft, &reply, &flags);
+        if (draft && operation != CLIENT_DISK && operation != CLIENT_DISCARD) restore_draft(draft, &reply, &flags);
         if (draft && operation == CLIENT_STATE && draft_revision(draft, token)) {
             snprintf(state_token, sizeof(state_token), "%s:%s", token, disk_revision); type = state_token;
         }

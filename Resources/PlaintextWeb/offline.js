@@ -198,6 +198,21 @@ const PlaintextDrafts = (() => {
             }
             this.notify();
         }
+        async discardConflict(revision, draftRevision) {
+            const {version, path} = this;
+            this.stop();
+            try {
+                if (this.running) await this.running;
+                if (this.version !== version || this.path !== path) throw Error('Your draft changed. Review it again before discarding.');
+                const saved = await this.api('discard', {path, revision, draftRevision}, this);
+                if (this.version !== version || this.path !== path) throw Error('Your draft changed. Review it again before discarding.');
+                this.contents = saved.contents; this.revision = saved.revision; this.draftRevision = saved.draftRevision;
+                this.conflict = false; this.dirty = false; this.pendingSave = null; this.networkError = '';
+                this.version++; this.remoteVersion = this.version; this.updatedAt = Date.now();
+                this.notify();
+                return await this.persist();
+            } finally { this.resume(); }
+        }
         async resolveConflict(revision, draftRevision) {
             this.revision = revision; this.draftRevision = draftRevision; this.conflict = false; this.pendingSave = null;
             return this.requestSave();
@@ -253,6 +268,87 @@ const PlaintextDrafts = (() => {
             this.controller?.abort();
         }
     }
-    return {Store, Document, Notifications, snapshot};
+    class ShellUpdates {
+        constructor({workers, prepare, release, reload, visible = () => true,
+            schedule = (fn, delay) => setTimeout(fn, delay), cancel = timer => clearTimeout(timer), now = () => Date.now()}) {
+            Object.assign(this, {workers, prepare, release, reload, visible, schedule, cancel, now});
+            this.controller = workers.controller;
+            this.lastCheck = -Infinity;
+            workers.addEventListener('message', event => void this.message(event));
+            workers.addEventListener('controllerchange', () => {
+                const previous = this.controller;
+                this.controller = workers.controller;
+                if (previous && this.controller && previous !== this.controller) {
+                    this.needsReload = true;
+                    void this.finish();
+                }
+            });
+        }
+        async start() {
+            try {
+                this.registration = await this.workers.register('/sw.js', {scope:'/'});
+                const observe = () => {
+                    const worker = this.registration.installing;
+                    worker?.addEventListener('statechange', () => this.requestActivation());
+                    this.requestActivation();
+                };
+                this.registration.addEventListener('updatefound', observe);
+                observe();
+                this.check();
+            } catch {}
+        }
+        check() {
+            if (this.needsReload) void this.finish();
+            this.requestActivation();
+            if (!this.registration || this.now() - this.lastCheck < 60000) return;
+            this.lastCheck = this.now();
+            void this.registration.update().catch(() => {});
+        }
+        requestActivation() {
+            this.cancel(this.retry);
+            if (!this.registration?.waiting || !this.visible() || this.needsReload) return;
+            this.registration.waiting.postMessage({type:'plaintext-update-request'});
+            this.retry = this.schedule(() => this.requestActivation(), 15000);
+        }
+        async message(event) {
+            const {type, token} = event.data || {};
+            if (type === 'plaintext-update-abort' && token === this.token) {
+                this.unlock();
+                return;
+            }
+            if (type !== 'plaintext-update-prepare' || !event.ports[0] ||
+                event.source !== this.registration?.waiting || this.token || this.needsReload) return;
+            this.token = token;
+            this.lease = this.schedule(() => this.unlock(), 10000);
+            let ready = false;
+            try { ready = await this.prepare(); } catch {}
+            ready = ready && this.token === token;
+            event.ports[0].postMessage({ready});
+            event.ports[0].close();
+            if (!ready && this.token === token) this.unlock();
+        }
+        unlock() {
+            this.cancel(this.lease);
+            this.token = null;
+            this.release();
+        }
+        async finish() {
+            if (this.finishing || this.reloaded) return;
+            this.finishing = true;
+            try {
+                if (await this.prepare()) {
+                    this.reloaded = true;
+                    this.cancel(this.lease); this.cancel(this.retry);
+                    this.reload();
+                    return;
+                }
+            } catch {}
+            finally { this.finishing = false; }
+            this.unlock();
+            this.cancel(this.retry);
+            this.retry = this.schedule(() => void this.finish(), 2000);
+        }
+    }
+    return {Store, Document, Notifications, ShellUpdates, snapshot};
 })();
 if (typeof module !== 'undefined') module.exports = PlaintextDrafts;

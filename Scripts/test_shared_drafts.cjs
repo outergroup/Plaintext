@@ -80,13 +80,31 @@ async function until(condition) {
         const copy=path.join(directory,'copy');await a.doc.saveCopy(copy);finishPublish();await oldPublish;await a.doc.sync();
         assert.equal(fs.readFileSync(copy,'utf8'),'copy while publishing');
         assert.equal((await api('state',{path:file})).contents,'copy while publishing');
+        const discardFile=path.join(directory,'discard');fs.writeFileSync(discardFile,'saved version');
+        const base=await api('state',{path:discardFile});
+        const published=await api('publish',{path:discardFile,contents:'shared draft',revision:base.revision,draftRevision:base.draftRevision});
+        await assert.rejects(api('discard',{path:discardFile,revision:base.revision,draftRevision:'missing'}),error=>error.conflict);
+        assert.equal((await api('state',{path:discardFile})).contents,'shared draft');
+        fs.writeFileSync(discardFile,'new saved version');
+        await assert.rejects(api('discard',{path:discardFile,revision:base.revision,draftRevision:published.draftRevision}),error=>error.conflict);
+        const latest=await api('disk',{path:discardFile});const beforeDiscard=fs.statSync(discardFile).mtimeMs;
+        const discardedRecords=[];
+        const discarded=new Document({...base,contents:'my conflicting draft',dirty:true,conflict:true,pendingSave:{contents:'my conflicting draft'}},
+            {api,store:{put:async record=>discardedRecords.push(record)},schedule:()=>1,cancel:()=>{}});
+        docs.push(discarded);
+        await discarded.discardConflict(latest.revision,published.draftRevision);
+        assert.equal(discarded.contents,'new saved version');assert(!discarded.dirty&&!discarded.conflict&&!discarded.pendingSave);
+        assert.equal(discardedRecords.at(-1).contents,'new saved version');
+        const afterDiscard=await api('state',{path:discardFile});
+        assert.equal(afterDiscard.contents,'new saved version');assert(!afterDiscard.dirty);assert.equal(afterDiscard.draftRevision,'missing');
+        assert.equal(fs.statSync(discardFile).mtimeMs,beforeDiscard);
         const largeFile=path.join(directory,'large');fs.writeFileSync(largeFile,'');
         const empty=await api('state',{path:largeFile});
         const large='x'.repeat(4*1024*1024);
         const largeDraft=await api('publish',{path:largeFile,contents:large,revision:empty.revision,draftRevision:empty.draftRevision});
         const largeState=await api('state',{path:largeFile});
         assert.equal(largeState.contents.length,large.length);assert.equal(largeState.draftRevision,largeDraft.draftRevision);
-        console.log('PASS real clients and notification streams: shared Edited state, bidirectional drafts, save clears Edited, conflicts preserve both drafts, explicit resolution, offline catch-up, publish/save race, lost acknowledgment, Save a Copy');
+        console.log('PASS real clients and notification streams: shared Edited state, bidirectional drafts, save clears Edited, conflicts preserve both drafts, explicit resolution, revision-checked discard without rewriting the file, offline catch-up, publish/save race, lost acknowledgment, Save a Copy');
     } finally {
         streams.forEach(stream=>stream.stop());docs.forEach(doc=>doc.stop());backend.kill();
         await new Promise(resolve=>backend.once('exit',resolve));fs.rmSync(directory,{recursive:true,force:true});

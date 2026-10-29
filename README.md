@@ -116,14 +116,22 @@ Where supported, a service worker opportunistically caches the editor shell for
 offline reload after the first successful online visit. Unsupported browsers and
 cache-registration failures do not produce user-facing capability warnings.
 Actual file-loading, draft-storage, and save failures are still reported. Packaging hashes the shell assets to version each
-cache; a new shell activates after existing editor pages close. Browser storage
+cache. Updated shells activate after a foreground editor pauses and checkpoints
+its drafts locally. Each editor then checkpoints before its own automatic reload,
+restoring its document, selection, scroll position, and Open panel. Background tabs
+may be suspended by the browser; they update when they can run again rather than
+blocking the foreground editor. Typing, composition, modal dialogs, and failed
+checkpoints defer that editor's reload. Update checks run on opening, focus,
+visibility, and reconnect; server synchronization is not required for the local
+checkpoint. Older pages without auto-update support may need a close and reopen
+to receive their first update. Browser storage
 belongs to the browser profile and origin: clearing site data removes drafts,
 and browser eviction or device failure can still lose them. Storage failures are
 shown prominently; navigation warns when the latest edits are not persisted.
 This recovery applies to the HTML editor, not the native outerframe editor.
 
 Focused checks: `node Scripts/test_shared_drafts.cjs <PlaintextBackend>`,
-`node Scripts/test_live_refresh.cjs`,
+`node Scripts/test_live_refresh.cjs`, `node Scripts/test_shell_updates.cjs`,
 `python3 Scripts/test_file_notifications.py <PlaintextBackend> <PlaintextHelper>`,
 `node Scripts/test_local_drafts.cjs`,
 `node Scripts/test_single_document.cjs`, `node Scripts/test_web_environments.cjs`,

@@ -3,17 +3,17 @@ const fs=require('node:fs');
 const vm=require('node:vm');
 const source=fs.readFileSync(require('node:path').join(__dirname,'../Resources/PlaintextWeb/app.js'),'utf8');
 const state={active:null,target:'host',replacing:false};
-const documents=new Map(),stored=new Map(),entries=[];
+const documents=new Map(),stored=new Map(),entries=[],messages=[];
 const elements=new Map();
 let message='',created=0,reads=0,delayRead=null;
 const location={search:'',pathname:'/'};
 const updateURL=url=>{location.search=new URL(url,'https://example.test').search;};
 const context=vm.createContext({
- URLSearchParams,Promise,state,documents,location,storageUser:'test',
+ URLSearchParams,Promise,state,documents,location,updateFrozen:false,storageUser:'test',
  history:{pushState:(_,__,url)=>{entries.push(url);updateURL(url);},replaceState:(_,__,url)=>{if(entries.length)entries[entries.length-1]=url;updateURL(url);}},
  window:{addEventListener(){},scrollTo(){}},
  $:selector=>{if(!elements.has(selector))elements.set(selector,{open:false,value:'',blur(){},close(){this.open=false;}});return elements.get(selector);},
- renderDocument(){},status:text=>{message=text;},updateFileNotifications(){},renderRecentFiles:async()=>{},
+ restoreRecentFile(){},showStartOverlay(){},renderDocument(){},status:text=>{message=text;messages.push(text);},updateFileNotifications(){},renderRecentFiles:async()=>{},
  localRecords:async()=>Array.from(stored.values()),
  api:async(_,values)=>{reads++;if(delayRead)await delayRead;return {path:values.path,contents:'File contents',revision:'1'};},
  createDocument:async record=>{
@@ -38,10 +38,13 @@ vm.runInContext(section('function documentURL(','function showPath(')+section('l
  assert.equal(reads,1);assert.equal(created,1);
  await go(null,'replace');await go({...route,draftID:original.id},'replace');assert.equal(state.active,original);
  await context.newDocument();const first=state.active;
- await go(null,'replace');await context.newDocument();assert.notEqual(state.active.id,first.id);
+ await go(null,'replace');messages.length=0;
+ await context.newDocument();assert.notEqual(state.active.id,first.id);
+ assert.ok(!messages.includes('Opening…'),'Dismissing the start panel into a blank draft must not flash a loading status');
  let release;delayRead=new Promise(resolve=>{release=resolve;});
  const pending=go({path:'/slow.txt',target:'host'});
  await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(message,'Opening…');
  const latest=go(null,'replace');release();await pending;await latest;
  assert.equal(state.active,null);assert.equal(location.search,'');assert.equal(state.replacing,false);
  delayRead=null;

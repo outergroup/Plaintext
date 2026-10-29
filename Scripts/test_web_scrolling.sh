@@ -15,6 +15,8 @@ root, outerloop, output = map(Path, sys.argv[1:])
 web = root / 'Resources/PlaintextWeb'
 source = (web / 'index.html').read_text()
 markup = source[source.index('<main>'):source.index('</main>') + 7]
+overlay_start = source.index('<dialog id="start-overlay"')
+markup += source[overlay_start:source.index('</dialog>', overlay_start) + 9]
 contents = ''.join(f'{i:03d} A long line for keyboard, scrolling, and wrapping checks.\n' for i in range(100))
 markup = markup.replace('aria-label="Text editor"></textarea>', 'aria-label="Text editor">' + html.escape(contents) + '</textarea>')
 markup = markup.replace('Open a file or create a new document', '')
