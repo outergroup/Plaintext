@@ -11,7 +11,7 @@ SOURCE_BUNDLE="$1"
 DESTINATION_DIR="$2"
 ARCHIVE_STEM="${3:-PlaintextContent.bundle}"
 AA_TOOL="${AA_TOOL:-aa}"
-STRIP_TOOL="${STRIP_TOOL:-strip}"
+SYMBOLS_DIR="${SYMBOLS_DIR:-$HOME/Library/Developer/PlaintextSymbols}"
 
 if [[ ! -d "$SOURCE_BUNDLE" ]]; then
     echo "error: source bundle not found at $SOURCE_BUNDLE" >&2
@@ -28,10 +28,6 @@ if ! command -v lipo >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! command -v "$STRIP_TOOL" >/dev/null 2>&1; then
-    echo "error: required tool '$STRIP_TOOL' was not found on PATH" >&2
-    exit 1
-fi
 
 bundle_executable_name() {
     local bundle_path="$1"
@@ -95,7 +91,6 @@ archive_platform_bundle() {
         /usr/bin/codesign --remove-signature "$executable_path" >/dev/null 2>&1 || true
     fi
 
-    "$STRIP_TOOL" -x "$executable_path"
 
     if command -v /usr/bin/codesign >/dev/null 2>&1; then
         /usr/bin/codesign --force --sign - --timestamp=none "$temp_bundle" >/dev/null
@@ -110,6 +105,16 @@ archive_platform_bundle() {
     rm -rf "$temp_root"
     echo "Archived $platform bundle at $archive_path"
 }
+
+SOURCE_DSYM="${SOURCE_BUNDLE}.dSYM"
+if [[ ! -d "$SOURCE_DSYM" ]]; then
+    echo "error: matching dSYM not found at $SOURCE_DSYM" >&2
+    exit 1
+fi
+while read -r uuid; do
+    mkdir -p "$SYMBOLS_DIR/$uuid"
+    ditto "$SOURCE_DSYM" "$SYMBOLS_DIR/$uuid/$(basename "$SOURCE_DSYM")"
+done < <(dwarfdump --uuid "$SOURCE_DSYM" | awk '/UUID:/ {print $2}')
 
 mkdir -p "$DESTINATION_DIR"
 archive_platform_bundle "$SOURCE_BUNDLE" "$DESTINATION_DIR" "macos-arm" "arm64" "$DESTINATION_DIR/$ARCHIVE_STEM.macos-arm.aar"

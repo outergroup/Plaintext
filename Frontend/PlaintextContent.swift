@@ -228,6 +228,8 @@ private final class TextFragmentLayer: CALayer {
         fatalError("init(coder:) has not been implemented")
     }
 
+    override func action(forKey event: String) -> CAAction? { nil }
+
     override func draw(in context: CGContext) {
         guard let textLayoutFragment else { return }
         context.saveGState()
@@ -307,8 +309,12 @@ private final class SymbolImageLayer: CALayer {
 
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
-        tintColor.set()
+        context.beginTransparencyLayer(auxiliaryInfo: nil)
         configuredImage.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1)
+        context.setBlendMode(.sourceIn)
+        context.setFillColor(tintColor.cgColor)
+        context.fill(iconRect)
+        context.endTransparencyLayer()
         NSGraphicsContext.restoreGraphicsState()
     }
 }
@@ -617,7 +623,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                           charactersIgnoringModifiers: charactersIgnoringModifiers,
                           modifierFlags: modifierFlags)
         case .magnification(_, let amount, let point, _):
-            if pendingFilePicker == nil && editorClipLayer.frame.contains(point) { setTextScale(preferences.textScale * (1 + amount)) }
+            if pendingFilePicker == nil && editorClipLayer.frame.contains(point) { scheduleTextMagnification(amount) }
         case .scrollWheelEvent(let point, let delta, _, _, _, let precise):
             let rootPoint = rootLayer.convert(point, to: rootLayer)
             if pendingFilePicker != nil, pickerMode == "conflict", filePickerPanelFrame.contains(rootPoint) {
@@ -985,6 +991,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         editorClipLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
         pathLayer.foregroundColor = resolvedCGColor(.labelColor)
         statusLayer.foregroundColor = resolvedCGColor(isSaving || isLoading ? .secondaryLabelColor : statusColor())
+        openIconLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
         pathChevronLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
         pathPromptCursorLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
         editorCaretLayer.backgroundColor = resolvedCGColor(.textColor)
@@ -1071,7 +1078,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             openControlFrame = CGRect(x: 10, y: 7, width: 38, height: 44)
             openButtonLayer.frame = openControlFrame.insetBy(dx: 0, dy: 4)
             openIconLayer.frame = openControlFrame.insetBy(dx: 6, dy: 9)
-            openIconLayer.tintColor = .labelColor
+            openIconLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
             menuControlFrame = CGRect(x: max(0, currentSize.width - 52), y: 7, width: 42, height: 44)
             saveControlFrame = CGRect(x: menuControlFrame.minX - 68, y: 7, width: 64, height: 44)
             let dirty = document?.draft.dirty == true || document?.draft.pending != nil
@@ -1317,7 +1324,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         filePickerListLayer.cornerRadius = 6
         filePickerListLayer.borderWidth = 1
         filePickerListLayer.borderColor = resolvedCGColor(.separatorColor)
-        filePickerListLayer.backgroundColor = resolvedCGColor(NSColor.controlBackgroundColor.withAlphaComponent(0.35))
+        filePickerListLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
         panel.addSublayer(filePickerListLayer)
 
         if filePickerRowsContentLayer.superlayer !== filePickerListLayer {
@@ -1452,7 +1459,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if let icon = row.sublayers?[0] as? SymbolImageLayer {
             icon.symbolName = entry.isDirectory ? "folder" : "doc"
             icon.accessibilityTitle = entry.isDirectory ? "Folder" : "File"
-            icon.tintColor = isSelected ? .white : .secondaryLabelColor
+            icon.tintColor = resolvedNSColor(isSelected ? .white : .secondaryLabelColor)
             icon.symbolPointSize = 15
             icon.maxSymbolSize = CGSize(width: 16, height: 16)
             icon.frame = CGRect(x: 12, y: 6, width: 16, height: 16)
@@ -2691,20 +2698,23 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         NSFont.monospacedSystemFont(ofSize: 15 * preferences.textScale, weight: .regular)
     }
 
-    private func updateTextContent(force: Bool = false) {
+    private func updateTextContent(force: Bool = false, keepingCursorVisible: Bool = false) {
         let displayText = text.isEmpty ? " " : text
-        guard force || displayText != attributedText.string else { return }
+        let textChanged = displayText != attributedText.string
+        guard force || textChanged else { return }
 
         withoutImplicitAnimations {
             generation += 1
-            naturalTextWidth = text.components(separatedBy: .newlines).reduce(CGFloat(1)) { max($0, ($1 as NSString).size(withAttributes: [.font: textFont()]).width + 4) }
+            if !preferences.wrapLines {
+                naturalTextWidth = text.components(separatedBy: .newlines).reduce(CGFloat(1)) { max($0, ($1 as NSString).size(withAttributes: [.font: textFont()]).width + 4) }
+            }
             contentHeightCache = nil
             visualLineCache = nil
             fragmentCoverage = nil
             clearTextFragmentLayers()
 
             let paragraph = NSMutableParagraphStyle()
-            paragraph.lineBreakMode = .byCharWrapping
+            paragraph.lineBreakMode = .byWordWrapping
             paragraph.lineSpacing = 2
             let updatedText = NSMutableAttributedString(string: displayText,
                                                         attributes: [
@@ -2721,11 +2731,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             }
             attributedText = updatedText
             contentStorage.attributedString = attributedText
-            textContainer.size = CGSize(width: max(textLayoutWidth, 1), height: max(contentHeight() - textInsetY * 2, editorClipLayer.bounds.height))
             cursorOffset = clampedOffset(cursorOffset)
             selectionAnchor = selectionAnchor.map(clampedOffset)
-            recomputeFindMatches(selectNearestMatch: false)
-            layoutText()
+            if textChanged { recomputeFindMatches(selectNearestMatch: false) }
+            layoutText(keepingCursorVisible: keepingCursorVisible)
             updateEditingCapabilities()
         }
         notifyAccessibilityLayoutChanged()
@@ -2736,9 +2745,44 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         return preferences.wrapLines ? viewport : max(viewport, naturalTextWidth)
     }
 
-    private func setTextScale(_ value: CGFloat) {
-        preferences.textScale = min(3, max(0.25, value))
-        savePreferences(); updateTextContent(force: true); layout(); ensureCursorVisible(); updateViewport()
+    private var pendingTextScale: CGFloat?
+    private var textScaleUpdateScheduled = false
+    private var textScaleSaveTask: Task<Void, Never>?
+
+    private func scheduleTextMagnification(_ amount: CGFloat) {
+        guard amount.isFinite else { return }
+        let scale = pendingTextScale ?? preferences.textScale
+        pendingTextScale = min(3, max(0.25, scale * (1 + amount)))
+        guard !textScaleUpdateScheduled else { return }
+        textScaleUpdateScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60.0) { [weak self] in
+            guard let self else { return }
+            self.textScaleUpdateScheduled = false
+            guard let scale = self.pendingTextScale else { return }
+            self.pendingTextScale = nil
+            guard self.pendingFilePicker == nil else { return }
+            self.setTextScale(scale, deferSaving: true)
+        }
+    }
+
+    private func setTextScale(_ value: CGFloat, deferSaving: Bool = false) {
+        pendingTextScale = nil
+        guard value.isFinite else { return }
+        let scale = min(3, max(0.25, value))
+        guard scale != preferences.textScale else { return }
+        preferences.textScale = scale
+        textScaleSaveTask?.cancel()
+        textScaleSaveTask = nil
+        if deferSaving {
+            textScaleSaveTask = Task { @MainActor [weak self] in
+                do { try await Task.sleep(for: .milliseconds(250)) }
+                catch { return }
+                self?.savePreferences()
+            }
+        } else {
+            savePreferences()
+        }
+        updateTextContent(force: true, keepingCursorVisible: true)
     }
 
     private func savePreferences() {
@@ -2760,7 +2804,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         preferences.recent = Array(preferences.recent.prefix(30)); savePreferences()
     }
 
-    private func layoutText() {
+    private func layoutText(keepingCursorVisible: Bool = false) {
         guard editorClipLayer.bounds.width > 0, editorClipLayer.bounds.height > 0 else { return }
         let textWidth = editorTextWidth()
         if abs(textWidth - textLayoutWidth) > 0.5 {
@@ -2772,6 +2816,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         textContainer.size = CGSize(width: textWidth,
                                     height: max(contentHeight() - textInsetY * 2, editorClipLayer.bounds.height))
         scrollOffset = clampedScrollOffset(scrollOffset)
+        if keepingCursorVisible { ensureCursorVisible() }
         updateViewport()
         updateSelectionLayers()
         updateCursor()
