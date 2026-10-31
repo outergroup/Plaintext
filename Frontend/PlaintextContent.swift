@@ -1192,8 +1192,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                  color: emphasized ? .white : .labelColor,
                                  alignment: .center)
         text.string = title
-        text.frame = CGRect(x: 6, y: 7, width: 58, height: 18)
-        text.autoresizingMask = [.layerWidthSizable]
+        let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        let lineHeight = ceil(font.ascender - font.descender)
+        text.frame = CGRect(x: 6, y: (layer.bounds.height - lineHeight) / 2, width: 58, height: lineHeight)
+        text.autoresizingMask = [.layerWidthSizable, .layerMinYMargin, .layerMaxYMargin]
         layer.addSublayer(text)
         return layer
     }
@@ -1216,6 +1218,24 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
     }
 
+    private func popoverOutlinePath(size: CGSize, arrowX: CGFloat) -> CGPath {
+        let rect = CGRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5)
+        let radius: CGFloat = 12
+        let arrowHalfWidth: CGFloat = 8
+        let arrowHeight: CGFloat = 8
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: rect.minX + radius, y: rect.maxY))
+        path.addLine(to: CGPoint(x: arrowX - arrowHalfWidth, y: rect.maxY))
+        path.addLine(to: CGPoint(x: arrowX, y: rect.maxY + arrowHeight))
+        path.addLine(to: CGPoint(x: arrowX + arrowHalfWidth, y: rect.maxY))
+        path.addArc(tangent1End: CGPoint(x: rect.maxX, y: rect.maxY), tangent2End: CGPoint(x: rect.maxX, y: rect.minY), radius: radius)
+        path.addArc(tangent1End: CGPoint(x: rect.maxX, y: rect.minY), tangent2End: CGPoint(x: rect.minX, y: rect.minY), radius: radius)
+        path.addArc(tangent1End: CGPoint(x: rect.minX, y: rect.minY), tangent2End: CGPoint(x: rect.minX, y: rect.maxY), radius: radius)
+        path.addArc(tangent1End: CGPoint(x: rect.minX, y: rect.maxY), tangent2End: CGPoint(x: rect.maxX, y: rect.maxY), radius: radius)
+        path.closeSubpath()
+        return path
+    }
+
     private func renderFilePickerContents(_ picker: PendingFilePicker) {
         filePickerOverlayLayer.isHidden = false
         filePickerOverlayLayer.frame = rootLayer.bounds
@@ -1235,16 +1255,17 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
         let panel = CALayer()
         panel.frame = panelFrame
-        panel.cornerRadius = 12
+        let outlinePath = popoverOutlinePath(size: panelFrame.size, arrowX: max(24, min(panelWidth - 24, anchorX - panelFrame.minX)))
         panel.shadowColor = NSColor.black.cgColor; panel.shadowOpacity = 0.18; panel.shadowRadius = 14; panel.shadowOffset = CGSize(width: 0, height: -5)
-        panel.borderWidth = 1
-        panel.borderColor = resolvedCGColor(.separatorColor)
-        panel.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        panel.shadowPath = outlinePath
         filePickerOverlayLayer.addSublayer(panel)
-        let arrow = CAShapeLayer(), triangle = CGMutablePath()
-        let tip = max(18, min(panelWidth - 18, anchorX - panelFrame.minX))
-        triangle.move(to: CGPoint(x: tip - 8, y: panelHeight - 1)); triangle.addLine(to: CGPoint(x: tip, y: panelHeight + 8)); triangle.addLine(to: CGPoint(x: tip + 8, y: panelHeight - 1))
-        arrow.path = triangle; arrow.fillColor = resolvedCGColor(.windowBackgroundColor); arrow.strokeColor = resolvedCGColor(.separatorColor); arrow.lineWidth = 1; panel.addSublayer(arrow)
+        let outline = CAShapeLayer()
+        outline.frame = panel.bounds
+        outline.path = outlinePath
+        outline.fillColor = resolvedCGColor(.windowBackgroundColor)
+        outline.strokeColor = resolvedCGColor(.separatorColor)
+        outline.lineWidth = 1
+        panel.addSublayer(outline)
         recentTabFrame = CGRect(x: 16, y: panelHeight - 48, width: 72, height: 32).offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         openTabFrame = CGRect(x: 90, y: panelHeight - 48, width: 66, height: 32).offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
         newFileFrame = CGRect(x: panelWidth - 136, y: panelHeight - 48, width: 120, height: 32).offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
@@ -1692,6 +1713,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if ["move", "save", "copy"].contains(pickerMode) { filePickerNameInputController.focus() } else { filePickerNameInputController.blur() }
         resetFilePickerTypeahead()
         renderFilePicker()
+        updateCursor()
         fadeInFilePickerOverlayIfNeeded(shouldAnimate)
         if pickerMode != "recent" && pickerMode != "conflict" { fetchFilePickerDirectory(path: directory, clearName: false) }
     }
@@ -1740,6 +1762,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         filePickerNameInputController.blur()
         filePickerNameInputController.setText("")
         resetFilePickerTypeahead()
+        updateCursor()
         fadeOutAndHideFilePickerOverlay()
     }
 
@@ -3152,6 +3175,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 editorCaretLayer.isHidden = true
                 stopBlinkingCaret(editorCaretLayer)
                 stopBlinkingCaret(pathPromptCursorLayer)
+                outerframeHost.sendTextInputGeometryUpdate(nil)
+            } else if pendingFilePicker != nil {
+                editorCaretLayer.isHidden = true
+                stopBlinkingCaret(editorCaretLayer)
                 outerframeHost.sendTextInputGeometryUpdate(nil)
             } else if viewIsFocused && windowIsActive && selectionRange == nil {
                 let rect = cursorRect(for: cursorOffset)
