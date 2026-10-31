@@ -572,9 +572,11 @@ document.addEventListener('keydown',event=>{
  else{const text=typeaheadText(event.key);if(text){event.preventDefault();handleTypeahead(text);}}
 });
 function pickerBreadcrumbs(path){
- if(!path.startsWith('/'))return [{name:path,path}];
- const segments=[{name:'/',path:'/'}];let parent='';
- for(const name of path.split('/').filter(Boolean)){parent+='/'+name;segments.push({name,path:parent});}
+ const drive=/^[A-Za-z]:\//.exec(path);
+ if(!path.startsWith('/')&&!drive)return [{name:path,path}];
+ const share=/^\/\/[^/]+\/[^/]+\/?/.exec(path);
+ const root=drive?drive[0]:share?share[0]:'/';const segments=[{name:root,path:root}];let parent=root.replace(/\/$/,'');
+ for(const name of path.slice(root.length).split('/').filter(Boolean)){parent+='/'+name;segments.push({name,path:parent});}
  return segments;
 }
 function renderPickerBreadcrumbs(path,restoreFocus){

@@ -10,22 +10,28 @@ enum FilePickerBreadcrumbBar {
     static let height: CGFloat = 34
 
     static func segments(for path: String) -> [FilePickerBreadcrumbSegment] {
-        let normalizedPath = path.isEmpty ? "/" : path
-        guard normalizedPath.hasPrefix("/") else {
-            return [FilePickerBreadcrumbSegment(title: normalizedPath, path: normalizedPath)]
+        let path = path.replacingOccurrences(of: "\\", with: "/")
+        if path == "~" { return [FilePickerBreadcrumbSegment(title: "Home", path: "~")] }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        var root = "/", remaining = components
+        if let drive = components.first, drive.count == 2, drive.last == ":" {
+            root = drive + "/"
+            remaining.removeFirst()
+        } else if path.hasPrefix("//"), components.count >= 2 {
+            root = "//" + components[0] + "/" + components[1] + "/"
+            remaining.removeFirst(2)
+        } else if !path.hasPrefix("/") {
+            return [FilePickerBreadcrumbSegment(title: path, path: path)]
         }
-        if normalizedPath == "/" {
-            return [FilePickerBreadcrumbSegment(title: "/", path: "/")]
-        }
-
-        var segments = [FilePickerBreadcrumbSegment(title: "/", path: "/")]
-        var accumulatedPath = ""
-        for component in normalizedPath.split(separator: "/", omittingEmptySubsequences: true) {
-            let title = String(component)
-            accumulatedPath += "/" + title
-            segments.append(FilePickerBreadcrumbSegment(title: title, path: accumulatedPath))
+        var segments = [FilePickerBreadcrumbSegment(title: root, path: root)]
+        var accumulated = root
+        for component in remaining {
+            if !accumulated.hasSuffix("/") { accumulated += "/" }
+            accumulated += component
+            segments.append(FilePickerBreadcrumbSegment(title: component, path: accumulated))
         }
         return segments
+
     }
 
     static func render(path: String,

@@ -1814,7 +1814,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
 
         let path: String
-        if name.hasPrefix("/") || name.hasPrefix("~") {
+        if name.hasPrefix("/") || name.hasPrefix("~") || name.hasPrefix("\\\\") || name.range(of: "^[A-Za-z]:[/\\\\]", options: .regularExpression) != nil {
             path = name
         } else {
             path = (picker.directory as NSString).appendingPathComponent(name)
@@ -2492,7 +2492,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func normalizedPath(_ value: String, relativeTo basePath: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
-        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") {
+        if trimmed.hasPrefix("/") || trimmed.hasPrefix("~") || trimmed.hasPrefix("\\\\") || trimmed.range(of: "^[A-Za-z]:[/\\\\]", options: .regularExpression) != nil {
             return trimmed
         }
         let directory = (basePath as NSString).deletingLastPathComponent

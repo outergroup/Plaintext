@@ -213,3 +213,11 @@ Outer Loop lets WebKit manage viewport fitting and safe-area insets, including
 ordinary pages that do not opt into cover. The scrolling simulator test checks
 both landscape orientations, keyboard visibility, menu access, the default and
 cover viewport behaviors, and portrait keyboard animation stability.
+
+
+## Windows
+
+Windows host paths and Docker/WSLc container files use the same revision checks, shared drafts, save/move protocol and change notifications as the Unix backends.
+Build and packaging are integrated in `../Backends/Windows/build.ps1`; install the
+app through Outer Shell’s Add Apps experience. The package includes HTML content
+and macOS native outerframe bundles.

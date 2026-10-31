@@ -1,8 +1,16 @@
 #include "environment.h"
+#ifndef _WIN32
 #include <sys/file.h>
+#endif
 enum { CLIENT_HEADER = 72, CLIENT_RESPONSE = 48, DRAFT_HEADER = 32,
        CLIENT_TARGETS = 7, CLIENT_PREVIEW = 8, CLIENT_DRAFT = 9, CLIENT_DISK = 10, CLIENT_STATE = 11, CLIENT_PUBLISH = 12, CLIENT_COMMIT = 13, CLIENT_DISCARD = 14 };
 static char *draft_path(const char *target, const char *user, const char *path) {
+#ifdef _WIN32
+    char *local = win_folder(CSIDL_LOCAL_APPDATA);
+    char *root = local ? win_join(local, "OuterShell/plaintext-environments") : NULL;
+    free(local);
+    if (!root) { fail("Cannot resolve draft directory."); return NULL; }
+#else
     const char *state = getenv("XDG_STATE_HOME");
     char *root = NULL;
     if (state && *state) root = format("%s/outershell/plaintext-environments", state);
@@ -15,6 +23,7 @@ static char *draft_path(const char *target, const char *user, const char *path) 
         if (!home) { fail("cannot resolve draft directory"); return NULL; }
         root = format("%s/.local/state/outershell/plaintext-environments", home);
     }
+    #endif
     if (!mkdirs(root)) { free(root); return NULL; }
     Bytes key = {allocate(24), 24};
     bool ok = binary_string(&key, 0, target) && binary_string(&key, 8, user) &&
