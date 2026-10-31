@@ -1199,7 +1199,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         text.string = title
         let font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         let lineHeight = ceil(font.ascender - font.descender)
-        text.frame = CGRect(x: 6, y: (layer.bounds.height - lineHeight) / 2, width: 58, height: lineHeight)
+        let textTop = (layer.bounds.height + font.capHeight) / 2 - font.ascender
+        let textY = floor((layer.bounds.height - textTop - lineHeight) * text.contentsScale) / text.contentsScale
+        text.frame = CGRect(x: 6, y: textY, width: 58, height: lineHeight)
         text.autoresizingMask = [.layerWidthSizable, .layerMinYMargin, .layerMaxYMargin]
         layer.addSublayer(text)
         return layer
