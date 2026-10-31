@@ -551,6 +551,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         case .systemAppearanceUpdate(let nextAppearance):
             appearance = nextAppearance
             updateColors()
+            layout()
             updateTextContent(force: true)
         case .windowActiveUpdate(let isActive):
             if !isActive {
@@ -986,7 +987,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func updateColors() {
         backgroundLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
-        headerLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        headerLayer.backgroundColor = resolvedCGColor(chromeBackgroundColor)
         toolbarDividerLayer.backgroundColor = resolvedCGColor(.separatorColor)
         editorClipLayer.backgroundColor = resolvedCGColor(.textBackgroundColor)
         pathLayer.foregroundColor = resolvedCGColor(.labelColor)
@@ -995,7 +996,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         pathChevronLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
         pathPromptCursorLayer.backgroundColor = resolvedCGColor(.keyboardFocusIndicatorColor)
         editorCaretLayer.backgroundColor = resolvedCGColor(.textColor)
-        findBarLayer.backgroundColor = resolvedCGColor(.windowBackgroundColor)
+        findBarLayer.backgroundColor = resolvedCGColor(chromeBackgroundColor)
         findFieldLayer.backgroundColor = resolvedCGColor(.controlBackgroundColor)
         findFieldLayer.borderColor = resolvedCGColor(findInputController.isFocused ? .separatorColor : .separatorColor)
         findTextLayer.foregroundColor = resolvedCGColor(.labelColor)
@@ -1026,6 +1027,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         updateSelectionLayers(force: true)
         updateFindDisplay()
         renderFilePicker()
+    }
+
+    private var chromeBackgroundColor: NSColor {
+        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? .underPageBackgroundColor : .windowBackgroundColor
     }
 
     private func withEffectiveAppearance(_ body: () -> Void) {
@@ -1262,7 +1267,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let outline = CAShapeLayer()
         outline.frame = panel.bounds
         outline.path = outlinePath
-        outline.fillColor = resolvedCGColor(.windowBackgroundColor)
+        outline.fillColor = resolvedCGColor(chromeBackgroundColor)
         outline.strokeColor = resolvedCGColor(.separatorColor)
         outline.lineWidth = 1
         panel.addSublayer(outline)
