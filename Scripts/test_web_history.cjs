@@ -24,9 +24,19 @@ const context=vm.createContext({
  activate:doc=>{state.active?.setWatching(false);state.active=doc;state.target=doc.target;}
 });
 const section=(start,end)=>source.slice(source.indexOf(start),source.indexOf(end,source.indexOf(start)));
-vm.runInContext(section('function documentURL(','function showPath(')+section('let navigationVersion=','async function localRecords(')+section('async function resolveDocument(','function ask('),context);
+vm.runInContext(section('function documentURL(','function showPath(')+section('let navigationVersion=','async function localRecords(')+section('async function resolveDocument(','async function save('),context);
 (async()=>{
- const go=(route,mode='push')=>context.navigateRoute(route,mode);
+ const go=(route,mode)=>context.navigateRoute(route,mode);
+ for(const choose of [()=>context.load('/initial.txt'),()=>context.newDocument()]){
+  state.active=null;entries.length=0;entries.push('/outer-shell','/');updateURL('/');
+  await choose();
+  assert.equal(entries.length,2,'The startup choice must replace the initial entry');
+  assert.equal(entries[0],'/outer-shell');
+  assert.ok(entries[1].includes('draft='));
+  await context.newDocument();
+  assert.equal(entries.length,3,'Later choices must add a history entry');
+ }
+ state.active=null;documents.clear();stored.clear();entries.length=0;created=0;reads=0;
  await go(null,'replace');
  const route={path:'/example.txt',target:'host'};
  await go(route);const original=state.active;

@@ -1556,6 +1556,7 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
+    environment_set_web_root(g_web_root[0] ? g_web_root : "web");
 
     int listen_fd;
     if (requested_port >= 0) {

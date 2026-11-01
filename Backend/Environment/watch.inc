@@ -61,14 +61,14 @@ EnvironmentWatch *environment_watch_open(const void *body, size_t length) {
     for (size_t i = 1; i < snapshot.target_count; i++) {
         const EnvironmentTarget *entry = &snapshot.targets[i];
         if (strcmp(entry->id, target) || strcmp(entry->state, "running")) continue;
-        char *args[18];
-        size_t count = app_runtime_exec(app_runtime(entry->runtime), entry->executable, entry->socket,
-                                       user, entry->container, HELPER_PATH, args, 18);
-        if (!count) break;
-        args[count - 1] = "watch"; args[count++] = path; args[count] = NULL;
+        char *args[32];
+        const char *watch_args[] = {"watch", path, NULL};
+        size_t count = app_runtime_exec_prefix(app_runtime(entry->runtime), entry->executable, entry->socket,
+                                               user, entry->container, args, 32);
+        if (!count || !helper_command(args, count, 32, watch_args)) break;
         char **command_args = args;
 #ifdef __APPLE__
-        char *owner_args[32], owner_id[32], owner_user[32];
+        char *owner_args[48], owner_id[32], owner_user[32];
         if (geteuid() == 0 && entry->owner_uid != 0 && app_runtime(entry->runtime) == APP_RUNTIME_APPLE) {
             snprintf(owner_id, sizeof(owner_id), "%u", (unsigned)entry->owner_uid);
             snprintf(owner_user, sizeof(owner_user), "#%u", (unsigned)entry->owner_uid);
@@ -80,7 +80,7 @@ EnvironmentWatch *environment_watch_open(const void *body, size_t length) {
         }
 #endif
         watch->remote = true;
-        started = spawn(command_args, &watch->child);
+        started = spawn(command_args, &watch->child) && helper_handshake(&watch->child);
         break;
     }
     environment_snapshot_free(&snapshot);

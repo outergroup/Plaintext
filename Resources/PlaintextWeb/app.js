@@ -336,7 +336,7 @@ function currentRoute(){
  const parameters=new URLSearchParams(location.search);
  return parameters.has('file')||parameters.has('draft')?{path:parameters.get('file')||'',target:parameters.get('target')||'host',draftID:parameters.get('draft')}:null;
 }
-function navigateRoute(route,mode='push'){
+function navigateRoute(route,mode=state.active?'push':'replace'){
  if(updateFrozen)return Promise.resolve();
  const version=++navigationVersion;
  navigationTask=navigationTask.then(async()=>{

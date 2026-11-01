@@ -32,7 +32,6 @@ footer{position:sticky;top:var(--toolbar-height);z-index:19;flex:none}footer:emp
  #dirty{display:none}
  .document-actions{display:flex;gap:4px;margin:0;min-width:0;position:relative}
  #document-menu{position:static}
- .document-actions #save{background:transparent;border:0;border-radius:6px;color:var(--accent)}
  #document-menu summary{display:flex;align-items:center;justify-content:center;width:44px;height:44px;padding:0;letter-spacing:1px}
  .document-menu{min-width:min(240px,calc(100vw - 24px));max-width:calc(100vw - 24px);max-height:calc(100svh - 76px);overflow:auto}
  .document-menu button{min-height:44px;white-space:normal}
@@ -43,7 +42,7 @@ footer{position:sticky;top:var(--toolbar-height);z-index:19;flex:none}footer:emp
 
 #document-info{display:none}
 #document-info svg{width:22px;height:22px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
-.document-actions #save{display:flex;align-items:center;justify-content:center;min-width:64px;height:44px;padding:0 10px}
+.document-actions #save{display:flex;align-items:center;justify-content:center;min-width:64px;height:44px;padding:0 10px;background:transparent;border:0;border-radius:6px;color:var(--accent)}
 .document-actions #save[hidden]{display:none}
 :root{--safe-left:env(safe-area-inset-left,0px);--safe-right:env(safe-area-inset-right,0px)}
 main{padding-left:var(--safe-left);padding-right:var(--safe-right)}

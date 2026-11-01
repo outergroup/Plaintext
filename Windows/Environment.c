@@ -1,6 +1,7 @@
 #define APP_PLAINTEXT 1
 #define HELPER_CAPABILITIES 15u
-#define HELPER_PATH "/usr/local/bin/outer-plaintext-helper"
+#define HELPER_APP_ID "org.outershell.Plaintext"
+#define HELPER_NAME "outer-plaintext-helper"
 #define APP_FRAME_MAGIC "PLH2"
 #include "AppEnvironment.h"
 #include "../Helper/binary.c"

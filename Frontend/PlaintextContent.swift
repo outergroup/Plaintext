@@ -388,6 +388,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var naturalTextWidth: CGFloat = 0
     private var shouldPushHistory = false
     private var showStartupPopover = false
+    private var isStartupPicker = false
     private var reviewedShared: PlaintextReply?
     private var pickerTarget = "host"
     private var targets: [(id: String, name: String, running: Bool)] = []
@@ -1761,7 +1762,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
     }
 
+    private func dismissFilePickerForNavigation() {
+        shouldPushHistory = !isStartupPicker
+        dismissFilePicker()
+    }
+
     private func dismissFilePicker() {
+        isStartupPicker = false
         pickerRequest = UUID(); pendingFilePicker = nil
         layout()
         filePickerScroll = 0
@@ -1777,7 +1784,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if entry.isDirectory {
             fetchFilePickerDirectory(path: entry.path, clearName: pickerMode == "open")
         } else {
-            dismissFilePicker(); shouldPushHistory = true
+            dismissFilePickerForNavigation()
             openDocument(path: entry.path, target: pickerTarget)
         }
     }
@@ -1825,7 +1832,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             dismissFilePicker()
             if mode == "move" { moveFile(to: path) }
             else if let document { let target = pickerTarget; Task { await document.saveTo(path: path, target: target, copy: mode == "copy") } }
-        } else { dismissFilePicker(); shouldPushHistory = true; openDocument(path: path, target: pickerTarget) }
+        } else { dismissFilePickerForNavigation(); openDocument(path: path, target: pickerTarget) }
     }
 
     private func moveFilePickerSelection(delta: Int) {
@@ -1890,12 +1897,12 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if ["recent", "open"].contains(pickerMode) {
             if recentTabFrame.contains(rootPoint) { pickerMode = "recent"; filePickerScroll = 0; renderFilePicker(); return true }
             if openTabFrame.contains(rootPoint) { pickerMode = "open"; fetchFilePickerDirectory(path: pendingFilePicker?.directory ?? "~"); return true }
-            if newFileFrame.contains(rootPoint) { dismissFilePicker(); shouldPushHistory = true; openDocument(path: "", new: true, target: pickerTarget); return true }
+            if newFileFrame.contains(rootPoint) { dismissFilePickerForNavigation(); openDocument(path: "", new: true, target: pickerTarget); return true }
         }
         if pickerMode == "recent" {
             for (frame, remove, recent) in recentFrames {
                 if remove.contains(rootPoint) { preferences.recent.removeAll { $0.path == recent.path && $0.target == recent.target }; savePreferences(); renderFilePicker(); return true }
-                if frame.contains(rootPoint) { dismissFilePicker(); shouldPushHistory = true; openDocument(path: recent.path, target: recent.target); return true }
+                if frame.contains(rootPoint) { dismissFilePickerForNavigation(); openDocument(path: recent.path, target: recent.target); return true }
             }
         }
         if targetControlFrame.contains(rootPoint), ["open", "save", "copy"].contains(pickerMode) { showTargetMenu(at: point); return true }
@@ -2342,7 +2349,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         clearMarkedTextState()
         doc.changed?(); updateTextContent(force: true); layout()
         rememberRecent(); startWatching(); doc.resume()
-        if showStartupPopover { showStartupPopover = false; showHomePopover() }
+        if showStartupPopover { showStartupPopover = false; isStartupPicker = true; showHomePopover() }
     }
 
     private func openDocument(path: String, draftID: String? = nil, new: Bool = false, target requestedTarget: String? = nil) {
@@ -4271,11 +4278,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             if ["recent", "open"].contains(pickerMode) {
                 children.append(axNode("recent-tab", .button, recentTabFrame, "Recent", actions: [.press]) { owner, _, _ in owner.pickerMode = "recent"; owner.filePickerScroll = 0; owner.renderFilePicker() })
                 children.append(axNode("open-tab", .button, openTabFrame, "Open", actions: [.press]) { owner, _, _ in owner.pickerMode = "open"; owner.fetchFilePickerDirectory(path: owner.pendingFilePicker?.directory ?? "~") })
-                children.append(axNode("new-file", .button, newFileFrame, "New text file", actions: [.press]) { owner, _, _ in owner.dismissFilePicker(); owner.shouldPushHistory = true; owner.openDocument(path: "", new: true, target: owner.pickerTarget) })
+                children.append(axNode("new-file", .button, newFileFrame, "New text file", actions: [.press]) { owner, _, _ in owner.dismissFilePickerForNavigation(); owner.openDocument(path: "", new: true, target: owner.pickerTarget) })
             }
             if pickerMode == "recent" {
                 for (frame, remove, recent) in recentFrames {
-                    children.append(axNode("recent:" + recent.target + recent.path, .button, frame, (recent.path as NSString).lastPathComponent, value: recent.path, actions: [.press]) { owner, _, _ in owner.dismissFilePicker(); owner.shouldPushHistory = true; owner.openDocument(path: recent.path, target: recent.target) })
+                    children.append(axNode("recent:" + recent.target + recent.path, .button, frame, (recent.path as NSString).lastPathComponent, value: recent.path, actions: [.press]) { owner, _, _ in owner.dismissFilePickerForNavigation(); owner.openDocument(path: recent.path, target: recent.target) })
                     children.append(axNode("remove:" + recent.target + recent.path, .button, remove, "Remove " + (recent.path as NSString).lastPathComponent + " from recents", actions: [.press]) { owner, _, _ in owner.preferences.recent.removeAll { $0.path == recent.path && $0.target == recent.target }; owner.savePreferences(); owner.renderFilePicker() })
                 }
                 return OuterframeAccessibilitySnapshot(rootNodes: [axNode("recents", .dialog, filePickerPanelFrame, "Open files", children: children)])

@@ -28,7 +28,7 @@
 #define MAX_DATA (16u * 1024u * 1024u)
 #define MAX_TEXT (4u * 1024u * 1024u)
 #define HELPER_NAME "outer-plaintext-helper"
-#define HELPER_PATH "/usr/local/bin/" HELPER_NAME
+#define HELPER_APP_ID "org.outershell.Plaintext"
 #define HELPER_CAPABILITIES 15u
 typedef struct {
     unsigned char *data;
