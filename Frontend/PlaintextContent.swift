@@ -544,6 +544,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
         switch message {
+        case .keyDown, .textInput, .setMarkedText, .textCommand, .setCursorPosition,
+             .mouseDown, .mouseDragged, .pasteboardContentPasted, .pasteboardContentDropped,
+             .contextMenuItemSelected, .accessibilityActionAndSnapshot:
+            resetCaretBlink()
+        default:
+            break
+        }
+        switch message {
         case .initializeContent(let arguments):
             configure(with: arguments)
         case .resizeContent(let size):
@@ -3218,6 +3226,16 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                                                                      rect: topLeftRect))
     }
 
+    private func resetCaretBlink() {
+        withoutImplicitAnimations {
+            for layer in [editorCaretLayer, pathPromptCursorLayer, filePickerNameCaretLayer, findCaretLayer] {
+                guard layer.animation(forKey: caretBlinkAnimationKey) != nil else { continue }
+                stopBlinkingCaret(layer)
+                startBlinkingCaret(layer)
+            }
+        }
+    }
+
     private func startBlinkingCaret(_ layer: CALayer) {
         layer.opacity = 1
         if layer.animation(forKey: caretBlinkAnimationKey) != nil { return }
@@ -3578,24 +3596,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func previousWordBoundary(from offset: Int) -> Int {
-        let string = text as NSString
-        var index = clampedOffset(offset)
-        while index > 0, isWhitespace(string.character(at: index - 1)) { index -= 1 }
-        while index > 0, !isWhitespace(string.character(at: index - 1)) { index -= 1 }
-        return index
+        guard !text.isEmpty else { return 0 }
+        return attributedText.nextWord(from: clampedOffset(offset), forward: false)
     }
 
     private func nextWordBoundary(from offset: Int) -> Int {
-        let string = text as NSString
-        let length = string.length
-        var index = clampedOffset(offset)
-        while index < length, !isWhitespace(string.character(at: index)) { index += 1 }
-        while index < length, isWhitespace(string.character(at: index)) { index += 1 }
-        return index
-    }
-
-    private func isWhitespace(_ character: unichar) -> Bool {
-        CharacterSet.whitespacesAndNewlines.contains(UnicodeScalar(character) ?? " ")
+        guard !text.isEmpty else { return 0 }
+        return attributedText.nextWord(from: clampedOffset(offset), forward: true)
     }
 
     private func lineStart(for offset: Int) -> Int {
@@ -3882,13 +3889,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func selectWord(at offset: Int) {
-        let start = previousWordBoundary(from: offset)
-        var end = nextWordBoundary(from: offset)
-        if start == end {
-            end = min(start + 1, (text as NSString).length)
-        }
-        selectionAnchor = start
-        cursorOffset = end
+        guard !text.isEmpty else { return }
+        let range = attributedText.doubleClick(at: min(clampedOffset(offset), attributedText.length - 1))
+        selectionAnchor = range.location
+        cursorOffset = NSMaxRange(range)
         updateSelectionLayers(force: true)
         updateCursor()
         updateEditingCapabilities()
