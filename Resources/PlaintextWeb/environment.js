@@ -1,7 +1,7 @@
 const EnvironmentBinary = (() => {
     'use strict';
     const encoder = new TextEncoder(), decoder = new TextDecoder('utf-8', {fatal:true});
-    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9, disk:10, state:11, publish:12, commit:13, discard:14};
+    const operations = {list:1, read:2, save:3, move:4, targets:7, preview:8, draft:9, disk:10, state:11, publish:12, commit:13, discard:14, recents:15, rememberRecent:16, removeRecent:17};
     function encode(operation, values = {}) {
         const op = operations[operation];
         if (!op) throw Error('Unsupported environment operation');
@@ -69,7 +69,7 @@ const EnvironmentBinary = (() => {
         const metadata = r.bytes(16), body = r.bytes(24);
         if (operation === 'targets') return targets(metadata);
         const m = reader(metadata, 64), count = m.u32(20), stride = m.u32(24), variable = m.u32(32);
-        const expected = (operation === 'preview' || operation === 'disk' || operation === 'state' || operation === 'discard') ? 2 : ['draft','publish','commit'].includes(operation) ? 3 : operations[operation];
+        const expected = (operation === 'preview' || operation === 'disk' || operation === 'state' || operation === 'discard' || ['recents','rememberRecent','removeRecent'].includes(operation)) ? 2 : ['draft','publish','commit'].includes(operation) ? 3 : operations[operation];
         if (!expected || m.u32(0) !== 0x53484c50 || m.u32(4) !== 2 || m.u32(8) !== expected ||
             m.u32(12) !== 0 || m.u32(16) !== metadata.byteLength || m.u32(28) !== 64 || m.u32(36) ||
             m.u64(40) !== body.byteLength || stride !== (operation === 'list' ? 48 : 0) ||
@@ -88,7 +88,7 @@ const EnvironmentBinary = (() => {
             result.data = body; result.type = r.string(32);
         } else {
             result.revision = m.string(56, variable);
-            if ((operation === 'read' || operation === 'disk' || operation === 'state' || operation === 'discard')) {
+            if ((operation === 'read' || operation === 'disk' || operation === 'state' || operation === 'discard' || ['recents','rememberRecent','removeRecent'].includes(operation))) {
                 result.contents = decoder.decode(body);
                 if (result.contents.includes('\0')) throw Error('Invalid document text');
                 result.dirty = !!(r.u32(40) & 1); result.draftConflict = !!(r.u32(40) & 2);

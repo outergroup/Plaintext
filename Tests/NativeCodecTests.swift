@@ -23,6 +23,13 @@ struct NativeCodecTests {
             guard process.terminationStatus == 0 else { fatalError("Driver failed") }
             return try PlaintextEnvironment.decode(response, operation: op)
         }
+        let recent = try request(16)
+        let recentList = try JSONDecoder().decode([[String: String]].self, from: Data(recent.contents.utf8))
+        precondition(recentList == [["path": file.path, "target": "host"]])
+        let reopenedRecents = try request(15)
+        precondition(reopenedRecents.contents == recent.contents)
+        let removedRecent = try request(17)
+        precondition(removedRecent.contents == "[]")
         let read = try request(2)
         precondition(read.contents == "original ☃")
         _ = try request(9, revision: read.revision, contents: read.contents)

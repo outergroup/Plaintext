@@ -3,7 +3,7 @@
 #include <sys/file.h>
 #endif
 enum { CLIENT_HEADER = 72, CLIENT_RESPONSE = 48, DRAFT_HEADER = 32,
-       CLIENT_TARGETS = 7, CLIENT_PREVIEW = 8, CLIENT_DRAFT = 9, CLIENT_DISK = 10, CLIENT_STATE = 11, CLIENT_PUBLISH = 12, CLIENT_COMMIT = 13, CLIENT_DISCARD = 14 };
+       CLIENT_TARGETS = 7, CLIENT_PREVIEW = 8, CLIENT_DRAFT = 9, CLIENT_DISK = 10, CLIENT_STATE = 11, CLIENT_PUBLISH = 12, CLIENT_COMMIT = 13, CLIENT_DISCARD = 14, CLIENT_RECENTS = 15, CLIENT_REMEMBER_RECENT = 16, CLIENT_REMOVE_RECENT = 17 };
 static char *draft_path(const char *target, const char *user, const char *path) {
 #ifdef _WIN32
     char *local = win_folder(CSIDL_LOCAL_APPDATA);
@@ -97,6 +97,8 @@ static int lock_draft(const char *path) {
     }
     return fd;
 }
+#include "recents.inc"
+
 static bool draft_revision(const char *path, char token[65]) {
     errno = 0;
     Bytes saved = read_file(path, MAX_TEXT + 128, true);
@@ -147,7 +149,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         get_u32(input.data + 4) != 1 || get_u32(input.data + 8) != input.size ||
         get_u64(input.data + 16)) { fail("invalid environment request header"); goto done; }
     operation = get_u32(input.data + 12);
-    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == OP_READ || operation == OP_SAVE || operation == OP_MOVE || operation == CLIENT_DRAFT || operation == CLIENT_DISK || operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT || operation == CLIENT_DISCARD;
+    bool allowed = operation == CLIENT_TARGETS || operation == OP_LIST || operation == OP_READ || operation == OP_SAVE || operation == OP_MOVE || operation == CLIENT_DRAFT || operation == CLIENT_DISK || operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT || operation == CLIENT_DISCARD || operation == CLIENT_RECENTS || operation == CLIENT_REMEMBER_RECENT || operation == CLIENT_REMOVE_RECENT;
     if (!allowed) { fail("operation is not supported by this app"); goto done; }
     target = binary_read_string(input, 24, CLIENT_HEADER, 4096);
     user = binary_read_string(input, 32, CLIENT_HEADER, 256);
@@ -170,6 +172,10 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         EnvironmentSnapshot environments = discover_environments();
         snapshot = environment_snapshot_encode(&environments);
         environment_snapshot_free(&environments);
+        goto done;
+    }
+    if (operation == CLIENT_RECENTS || operation == CLIENT_REMEMBER_RECENT || operation == CLIENT_REMOVE_RECENT) {
+        reply = recent_files_operation(operation, target, request.path);
         goto done;
     }
     shared = operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT || operation == CLIENT_DISCARD;

@@ -221,3 +221,13 @@ Windows host paths and Docker/WSLc container files use the same revision checks,
 Build and packaging are integrated in `../Backends/Windows/build.ps1`; install the
 app through Outer Shell’s Add Apps experience. The package includes HTML content
 and macOS native outerframe bundles.
+
+Recent files are stored by the backend in its per-user state directory, shared
+between the HTML and outerframe clients. The list keeps the 30 most recently
+opened paths, distinguished by host or container target. Removing an entry
+updates the shared list without deleting the file or its drafts. Clients reload
+recents when opening the picker or returning to its window. Existing client-local
+lists are not imported; the server list fills as files are opened.
+
+Run `node Scripts/test_server_recents.cjs /path/to/EnvironmentDriver` to check
+persistence, concurrent updates, target separation, and the web clients.

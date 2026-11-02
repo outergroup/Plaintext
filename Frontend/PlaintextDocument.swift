@@ -95,7 +95,7 @@ enum PlaintextEnvironment {
             throw PlaintextDocumentError.message(message)
         }
         let metadata = try field(bytes, 16, minimum: 48), body = try field(bytes, 24, minimum: 48)
-        let expected: UInt32 = [10, 11, 14].contains(operation) ? 2 : [9, 12, 13].contains(operation) ? 3 : operation
+        let expected: UInt32 = [10, 11, 14, 15, 16, 17].contains(operation) ? 2 : [9, 12, 13].contains(operation) ? 3 : operation
         guard metadata.count >= 64, try u32(metadata, 0) == 0x53484c50, try u32(metadata, 4) == 2,
               try u32(metadata, 8) == expected, try u32(metadata, 12) == 0,
               try u32(metadata, 16) == metadata.count, try u32(metadata, 20) == 0,

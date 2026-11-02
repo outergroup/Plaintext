@@ -173,7 +173,6 @@ private struct NativeRecentFile: Codable {
 private struct NativePreferences: Codable {
     var textScale: CGFloat = 1
     var wrapLines = true
-    var recent: [NativeRecentFile] = []
 }
 
 private struct PendingFilePicker {
@@ -364,6 +363,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var reviewedDisk: PlaintextReply?
     private var showingServerVersion = false
     private var didRestoreQueue = false
+    private var recentFiles: [NativeRecentFile] = []
+    private var recentFilesTask: Task<Void, Never>?
     private var preferences = NativePreferences()
     private var preferencesWriteTask: Task<Void, Never>?
     private var watchTask: Task<Void, Never>?
@@ -568,6 +569,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 findInputController.breakUndoCoalescing()
                 filePickerNameInputController.breakUndoCoalescing()
             }
+            if isActive && pendingFilePicker != nil && pickerMode == "recent" { updateRecentFiles() }
             windowIsActive = isActive
             updateSelectionLayers(force: true)
             updateCursor()
@@ -639,7 +641,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             if pendingFilePicker != nil, pickerMode == "conflict", filePickerPanelFrame.contains(rootPoint) {
                 filePickerScroll = max(0, filePickerScroll - delta.y * (precise ? 1 : 28)); renderFilePicker()
             } else if pendingFilePicker != nil, pickerMode == "recent", filePickerPanelFrame.contains(rootPoint) {
-                filePickerScroll = min(max(0, filePickerScroll - delta.y * (precise ? 1 : 28)), max(0, CGFloat(preferences.recent.count) * 58 - filePickerPanelFrame.height + 70)); renderFilePicker()
+                filePickerScroll = min(max(0, filePickerScroll - delta.y * (precise ? 1 : 28)), max(0, CGFloat(recentFiles.count) * 58 - filePickerPanelFrame.height + 70)); renderFilePicker()
             } else if pendingFilePicker != nil, filePickerListFrame.contains(rootPoint) {
                 setFilePickerScroll(filePickerScroll - delta.y * (precise ? 1 : filePickerRowHeight))
             } else if editorClipLayer.frame.contains(rootPoint) {
@@ -1261,7 +1263,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let width = rootLayer.bounds.width
         let height = rootLayer.bounds.height
         let panelWidth = min(max(width - 24, 100), 560)
-        let panelHeight = pickerMode == "recent" ? min(max(170, CGFloat(preferences.recent.count) * 58 + 70), max(100, height - headerHeight - 34)) : max(120, height - headerHeight - 34)
+        let panelHeight = pickerMode == "recent" ? min(max(170, CGFloat(recentFiles.count) * 58 + 70), max(100, height - headerHeight - 34)) : max(120, height - headerHeight - 34)
         let anchorX = pickerMode == "move" ? pathControlFrame.midX : openControlFrame.midX
         let panelFrame = CGRect(x: max(12, min(pickerMode == "move" ? pathControlFrame.minX : 12, width - panelWidth - 12)),
                                 y: height - headerHeight - 12 - panelHeight,
@@ -1315,8 +1317,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if pickerMode == "recent" {
             filePickerNameFieldFrame = .zero; filePickerListFrame = .zero; filePickerOpenFrame = .zero; filePickerCancelFrame = .zero
             filePickerEntryFrames.removeAll(); filePickerBreadcrumbSegmentFrames.removeAll()
-            if preferences.recent.isEmpty { let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor); empty.string = "Files you open appear here."; empty.frame = CGRect(x: 18, y: panelHeight - 94, width: panelWidth - 36, height: 20); panel.addSublayer(empty) }
-            for (index, recent) in preferences.recent.enumerated() {
+            if recentFiles.isEmpty { let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor); empty.string = "Files you open appear here."; empty.frame = CGRect(x: 18, y: panelHeight - 94, width: panelWidth - 36, height: 20); panel.addSublayer(empty) }
+            for (index, recent) in recentFiles.enumerated() {
                 let row = CGRect(x: 16, y: panelHeight - 112 - CGFloat(index) * 58 + filePickerScroll, width: panelWidth - 32, height: 52)
                 guard row.minY >= 12, row.maxY <= panelHeight - 58 else { continue }
                 let name = makeTextLayer(size: 14, weight: .semibold, color: .labelColor); name.string = (recent.path as NSString).lastPathComponent; name.frame = CGRect(x: row.minX, y: row.minY + 25, width: row.width - 40, height: 20); panel.addSublayer(name)
@@ -1701,7 +1703,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func showHomePopover() {
-        pickerMode = "recent"; showOpenFilePicker()
+        pickerMode = "recent"; showOpenFilePicker(); updateRecentFiles()
     }
 
     private func showOpenFilePicker() {
@@ -1909,7 +1911,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
         if pickerMode == "recent" {
             for (frame, remove, recent) in recentFrames {
-                if remove.contains(rootPoint) { preferences.recent.removeAll { $0.path == recent.path && $0.target == recent.target }; savePreferences(); renderFilePicker(); return true }
+                if remove.contains(rootPoint) { updateRecentFiles(operation: 17, file: recent); return true }
                 if frame.contains(rootPoint) { dismissFilePickerForNavigation(); openDocument(path: recent.path, target: recent.target); return true }
             }
         }
@@ -2842,11 +2844,29 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
     }
 
+    private func updateRecentFiles(operation: UInt32 = 15, file: NativeRecentFile? = nil) {
+        guard let session = urlSession, let endpoint = environmentEndpoint else { return }
+        let previous = recentFilesTask
+        recentFilesTask = Task { [weak self] in
+            await previous?.value
+            do {
+                let response = try await PlaintextEnvironment.request(session: session, endpoint: endpoint,
+                                                                      operation: operation, target: file?.target ?? "host", path: file?.path ?? "")
+                let files = try JSONDecoder().decode([NativeRecentFile].self, from: Data(response.contents.utf8))
+                guard let self else { return }
+                recentFiles = files
+                if pendingFilePicker != nil && pickerMode == "recent" { renderFilePicker() }
+            } catch {
+                guard let self else { return }
+                statusText = "Could not update recent files: " + error.localizedDescription
+                renderHeader()
+            }
+        }
+    }
+
     private func rememberRecent() {
         guard let doc = document, !doc.draft.path.isEmpty else { return }
-        preferences.recent.removeAll { $0.path == doc.draft.path && $0.target == doc.draft.target }
-        preferences.recent.insert(NativeRecentFile(path: doc.draft.path, target: doc.draft.target), at: 0)
-        preferences.recent = Array(preferences.recent.prefix(30)); savePreferences()
+        updateRecentFiles(operation: 16, file: NativeRecentFile(path: doc.draft.path, target: doc.draft.target))
     }
 
     private func layoutText(keepingCursorVisible: Bool = false) {
@@ -4287,7 +4307,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             if pickerMode == "recent" {
                 for (frame, remove, recent) in recentFrames {
                     children.append(axNode("recent:" + recent.target + recent.path, .button, frame, (recent.path as NSString).lastPathComponent, value: recent.path, actions: [.press]) { owner, _, _ in owner.dismissFilePickerForNavigation(); owner.openDocument(path: recent.path, target: recent.target) })
-                    children.append(axNode("remove:" + recent.target + recent.path, .button, remove, "Remove " + (recent.path as NSString).lastPathComponent + " from recents", actions: [.press]) { owner, _, _ in owner.preferences.recent.removeAll { $0.path == recent.path && $0.target == recent.target }; owner.savePreferences(); owner.renderFilePicker() })
+                    children.append(axNode("remove:" + recent.target + recent.path, .button, remove, "Remove " + (recent.path as NSString).lastPathComponent + " from recents", actions: [.press]) { owner, _, _ in owner.updateRecentFiles(operation: 17, file: recent) })
                 }
                 return OuterframeAccessibilitySnapshot(rootNodes: [axNode("recents", .dialog, filePickerPanelFrame, "Open files", children: children)])
             }

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the HTTP binary boundary, including the guard as the final header."""
 import http.client
+import json
 import os
 from pathlib import Path
 import socket
@@ -49,6 +50,12 @@ with tempfile.TemporaryDirectory(prefix='env-http-',dir='/tmp') as temp:
   for route, marker in [('/web/offline.js',b'PlaintextDrafts'),('/sw.js',b'plaintext-shell-')]:
    c=Connection(str(sock));c.request('GET',route);r=c.getresponse()
    assert r.status==200 and marker in r.read();c.close()
+  remembered=decode_client(request(encode_client('rememberRecent',path=str(file)))[1])
+  assert json.loads(remembered['contents'])==[{'path':str(file),'target':'host'}]
+  listed=decode_client(request(encode_client('recents'))[1])
+  assert listed['contents']==remembered['contents']
+  removed=decode_client(request(encode_client('removeRecent',path=str(file)))[1])
+  assert json.loads(removed['contents'])==[]
   print(f'PASS {app}: real HTTP binary body, final-header guard, missing guard rejection, malformed packet, codec asset')
  finally:
   process.terminate();process.wait(timeout=5);process.stderr.close()

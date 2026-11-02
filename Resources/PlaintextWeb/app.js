@@ -230,45 +230,33 @@ function renderDocument(){
  $('#download').disabled=!state.active;
  document.title=(dirty?'• ':'')+(state.active?(state.active.path.split('/').pop()||'Untitled'):'Plaintext');
 }
-const recentFilesKey='plaintext.recentFiles.'+storageUser;
-function recentFiles(){
- try{
-  const records=JSON.parse(localStorage.getItem(recentFilesKey)||'[]');
-  return Array.isArray(records)?records.filter(r=>r&&typeof r.path==='string'&&r.path&&typeof r.target==='string'&&Number.isFinite(r.openedAt)):[];
- }catch{return [];}
+let recentFilesTask=Promise.resolve();
+function updateRecentFiles(operation='recents',record={target:'host',path:''}){
+ const task=recentFilesTask.then(async()=>{
+  const response=await api(operation,{path:record.path},{target:record.target});
+  const records=JSON.parse(response.contents);
+  if(!Array.isArray(records)||records.some(r=>!r||typeof r.path!=='string'||typeof r.target!=='string'))throw Error('Invalid recent files response');
+  return records;
+ });
+ recentFilesTask=task.catch(()=>{});
+ return task;
 }
 function rememberFile(doc){
  if(!doc.path)return;
- const records=recentFiles().filter(r=>r.path!==doc.path||r.target!==doc.target);
- records.unshift({path:doc.path,target:doc.target,openedAt:Date.now()});
- try{localStorage.setItem(recentFilesKey,JSON.stringify(records.slice(0,30)));}catch{}
+ const key=JSON.stringify([doc.target,doc.path]);
+ if(doc.recentFileKey===key)return;
+ doc.recentFileKey=key;
+ void updateRecentFiles('rememberRecent',doc).catch(error=>{delete doc.recentFileKey;status('Could not update recent files: '+error.message);});
 }
-const removedRecentFilesKey=recentFilesKey+'.removed';
-function removedRecentFiles(){
- try{const keys=JSON.parse(localStorage.getItem(removedRecentFilesKey)||'[]');return new Set(Array.isArray(keys)?keys.filter(key=>typeof key==='string'):[]);}catch{return new Set();}
-}
-function recentFileKey(record){return JSON.stringify([record.target,record.path]);}
-function restoreRecentFile(doc){
- const removed=removedRecentFiles();
- if(removed.delete(recentFileKey(doc)))try{localStorage.setItem(removedRecentFilesKey,JSON.stringify([...removed]));}catch{}
-}
-function removeRecentFile(record){
- const removed=removedRecentFiles();removed.add(recentFileKey(record));
- try{
-  localStorage.setItem(removedRecentFilesKey,JSON.stringify([...removed]));
-  localStorage.setItem(recentFilesKey,JSON.stringify(recentFiles().filter(item=>recentFileKey(item)!==recentFileKey(record))));
-  void renderRecentFiles();
- }catch{status('Could not remove this item from recent files.');}
+async function removeRecentFile(record){
+ try{await updateRecentFiles('removeRecent',record);await renderRecentFiles();}
+ catch(error){status('Could not remove recent file: '+error.message);}
 }
 async function renderRecentFiles(){
- const drafts=await localRecords(),removed=removedRecentFiles();
- const records=recentFiles().filter(record=>!removed.has(recentFileKey(record))),known=new Set(records.map(recentFileKey));
- for(const record of drafts){
-  const key=JSON.stringify([record.target,record.path]);
-  if(record.path&&!known.has(key)&&!removed.has(key)){records.push({path:record.path,target:record.target,openedAt:record.updatedAt||0});known.add(key);}
- }
+ let records;
+ try{records=await updateRecentFiles();}
+ catch(error){status('Could not load recent files: '+error.message);return;}
  if(state.active&&!$('#start-overlay').open)return;
- records.sort((a,b)=>b.openedAt-a.openedAt);
  $('#recent-files').replaceChildren(...records.slice(0,30).map(record=>{
   const row=document.createElement('div'),button=document.createElement('button'),name=document.createElement('strong'),detail=document.createElement('span'),remove=document.createElement('button');
   row.className='recent-row';
@@ -330,7 +318,7 @@ async function createDocument(record, forkIfLocked=true){
  await doc.persist();
  return doc;
 }
-function activate(doc){state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;$('#editor').value=doc.contents;window.scrollTo(0,0);documentChanged(doc);doc.resume();}
+function activate(doc){delete doc.recentFileKey;state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;$('#editor').value=doc.contents;window.scrollTo(0,0);documentChanged(doc);doc.resume();}
 let navigationVersion=0,navigationTask=Promise.resolve();
 function currentRoute(){
  const parameters=new URLSearchParams(location.search);
@@ -351,7 +339,7 @@ function navigateRoute(route,mode=state.active?'push':'replace'){
    $('#document-menu').open=false;$('#document-info').open=false;
    if($('#start-overlay').open)$('#start-overlay').close();
    state.locationKey=null;
-   if(doc){restoreRecentFile(doc);activate(doc);}
+   if(doc){activate(doc);}
    else{
     state.active?.setWatching(false);state.active=null;
     $('#editor').blur();$('#editor').value='';
@@ -656,7 +644,7 @@ for(const id of ['document-menu','document-info']){
  panel.addEventListener('toggle',()=>{if(panel.open)$('#'+(id==='document-menu'?'document-info':'document-menu')).open=false;});
 }
 window.addEventListener('beforeunload',e=>{if([...documents.values()].some(doc=>doc.localError||doc.localVersion<doc.version)){e.preventDefault();e.returnValue='';}});
-window.addEventListener('storage',event=>{if((event.key===recentFilesKey||event.key===removedRecentFilesKey)&&(!state.active||$('#start-overlay').open))void renderRecentFiles();});
+window.addEventListener('focus',()=>{if($('#start-overlay').open)void renderRecentFiles();});
 window.addEventListener('online',()=>{if(updateFrozen)return;updateFileNotifications(true);for(const doc of documents.values())doc.resume();void discover();});
 document.addEventListener('visibilitychange',()=>{if(updateFrozen)return;for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});
 window.addEventListener('focus',()=>{if(!updateFrozen&&!document.hidden){updateFileNotifications(true);state.active?.resume();}});
