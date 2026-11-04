@@ -2449,6 +2449,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                                                                     target: document.draft.target, path: document.draft.path,
                                                                     destination: targetPath, revision: document.draft.revision)
                 document.draft.path = result.path; document.draft.revision = result.revision
+                if self.document === document { filePath = result.path }
                 _ = await document.persist(); document.changed?()
             } catch { statusText = error.localizedDescription }
         }

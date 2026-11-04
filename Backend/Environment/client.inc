@@ -175,7 +175,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         goto done;
     }
     if (operation == CLIENT_RECENTS || operation == CLIENT_REMEMBER_RECENT || operation == CLIENT_REMOVE_RECENT) {
-        reply = recent_files_operation(operation, target, request.path);
+        reply = recent_files_operation(operation, target, request.path, NULL);
         goto done;
     }
     shared = operation == CLIENT_STATE || operation == CLIENT_PUBLISH || operation == CLIENT_COMMIT || operation == CLIENT_DISCARD;
@@ -264,6 +264,7 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         if (!new_path && !failure[0]) fail("invalid helper move response");
         if (new_path && rename(draft, new_path) && errno != ENOENT)
             fail("file moved, but draft migration failed: %s", strerror(errno));
+        if (dest && *dest) recent_files_rename(target, request.path, dest);
         free(dest); free(new_path);
     }
 done:

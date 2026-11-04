@@ -13,7 +13,7 @@ static bool recent_json_string(Bytes *output, const char *text) {
     return append(output, "\"", 1, MAX_TEXT);
 }
 
-static BinaryReply recent_files_operation(uint32_t operation, const char *target, const char *path) {
+static BinaryReply recent_files_operation(uint32_t operation, const char *target, const char *path, const char *destination) {
     BinaryReply reply = {0};
     RecentFile records[RECENT_LIMIT + 1] = {0};
     size_t count = 0;
@@ -60,16 +60,21 @@ static BinaryReply recent_files_operation(uint32_t operation, const char *target
         }
     }
     if (operation != CLIENT_RECENTS) {
+        size_t kept = 0, position = 0;
+        bool found = false;
         for (size_t i = 0; i < count; i++) {
-            if (!strcmp(records[i].target, target) && !strcmp(records[i].path, path)) {
-                free(records[i].target); free(records[i].path);
-                memmove(records + i, records + i + 1, (count - i - 1) * sizeof(*records));
-                count--; break;
-            }
+            bool same_target = !strcmp(records[i].target, target);
+            bool previous = same_target && !strcmp(records[i].path, path);
+            bool duplicate = same_target && destination && !strcmp(records[i].path, destination);
+            if (previous && !found) { position = kept; found = true; }
+            if (previous || duplicate) { free(records[i].target); free(records[i].path); }
+            else records[kept++] = records[i];
         }
-        if (operation == CLIENT_REMEMBER_RECENT) {
-            memmove(records + 1, records, count * sizeof(*records));
-            records[0] = (RecentFile){strdup(target), strdup(path)};
+        count = kept;
+        if (operation == CLIENT_REMEMBER_RECENT || operation == OP_MOVE) {
+            if (!found || operation != OP_MOVE) position = 0;
+            memmove(records + position + 1, records + position, (count - position) * sizeof(*records));
+            records[position] = (RecentFile){strdup(target), strdup(destination ? destination : path)};
             count++;
             if (count > RECENT_LIMIT) { count--; free(records[count].target); free(records[count].path); }
         }
@@ -99,4 +104,14 @@ done:
     if (lock >= 0) close(lock);
     free(filename);
     return reply;
+}
+
+static void recent_files_rename(const char *target, const char *path, const char *destination) {
+    if (path[0] != '/' || destination[0] != '/' || !strcmp(path, destination)) return;
+    char previous[sizeof(failure)];
+    memcpy(previous, failure, sizeof(failure));
+    failure[0] = 0;
+    BinaryReply reply = recent_files_operation(OP_MOVE, target, path, destination);
+    binary_reply_free(&reply);
+    memcpy(failure, previous, sizeof(failure));
 }

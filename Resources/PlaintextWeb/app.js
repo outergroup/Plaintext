@@ -526,7 +526,7 @@ async function confirmMove(){
  state.replacing=true;renderDocument();updatePickerAction();$('#move-name').disabled=true;
  try{
   const result=await api('move',{path:doc.path,destination,revision:doc.revision},doc);
-  doc.path=result.path;doc.draftRevision='missing';await doc.persist();documentChanged(doc);$('#start-overlay').close();
+  doc.path=result.path;doc.recentFileKey=JSON.stringify([doc.target,doc.path]);doc.draftRevision='missing';await doc.persist();documentChanged(doc);$('#start-overlay').close();
  }catch(e){$('#start-overlay-status').textContent=e.message;}
  finally{state.replacing=false;$('#move-name').disabled=false;renderDocument();updatePickerAction();}
 }
