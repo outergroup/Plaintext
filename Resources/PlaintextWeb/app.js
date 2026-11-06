@@ -91,7 +91,7 @@ function configureEditorFocusScrolling(){
    if(!rect){mirror.remove();return;}
    const top=editor.getBoundingClientRect().top+rect.top-mirror.getBoundingClientRect().top;
    const bottom=top+(parseFloat(style.lineHeight)||parseFloat(style.fontSize)*1.5);
-   const topLimit=document.documentElement.dataset.rail?12:$('.document-toolbar').getBoundingClientRect().bottom+12;
+   const topLimit=contentTopLimit();
    const bottomLimit=viewport.offsetTop+viewport.height-12;
    mirror.remove();
    if(bottom>bottomLimit)window.scrollBy({top:bottom-bottomLimit,behavior:'instant'});
@@ -187,6 +187,184 @@ $('#wrap-lines').onclick=()=>{
  wrapLines=!wrapLines;setLineWrapping(wrapLines);
  try{localStorage.setItem(wrapLinesKey,String(wrapLines));}catch{}
 };
+function contentTopLimit(){
+ const bar=$('#find-bar'),base=document.documentElement.dataset.rail?0:$('.document-toolbar').getBoundingClientRect().bottom;
+ return Math.max(base,bar.hidden?0:bar.getBoundingClientRect().bottom)+12;
+}
+const find=(()=>{
+ const editor=$('#editor'),bar=$('#find-bar'),input=$('#find-input'),count=$('#find-status'),root=document.documentElement;
+ const overlay=document.createElement('div');overlay.id='find-highlights';overlay.setAttribute('aria-hidden','true');editor.after(overlay);
+ let matches=[],query='',current=-1,origin={start:0,end:0,direction:'none'},folded=null,frame=null;
+ const isOpen=()=>!bar.hidden;
+ function foldText(text){
+  const chunks=[],starts=[],ends=[];
+  for(let i=0;i<text.length;){
+   const code=text.codePointAt(i),size=code>0xffff?2:1;
+   let folded;
+   if(code<128)folded=code>=65&&code<=90?String.fromCharCode(code+32):text[i];
+   else folded=text.slice(i,i+size).normalize('NFD').replace(/\p{M}/gu,'').toLowerCase();
+   for(let k=0;k<folded.length;k++){starts.push(i);ends.push(i+size);}
+   chunks.push(folded);i+=size;
+  }
+  return {source:text,text:chunks.join(''),starts,ends};
+ }
+ function compute(){
+  query=input.value;matches=[];current=-1;
+  const text=editor.value,needle=foldText(query).text;
+  if(!needle)return;
+  if(folded?.source!==text)folded=foldText(text);
+  for(let at=folded.text.indexOf(needle);at>=0;at=folded.text.indexOf(needle,at+needle.length)){
+   const start=folded.starts[at];let end=folded.ends[at+needle.length-1];
+   while(end<text.length&&/\p{M}/u.test(text[end]))end++;
+   if(matches.length&&start<matches[matches.length-1].end)continue;
+   matches.push({start,end});
+  }
+  current=selectedIndex();
+ }
+ function selectedIndex(){
+  const start=editor.selectionStart,end=editor.selectionEnd;
+  let low=0,high=matches.length;
+  while(low<high){const middle=(low+high)>>1;if(matches[middle].start<start)low=middle+1;else high=middle;}
+  return matches[low]?.start===start&&matches[low].end===end?low:-1;
+ }
+ function updateStatus(){
+  count.textContent=!query?'':!matches.length?'No matches':current>=0?`${current+1} of ${matches.length}`:matches.length===1?'1 match':`${matches.length} matches`;
+  $('#find-previous').disabled=$('#find-next').disabled=!matches.length;
+ }
+ function render(){
+  if(frame!==null){cancelAnimationFrame(frame);frame=null;}
+  if(!isOpen()||!matches.length){overlay.removeAttribute('style');overlay.replaceChildren();return;}
+  const style=getComputedStyle(editor);
+  overlay.removeAttribute('style');
+  for(const name of style)overlay.style.setProperty(name,style.getPropertyValue(name));
+  Object.assign(overlay.style,{display:'block',position:'absolute',left:editor.offsetLeft+'px',top:editor.offsetTop+'px',width:editor.offsetWidth+'px',height:editor.offsetHeight+'px',
+   minHeight:'0',maxHeight:'none',margin:'0',overflow:'hidden',pointerEvents:'none',background:'transparent',color:'transparent',webkitTextFillColor:'transparent',borderColor:'transparent',boxShadow:'none',outline:'none',zIndex:'1',transform:'none'});
+  const text=editor.value,fragment=document.createDocumentFragment();let last=0;
+  for(const [index,match] of matches.entries()){
+   fragment.append(text.slice(last,match.start));
+   const mark=document.createElement('mark');mark.textContent=text.slice(match.start,match.end);
+   if(index===current)mark.className='current';
+   fragment.append(mark);last=match.end;
+  }
+  fragment.append(text.slice(last)+'​');
+  overlay.replaceChildren(fragment);overlay.scrollLeft=editor.scrollLeft;
+ }
+ function schedule(){if(isOpen()&&frame===null)frame=requestAnimationFrame(()=>{frame=null;render();});}
+ function reveal(){
+  const mark=overlay.querySelector('mark.current');if(!mark)return;
+  if(editor.getAttribute('wrap')==='off'){
+   const bounds=editor.getBoundingClientRect(),rect=mark.getBoundingClientRect(),inset=32;
+   if(rect.left<bounds.left+inset)editor.scrollLeft-=bounds.left+inset-rect.left;
+   else if(rect.right>bounds.right-inset)editor.scrollLeft+=rect.right-bounds.right+inset;
+   overlay.scrollLeft=editor.scrollLeft;
+  }
+  const rect=mark.getBoundingClientRect(),viewport=window.visualViewport;
+  const top=contentTopLimit(),bottom=(viewport?viewport.offsetTop+viewport.height:innerHeight)-12;
+  if(rect.top<top||rect.bottom>bottom)window.scrollBy({top:rect.top-(top+Math.max(0,(bottom-top-rect.height)/2)),behavior:'instant'});
+ }
+ function select(index){
+  current=index;const match=matches[index];
+  editor.setSelectionRange(match.start,match.end,'forward');
+  render();reveal();updateStatus();
+ }
+ function restoreOrigin(){
+  const length=editor.value.length;
+  editor.setSelectionRange(Math.min(origin.start,length),Math.min(origin.end,length),origin.direction);
+  current=-1;render();updateStatus();
+ }
+ function searchFromOrigin(){
+  compute();
+  if(!matches.length){restoreOrigin();return;}
+  const index=matches.findIndex(match=>match.start>=origin.start);
+  select(index<0?0:index);
+ }
+ function captureOrigin(){origin={start:editor.selectionStart,end:editor.selectionEnd,direction:editor.selectionDirection};}
+ function setVisible(visible){
+  if(isOpen()===visible)return;
+  const before=bar.hidden?0:bar.offsetHeight;
+  bar.hidden=!visible;root.toggleAttribute('data-find',visible);
+  const after=bar.hidden?0:bar.offsetHeight;
+  if(window.scrollY>0)window.scrollBy({top:after-before,behavior:'instant'});
+ }
+ function seedFromSelection(){
+  const selected=editor.value.slice(editor.selectionStart,editor.selectionEnd);
+  if(selected&&!/[\r\n]/.test(selected))input.value=selected;
+ }
+ function open(seed){
+  if(editor.disabled)return;
+  const wasOpen=isOpen();
+  if(!wasOpen||document.activeElement!==input)captureOrigin();
+  if(seed&&document.activeElement!==input)seedFromSelection();
+  setVisible(true);
+  input.focus({preventScroll:true});input.select();
+  if(!wasOpen||input.value!==query||selectedIndex()<0)searchFromOrigin();
+  else{current=selectedIndex();render();updateStatus();}
+ }
+ function close(){
+  if(!isOpen())return;
+  const focusEditor=bar.contains(document.activeElement)||document.activeElement===document.body;
+  if(frame!==null){cancelAnimationFrame(frame);frame=null;}
+  setVisible(false);render();
+  if(focusEditor&&!editor.disabled)editor.focus({preventScroll:true});
+ }
+ function step(direction){
+  if(editor.disabled)return;
+  if(!input.value){open(false);return;}
+  setVisible(true);compute();
+  if(!matches.length){render();updateStatus();return;}
+  const start=editor.selectionStart,end=editor.selectionEnd;
+  let index=current;
+  if(index>=0)index=(index+direction+matches.length)%matches.length;
+  else if(direction<0){index=matches.findLastIndex(match=>match.start<start);if(index<0)index=matches.length-1;}
+  else{index=matches.findIndex(match=>match.start>=end);if(index<0)index=0;}
+  select(index);
+  origin={start:matches[index].start,end:matches[index].end,direction:'forward'};
+ }
+ function useSelection(){
+  if(editor.disabled)return;
+  seedFromSelection();
+  if(isOpen()){captureOrigin();searchFromOrigin();}
+  else{compute();updateStatus();}
+ }
+ function contentChanged(){
+  if(!query)return;
+  compute();updateStatus();schedule();
+ }
+ input.addEventListener('input',()=>{if(isOpen())searchFromOrigin();});
+ input.addEventListener('keydown',event=>{
+  if(event.key!=='Enter'||event.isComposing||event.metaKey||event.ctrlKey||event.altKey)return;
+  event.preventDefault();step(event.shiftKey?-1:1);
+ });
+ for(const button of [$('#find-previous'),$('#find-next')]){
+  button.addEventListener('pointerdown',event=>{if(document.activeElement===input||document.activeElement===editor)event.preventDefault();});
+ }
+ $('#find-previous').onclick=()=>step(-1);
+ $('#find-next').onclick=()=>step(1);
+ $('#find-done').onclick=close;
+ $('#find-command').onclick=()=>open(true);
+ editor.addEventListener('input',()=>{if(isOpen())contentChanged();});
+ editor.addEventListener('scroll',()=>{overlay.scrollLeft=editor.scrollLeft;});
+ for(const type of ['select','selectionchange','keyup','pointerup','focus','blur']){
+  editor.addEventListener(type,()=>{
+   if(!isOpen()||!matches.length)return;
+   const index=selectedIndex();
+   if(index!==current){current=index;updateStatus();schedule();}
+  });
+ }
+ new ResizeObserver(schedule).observe(editor);
+ new MutationObserver(schedule).observe(editor,{attributes:true,attributeFilter:['wrap']});
+ new MutationObserver(schedule).observe(root,{attributes:true,attributeFilter:['style','data-rail']});
+ document.addEventListener('keydown',event=>{
+  if(event.defaultPrevented||event.isComposing||editor.disabled)return;
+  if(document.querySelector('dialog:modal')||$('#start-overlay').open)return;
+  const key=event.key.toLowerCase(),command=(event.metaKey||event.ctrlKey)&&!event.altKey;
+  if(command&&!event.shiftKey&&key==='f'){event.preventDefault();open(true);}
+  else if(command&&key==='g'){event.preventDefault();step(event.shiftKey?-1:1);}
+  else if(event.metaKey&&!event.ctrlKey&&!event.altKey&&!event.shiftKey&&key==='e'){event.preventDefault();useSelection();}
+  else if(event.key==='Escape'&&isOpen()){event.preventDefault();close();}
+ });
+ return {open,close,isOpen,contentChanged};
+})();
 function targetName(target){return state.targets.find(t=>t.id===target)?.name || (target==='host'?'Host':'Unavailable container');}
 async function api(operation, values={}, context=state){
  const body=EnvironmentBinary.encode(operation,{target:context.target,...values});
@@ -228,6 +406,7 @@ function renderDocument(){
  $('#save').disabled=!doc||state.replacing||saving||(!dirty&&!!doc.path);$('#move').disabled=!state.active?.path||state.replacing;
  for(const id of ['home','overflow-home','mobile-location','path','location-target'])$('#'+id).disabled=state.replacing;
  $('#download').disabled=!state.active;
+ $('#find-command').disabled=!state.active||state.replacing;
  document.title=(dirty?'• ':'')+(state.active?(state.active.path.split('/').pop()||'Untitled'):'Plaintext');
 }
 let recentFilesTask=Promise.resolve();
@@ -294,6 +473,7 @@ function documentChanged(doc){
   editor.value=doc.contents;
   editor.setSelectionRange(Math.min(selectionStart,doc.contents.length),Math.min(selectionEnd,doc.contents.length),selectionDirection);
   editor.scrollLeft=scrollLeft;window.scrollTo(x,y);
+  find.contentChanged();
  }
  const locationKey=JSON.stringify([doc.id,doc.path,doc.target,targetName(doc.target)]);
  if(state.locationKey!==locationKey){state.locationKey=locationKey;showPath(doc);}
@@ -318,7 +498,7 @@ async function createDocument(record, forkIfLocked=true){
  await doc.persist();
  return doc;
 }
-function activate(doc){delete doc.recentFileKey;state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;$('#editor').value=doc.contents;window.scrollTo(0,0);documentChanged(doc);doc.resume();}
+function activate(doc){delete doc.recentFileKey;state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;find.close();$('#editor').value=doc.contents;window.scrollTo(0,0);documentChanged(doc);doc.resume();}
 let navigationVersion=0,navigationTask=Promise.resolve();
 function currentRoute(){
  const parameters=new URLSearchParams(location.search);
@@ -341,7 +521,7 @@ function navigateRoute(route,mode=state.active?'push':'replace'){
    state.locationKey=null;
    if(doc){activate(doc);}
    else{
-    state.active?.setWatching(false);state.active=null;
+    state.active?.setWatching(false);state.active=null;find.close();
     $('#editor').blur();$('#editor').value='';
     updateFileNotifications();renderDocument();status('');window.scrollTo(0,0);
     showStartOverlay(true);

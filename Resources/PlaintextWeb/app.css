@@ -183,3 +183,24 @@ main{padding-left:var(--safe-left);padding-right:var(--safe-right)}
 @media(max-height:450px){#pickerPath{min-height:34px;padding:2px 0}#pickerPath button{min-height:28px}}
 
 #start-overlay[data-mode="save"] .start-actions,#start-overlay[data-mode="copy"] .start-actions{display:none}
+
+main{position:relative}
+:root[data-find]{--find-height:46px}
+main{padding-top:calc(var(--toolbar-height) + var(--find-height,0px))}
+html,body{scroll-padding-top:calc(var(--toolbar-height) + var(--find-height,0px) + 12px)}
+footer{top:calc(var(--toolbar-height) + var(--find-height,0px))}
+#find-bar{position:fixed;z-index:19;top:var(--toolbar-height);left:var(--safe-left);right:var(--safe-right);height:var(--find-height,46px);display:flex;align-items:center;gap:6px;padding:0 12px;background:var(--chrome);border-bottom:1px solid var(--line);transform:translateZ(0)}
+#find-bar[hidden]{display:none}
+#find-input{flex:1;min-width:0;max-width:420px;height:32px;padding:0 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--text);font:inherit;font-size:14px}
+#find-input:focus{border-color:var(--accent)}
+#find-status{flex:none;min-width:5.5em;font-size:12px;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+#find-bar button{flex:none;display:flex;align-items:center;justify-content:center;height:32px;min-width:32px;padding:0 8px;border:0;border-radius:7px;background:transparent}
+#find-bar button:hover{background:var(--bar)}
+#find-bar svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+#find-done{margin-left:auto;color:var(--accent);font-weight:550}
+@media(pointer:coarse){#find-input{font-size:16px}#find-bar button{min-width:40px;height:40px}}
+#find-highlights{display:none}
+#find-highlights mark{color:transparent;-webkit-text-fill-color:transparent;background:#ffd23f80;border-radius:2px}
+#find-highlights mark.current{background:#ff9f0ac0}
+#editor:focus+#find-highlights mark.current{background:#ffd23f80}
+@media(prefers-color-scheme:dark){#find-highlights mark{background:#ffd23f4d}#find-highlights mark.current{background:#ff9f0a8c}#editor:focus+#find-highlights mark.current{background:#ffd23f4d}}

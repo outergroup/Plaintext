@@ -498,7 +498,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         )
         controller.delegate = self
         controller.onSubmit = { [weak self] in
-            self?.findNext()
+            guard let self else { return }
+            self.findNext(backward: self.findSubmitsBackward)
         }
         return controller
     }()
@@ -515,7 +516,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }()
     private var isFindVisible = false
     private var findMatches: [NSRange] = []
-    private var activeFindMatchIndex: Int?
+    private var findMatchesQuery = ""
+    private var findOrigin = NSRange(location: 0, length: 0)
+    private var findSubmitsBackward = false
+    private var findHighlightLayers: [CALayer] = []
+    private var findHighlightCoverage: CGRect?
     private var markedTextRange: NSRange?
     private var pendingMarkedTextReplacementRange: NSRange?
     private var findBarFrame = CGRect.zero
@@ -634,6 +639,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             handleRightMouseDown(point: point, clickCount: clickCount)
         case .keyDown(_, let characters, let charactersIgnoringModifiers, let modifierFlags, _):
             pickerElasticScrolling.reset()
+            findSubmitsBackward = modifierFlags.contains(.shift)
             if pendingFilePicker != nil,
                handleFilePickerKeyDown(characters: characters,
                                        charactersIgnoringModifiers: charactersIgnoringModifiers,
@@ -1173,7 +1179,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         findBarLayer.frame = findBarFrame
         findBarLayer.isHidden = !isFindVisible
 
-        let statusWidth: CGFloat = 54
+        let statusWidth = findStatusWidth()
         let doneWidth: CGFloat = 54
         let buttonSize: CGFloat = 26
         let buttonGap: CGFloat = 4
@@ -2072,7 +2078,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             updateEditingCapabilities()
             return
         }
-        recomputeFindMatches(selectNearestMatch: true)
+        if isFindVisible, findInputController.text != findMatchesQuery {
+            searchFromFindOrigin()
+        }
         updateFindDisplay()
         updateCursor()
         updateEditingCapabilities()
@@ -2099,7 +2107,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             findTextLayer.fontSize = 13
             findPlaceholderLayer.font = font
             findPlaceholderLayer.fontSize = 13
-            findStatusLayer.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+            findStatusLayer.font = findStatusFont
             findStatusLayer.fontSize = 12
             findDoneTextLayer.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
             findDoneTextLayer.fontSize = 12
@@ -2147,16 +2155,34 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 startBlinkingCaret(findCaretLayer)
             }
 
-            if findInputController.text.isEmpty {
-                findStatusLayer.string = ""
-            } else if let activeFindMatchIndex {
-                findStatusLayer.string = "\(activeFindMatchIndex + 1) / \(findMatches.count)"
-            } else if !findMatches.isEmpty {
-                findStatusLayer.string = "\(findMatches.count) results"
-            } else {
-                findStatusLayer.string = "No results"
-            }
+            findStatusLayer.string = findStatusText()
         }
+        if isFindVisible, findStatusWidth() != findStatusLayer.frame.width {
+            layoutFindBar()
+        }
+    }
+
+    private var findStatusFont: NSFont {
+        NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+    }
+
+    private func findStatusText() -> String {
+        if findInputController.text.isEmpty {
+            return ""
+        } else if let index = selectedFindMatchIndex() {
+            return "\(index + 1) of \(findMatches.count)"
+        } else if !findMatches.isEmpty {
+            return findMatches.count == 1 ? "1 match" : "\(findMatches.count) matches"
+        } else {
+            return "No results"
+        }
+    }
+
+    private func findStatusWidth() -> CGFloat {
+        let attributes: [NSAttributedString.Key: Any] = [.font: findStatusFont]
+        let minimum = ("No results" as NSString).size(withAttributes: attributes).width
+        let current = (findStatusText() as NSString).size(withAttributes: attributes).width
+        return ceil(max(minimum, current)) + 2
     }
 
     private func findTextFrame() -> CGRect {
@@ -2170,15 +2196,21 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         return min(max(prefix.size(withAttributes: [.font: font]).width, 0), max(textFrame.width - cursorWidth, 0))
     }
 
-    private func showFind(selectCurrentSelection: Bool) {
+    private func showFind(seedingFromSelection: Bool) {
         endUndoGroup()
-        if selectCurrentSelection, let selected = selectedString(), !selected.isEmpty {
-            findInputController.setText(selected)
+        if !findInputController.isFocused {
+            findOrigin = selectionRange ?? NSRange(location: cursorOffset, length: 0)
         }
         isFindVisible = true
+        if seedingFromSelection, let seed = findSeedFromSelection() {
+            findInputController.setText(seed)
+        }
         findInputController.focus(selectAll: true)
-        recomputeFindMatches(selectNearestMatch: true)
+        if findInputController.text != findMatchesQuery || selectedFindMatchIndex() == nil {
+            searchFromFindOrigin()
+        }
         layout()
+        updateSelectionLayers(force: true)
         updateCursor()
     }
 
@@ -2187,63 +2219,63 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         findInputController.blur()
         isFindVisible = false
         layout()
+        updateSelectionLayers(force: true)
         updateCursor()
+        updateEditingCapabilities()
     }
 
     private func useSelectionForFind() {
-        if let selected = selectedString(), !selected.isEmpty {
-            findInputController.setText(selected)
+        if let seed = findSeedFromSelection() {
+            findInputController.setText(seed)
         }
-        showFind(selectCurrentSelection: false)
+        if isFindVisible {
+            findOrigin = selectionRange ?? NSRange(location: cursorOffset, length: 0)
+            searchFromFindOrigin()
+        } else {
+            recomputeFindMatches()
+            updateFindDisplay()
+        }
     }
 
-    private func recomputeFindMatches(selectNearestMatch: Bool) {
+    private func findSeedFromSelection() -> String? {
+        guard let selected = selectedString(), !selected.isEmpty,
+              selected.rangeOfCharacter(from: .newlines) == nil else { return nil }
+        return selected
+    }
+
+    private func recomputeFindMatches() {
         findMatches.removeAll()
-        activeFindMatchIndex = nil
         let query = findInputController.text
+        findMatchesQuery = query
         guard !query.isEmpty else { return }
 
         let haystack = text as NSString
-        let queryLength = (query as NSString).length
-        guard queryLength > 0 else { return }
-
         var searchRange = NSRange(location: 0, length: haystack.length)
         while searchRange.length > 0 {
             let match = haystack.range(of: query, options: [.caseInsensitive, .diacriticInsensitive], range: searchRange)
-            if match.location == NSNotFound { break }
+            if match.location == NSNotFound || match.length == 0 { break }
             findMatches.append(match)
-            let nextLocation = match.location + max(match.length, 1)
-            if nextLocation >= haystack.length { break }
+            let nextLocation = NSMaxRange(match)
             searchRange = NSRange(location: nextLocation, length: haystack.length - nextLocation)
         }
-
-        if selectNearestMatch {
-            activateFindMatch(nearestTo: cursorOffset, forward: true, allowBeep: false)
-        }
     }
 
-    private func activateFindMatch(nearestTo offset: Int, forward: Bool, allowBeep: Bool) {
-        guard !findMatches.isEmpty else {
-            if allowBeep { NSSound.beep() }
-            return
-        }
-        let clamped = clampedOffset(offset)
-        let index: Int
-        if forward {
-            index = findMatches.firstIndex { $0.location + max($0.length, 1) > clamped } ?? 0
+    private func searchFromFindOrigin() {
+        recomputeFindMatches()
+        let origin = clampedOffset(findOrigin.location)
+        if let index = findMatches.firstIndex(where: { $0.location >= origin }) ?? (findMatches.isEmpty ? nil : 0) {
+            activateFindMatch(at: index)
         } else {
-            index = findMatches.lastIndex { $0.location < clamped } ?? (findMatches.count - 1)
+            restoreFindOrigin()
         }
-        activateFindMatch(at: index)
     }
 
-    private func activateFindMatch(at index: Int) {
+    private func restoreFindOrigin() {
         endUndoGroup()
-        guard findMatches.indices.contains(index) else { return }
-        let match = findMatches[index]
-        activeFindMatchIndex = index
-        selectionAnchor = match.location
-        cursorOffset = match.location + match.length
+        let lower = clampedOffset(findOrigin.location)
+        let upper = clampedOffset(NSMaxRange(findOrigin))
+        selectionAnchor = upper > lower ? lower : nil
+        cursorOffset = upper
         ensureCursorVisible()
         updateViewport()
         updateSelectionLayers(force: true)
@@ -2252,46 +2284,113 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         updateEditingCapabilities()
     }
 
-    private func currentFindMatchIndex() -> Int? {
-        if let activeFindMatchIndex, findMatches.indices.contains(activeFindMatchIndex) {
-            return activeFindMatchIndex
-        }
-        guard let selectionRange else { return nil }
-        return findMatches.firstIndex {
-            $0.location == selectionRange.location && $0.length == selectionRange.length
-        }
+    private func activateFindMatch(at index: Int) {
+        endUndoGroup()
+        guard findMatches.indices.contains(index) else { return }
+        let match = findMatches[index]
+        selectionAnchor = match.location
+        cursorOffset = NSMaxRange(match)
+        ensureCursorVisible()
+        updateViewport()
+        updateSelectionLayers(force: true)
+        updateCursor()
+        updateFindDisplay()
+        updateEditingCapabilities()
     }
 
-    private func findNext() {
-        if !isFindVisible {
-            showFind(selectCurrentSelection: false)
+    private func selectedFindMatchIndex() -> Int? {
+        guard let selectionRange, findMatchesQuery == findInputController.text else { return nil }
+        var low = 0
+        var high = findMatches.count
+        while low < high {
+            let middle = (low + high) / 2
+            if findMatches[middle].location < selectionRange.location { low = middle + 1 } else { high = middle }
+        }
+        guard findMatches.indices.contains(low), findMatches[low] == selectionRange else { return nil }
+        return low
+    }
+
+    private func findNext(backward: Bool = false) {
+        guard !findInputController.text.isEmpty else {
+            showFind(seedingFromSelection: false)
             return
         }
-        recomputeFindMatches(selectNearestMatch: false)
+        recomputeFindMatches()
         guard !findMatches.isEmpty else {
             updateFindDisplay()
+            updateSelectionLayers(force: true)
             NSSound.beep()
             return
         }
-        let nextIndex = currentFindMatchIndex().map { ($0 + 1) % findMatches.count }
-            ?? (findMatches.firstIndex { $0.location >= cursorOffset } ?? 0)
-        activateFindMatch(at: nextIndex)
+        let index: Int
+        if let current = selectedFindMatchIndex() {
+            index = (current + (backward ? -1 : 1) + findMatches.count) % findMatches.count
+        } else if backward {
+            let start = selectionRange?.location ?? cursorOffset
+            index = findMatches.lastIndex { $0.location < start } ?? (findMatches.count - 1)
+        } else {
+            index = findMatches.firstIndex { $0.location >= cursorOffset } ?? 0
+        }
+        activateFindMatch(at: index)
+        findOrigin = findMatches[index]
     }
 
     private func findPrevious() {
-        if !isFindVisible {
-            showFind(selectCurrentSelection: false)
-            return
+        findNext(backward: true)
+    }
+
+    private func updateFindHighlightLayers() {
+        withoutImplicitAnimations {
+            for layer in findHighlightLayers {
+                layer.removeFromSuperlayer()
+            }
+            findHighlightLayers = []
+            findHighlightCoverage = nil
+            guard isFindVisible, !findMatches.isEmpty, findMatchesQuery == findInputController.text,
+                  textSelectionLayer.bounds.height > 0 else { return }
+
+            let contentHeight = textSelectionLayer.bounds.height
+            let coverage = expandedTextContentRect(containing: visibleTextContentRect(), contentHeight: contentHeight)
+            findHighlightCoverage = coverage
+            let length = (text as NSString).length
+            let lowerOffset = textLayoutManager.textLayoutFragment(for: CGPoint(x: 0, y: coverage.minY))
+                .map { utf16Offset(for: $0.rangeInElement.location) } ?? 0
+            let upperOffset = textLayoutManager.textLayoutFragment(for: CGPoint(x: 0, y: coverage.maxY))
+                .map { utf16Offset(for: $0.rangeInElement.endLocation) } ?? length
+
+            var low = 0
+            var high = findMatches.count
+            while low < high {
+                let middle = (low + high) / 2
+                if NSMaxRange(findMatches[middle]) <= lowerOffset { low = middle + 1 } else { high = middle }
+            }
+
+            let color = resolvedCGColor(NSColor.systemYellow.withAlphaComponent(appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? 0.32 : 0.42))
+            let selected = selectionRange
+            var index = low
+            while index < findMatches.count, findMatches[index].location <= upperOffset, findHighlightLayers.count < 2000 {
+                let match = findMatches[index]
+                index += 1
+                if match == selected { continue }
+                for rect in textSegmentRects(for: match, type: .standard) where rect.intersects(coverage) {
+                    let highlight = CALayer()
+                    highlight.frame = CGRect(x: rect.minX - 1,
+                                             y: contentHeight - rect.maxY,
+                                             width: max(rect.width, 1) + 2,
+                                             height: max(rect.height, 1))
+                    highlight.backgroundColor = color
+                    highlight.cornerRadius = 3
+                    textSelectionLayer.insertSublayer(highlight, at: 0)
+                    findHighlightLayers.append(highlight)
+                }
+            }
         }
-        recomputeFindMatches(selectNearestMatch: false)
-        guard !findMatches.isEmpty else {
-            updateFindDisplay()
-            NSSound.beep()
-            return
-        }
-        let previousIndex = currentFindMatchIndex().map { ($0 - 1 + findMatches.count) % findMatches.count }
-            ?? (findMatches.lastIndex { $0.location < cursorOffset } ?? (findMatches.count - 1))
-        activateFindMatch(at: previousIndex)
+    }
+
+    private func refreshFindHighlightsIfNeeded() {
+        guard isFindVisible, !findMatches.isEmpty else { return }
+        if let findHighlightCoverage, findHighlightCoverage.contains(visibleTextContentRect()) { return }
+        updateFindHighlightLayers()
     }
 
     private func documentDisplayName() -> String {
@@ -2760,6 +2859,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 }
             } catch { statusText = error.localizedDescription; renderHeader() }
             var items = [
+                OuterframeContextMenuItem(id: "find", title: "Find…", isEnabled: doc != nil && pendingFilePicker == nil,
+                                          keyEquivalent: "f", keyEquivalentModifierMask: UInt32(NSEvent.ModifierFlags.command.rawValue)),
+                OuterframeContextMenuItem(id: "find-separator", title: "", kind: .separator),
                 OuterframeContextMenuItem(id: "text-smaller", title: "Smaller Text", isEnabled: preferences.textScale > 0.25),
                 OuterframeContextMenuItem(id: "text-reset", title: "Text Size: \(Int(preferences.textScale * 100))% — Reset"),
                 OuterframeContextMenuItem(id: "text-larger", title: "Larger Text", isEnabled: preferences.textScale < 3),
@@ -2823,7 +2925,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             contentStorage.attributedString = attributedText
             cursorOffset = clampedOffset(cursorOffset)
             selectionAnchor = selectionAnchor.map(clampedOffset)
-            if textChanged { recomputeFindMatches(selectNearestMatch: false) }
+            if textChanged { recomputeFindMatches() }
             layoutText(keepingCursorVisible: keepingCursorVisible)
             updateEditingCapabilities()
         }
@@ -2932,6 +3034,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateViewport() {
+        defer { refreshFindHighlightsIfNeeded() }
         withoutImplicitAnimations {
             guard editorClipLayer.bounds.width > 0, editorClipLayer.bounds.height > 0 else {
                 clearTextFragmentLayers()
@@ -3234,6 +3337,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 selectionLayers.append(highlight)
             }
         }
+        updateFindHighlightLayers()
     }
 
     private func cursorRect(for offset: Int) -> CGRect {
@@ -3542,13 +3646,15 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         case "undo": performUndo()
         case "redo": performUndo(redo: true)
         case "find":
-            showFind(selectCurrentSelection: true)
+            showFind(seedingFromSelection: true)
         case "findNext":
             findNext()
         case "findPrevious":
             findPrevious()
         case "useSelectionForFind":
             useSelectionForFind()
+        case "cancelOperation":
+            hideFind()
         case "insertNewline":
             insertText("\n")
         case "insertTab":
@@ -3641,7 +3747,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func performFindTextCommand(_ command: String) {
         switch command {
         case "find":
-            showFind(selectCurrentSelection: false)
+            showFind(seedingFromSelection: false)
         case "findNext":
             findNext()
         case "findPrevious":
@@ -4185,6 +4291,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if pendingPathMenuIDs.remove(menuID) != nil {
             if itemID.hasPrefix("recover:") { openDocument(path: "", draftID: String(itemID.dropFirst(8))); return }
             switch itemID {
+            case "find": showFind(seedingFromSelection: true)
             case "text-smaller": setTextScale(preferences.textScale - 0.1)
             case "text-larger": setTextScale(preferences.textScale + 0.1)
             case "text-reset": setTextScale(1)
@@ -4237,7 +4344,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if modifierFlags.contains(.command), normalized == "o" {
             showOpenPrompt()
         } else if modifierFlags.contains(.command), normalized == "f" {
-            showFind(selectCurrentSelection: true)
+            showFind(seedingFromSelection: !findInputController.isFocused)
         } else if modifierFlags.contains(.command), normalized == "g" {
             if modifierFlags.contains(.shift) {
                 findPrevious()
@@ -4248,7 +4355,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             useSelectionForFind()
         } else if modifierFlags.contains(.command), normalized == "s" {
             saveNow()
-        } else if findInputController.isFocused, normalized == "\u{1b}" {
+        } else if isFindVisible, pathPromptMode == nil, normalized == "\u{1b}" {
             hideFind()
         } else if pathPromptMode != nil, normalized == "\u{1b}" {
             cancelPathPrompt()
