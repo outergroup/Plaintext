@@ -52,11 +52,41 @@ MainActor.assumeIsolated {
     manager.ensureLayout(for: manager.documentRange)
     let narrowerEndLine = query(.lineForIndex, NSRange(location: text.utf16.count, length: 0))?.index ?? -1
     precondition(narrowerEndLine > endLine, "Width change must invalidate line cache")
+    container.size.width = 1100
+    load("Outer Loop addresses this for two different scenarios:\n- When you already have the server saved in Outer Loop on another device\n- A true \"cold start\"\n\nFollowing paragraph.\n")
+    @MainActor func checkLineEnds() {
+        let string = text as NSString
+        manager.enumerateTextLayoutFragments(from: manager.documentRange.location, options: [.ensuresLayout, .ensuresExtraLineFragment]) { fragment in
+            let base = manager.offset(from: manager.documentRange.location, to: fragment.rangeInElement.location)
+            for line in fragment.textLineFragments {
+                let lower = min(base + line.characterRange.location, string.length)
+                var upper = min(base + NSMaxRange(line.characterRange), string.length)
+                while upper > lower, let scalar = UnicodeScalar(string.character(at: upper - 1)), CharacterSet.newlines.contains(scalar) { upper -= 1 }
+                let point = CGPoint(x: container.size.width - 1, y: fragment.layoutFragmentFrame.minY + line.typographicBounds.midY)
+                let actual = geometry.insertionOffset(at: point, text: text)
+                precondition(actual == upper, "Click past line must stay before its newline: \(actual), expected \(upper)")
+                let left = geometry.insertionOffset(at: CGPoint(x: -20, y: point.y), text: text)
+                precondition(left == lower, "Click before line must select its beginning")
+                let screen = CGRect(x: 0, y: 0, width: container.size.width + 20, height: 10000)
+                let hit = geometry.query(.rangeForPosition, range: .init(location: 0, length: 0),
+                                         point: CGPoint(x: point.x, y: screen.maxY - point.y), text: text,
+                                         generation: generation, viewport: screen, scrollOffset: 0, inset: .zero)
+                precondition(hit?.range.location == upper, "Accessibility must use the same line-end hit test")
+            }
+            return true
+        }
+    }
+    checkLineEnds()
+    load("First 😀 line\r\nSecond line\rThird line\u{2028}Fourth line\u{2029}\n")
+    checkLineEnds()
+    container.size.width = 150
+    load(String(repeating: "wrapped words ", count: 12) + "\n\nFinal line")
+    checkLineEnds()
     load("")
     precondition(query(.rangeForLine)?.range == NSRange(location: 0, length: 0))
     precondition(query(.lineForIndex)?.index == 0)
     precondition(query(.frameForRange)?.frame.height ?? 0 > 0)
-    print("PASS TextKit accessibility geometry: Unicode, wrapping, scrolling, resize, EOF, and empty document")
+    print("PASS TextKit accessibility geometry: Unicode, wrapping, scrolling, resize, line-end clicks, newlines, EOF, and empty document")
 }
 SWIFT
 xcrun swiftc -module-cache-path "$TEST_DIR/modules" "$ROOT/Vendor/OuterframeSwiftMethods/OuterframeAccessibility.swift" \

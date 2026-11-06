@@ -7,6 +7,35 @@ final class PlaintextAccessibilityTextLayout {
 
     init(layoutManager: NSTextLayoutManager) { self.layoutManager = layoutManager }
 
+    func insertionOffset(at textPoint: CGPoint, text: String) -> Int {
+        let string = text as NSString
+        let point = CGPoint(x: max(textPoint.x, 0), y: max(textPoint.y, 0))
+        layoutManager.ensureLayout(for: layoutManager.documentRange)
+        guard let fragment = layoutManager.textLayoutFragment(for: point) else {
+            return point.y <= 0 ? 0 : string.length
+        }
+        let base = layoutManager.offset(from: layoutManager.documentRange.location, to: fragment.rangeInElement.location)
+        let localY = point.y - fragment.layoutFragmentFrame.minY
+        guard let line = fragment.textLineFragment(forVerticalOffset: localY, requiresExactMatch: false) else {
+            return min(max(base, 0), string.length)
+        }
+        let lower = min(max(base + line.characterRange.location, 0), string.length)
+        var upper = min(max(base + NSMaxRange(line.characterRange), lower), string.length)
+        while upper > lower, let scalar = UnicodeScalar(string.character(at: upper - 1)), CharacterSet.newlines.contains(scalar) {
+            upper -= 1
+        }
+        guard lower < upper else { return lower }
+        let localPoint = CGPoint(x: point.x - fragment.layoutFragmentFrame.minX - line.typographicBounds.minX,
+                                 y: localY - line.typographicBounds.minY)
+        let index = line.characterIndex(for: localPoint)
+        guard index != NSNotFound else {
+            let start = line.locationForCharacter(at: lower - base)
+            let end = line.locationForCharacter(at: upper - base)
+            return abs(localPoint.x - start.x) < abs(localPoint.x - end.x) ? lower : upper
+        }
+        return base + min(max(index, lower - base), upper - base)
+    }
+
     func query(_ query: OuterframeAccessibilityTextQuery, range: NSRange, point: CGPoint,
                text: String, generation: Int, viewport: CGRect, scrollOffset: CGFloat, inset: CGSize) -> OuterframeAccessibilityTextResult? {
         let length = text.utf16.count
@@ -33,15 +62,7 @@ final class PlaintextAccessibilityTextLayout {
             guard viewport.contains(point) else { return nil }
             let textPoint = CGPoint(x: max(point.x - viewport.minX - inset.width, 0),
                                     y: max(viewport.maxY - point.y + scrollOffset - inset.height, 0))
-            layoutManager.ensureLayout(for: layoutManager.documentRange)
-            guard let fragment = layoutManager.textLayoutFragment(for: textPoint),
-                  let line = fragment.textLineFragment(forVerticalOffset: textPoint.y - fragment.layoutFragmentFrame.minY, requiresExactMatch: false) else {
-                return OuterframeAccessibilityTextResult(range: NSRange(location: textPoint.y <= 0 ? 0 : length, length: 0))
-            }
-            let base = layoutManager.offset(from: layoutManager.documentRange.location, to: fragment.rangeInElement.location)
-            let localPoint = CGPoint(x: textPoint.x - fragment.layoutFragmentFrame.minX - line.typographicBounds.minX,
-                                     y: textPoint.y - fragment.layoutFragmentFrame.minY - line.typographicBounds.minY)
-            let offset = min(max(base + line.characterIndex(for: localPoint), 0), length)
+            let offset = insertionOffset(at: textPoint, text: text)
             let result = offset < length ? (text as NSString).rangeOfComposedCharacterSequence(at: offset) : NSRange(location: length, length: 0)
             return OuterframeAccessibilityTextResult(range: result)
         case .lineForIndex:

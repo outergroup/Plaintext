@@ -3941,25 +3941,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func textOffset(atTextPoint textPoint: CGPoint) -> Int {
-        let point = CGPoint(x: max(textPoint.x, 0), y: max(textPoint.y, 0))
-        textLayoutManager.ensureLayout(for: textLayoutManager.documentRange)
-        guard let fragment = textLayoutManager.textLayoutFragment(for: point) else {
-            return point.y <= 0 ? 0 : (text as NSString).length
-        }
-        let fragmentFrame = fragment.layoutFragmentFrame
-        let localY = point.y - fragmentFrame.minY
-        guard let line = fragment.textLineFragment(forVerticalOffset: localY, requiresExactMatch: false) else {
-            return utf16Offset(for: fragment.rangeInElement.location)
-        }
-
-        let fragmentStart = utf16Offset(for: fragment.rangeInElement.location)
-        let linePoint = CGPoint(x: point.x - fragmentFrame.minX - line.typographicBounds.minX,
-                                y: localY - line.typographicBounds.minY)
-        let localIndex = line.characterIndex(for: linePoint)
-        let lineLower = line.characterRange.location
-        let lineUpper = line.characterRange.location + line.characterRange.length
-        let clampedLocalIndex = min(max(localIndex, lineLower), lineUpper)
-        return clampedOffset(fragmentStart + clampedLocalIndex)
+        accessibilityTextLayout.insertionOffset(at: textPoint, text: text)
     }
 
     private func updateCursorShape(at point: CGPoint) {
