@@ -454,6 +454,13 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var dragAnchorOffset: Int?
     private var selectionLayers: [CALayer] = []
     private var scrollOffset: CGFloat = 0
+    private lazy var pickerElasticScrolling = ElasticScrollController(host: outerframeHost)
+    private var pickerScrollLayers: [CALayer] = []
+    private var pickerScrollMaximum: CGFloat = 0
+    private var pickerScrollViewport: CGFloat = 0
+    private var elasticScroll = ElasticScrollState()
+    private var elasticScrollCallbackID: UUID?
+    private var displayedScrollOffset: CGFloat { scrollOffset + elasticScroll.displacement }
     private var scrollbarController: ScrollbarController<PlaintextHandler>?
     private lazy var filePickerScrollbarDelegate = FilePickerScrollbarDelegate(owner: self)
     private var filePickerScrollbarController: ScrollbarController<FilePickerScrollbarDelegate>?
@@ -582,6 +589,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             viewIsFocused = isFocused
             updateCursor()
         case .mouseDown(let point, let modifierFlags, let clickCount):
+            let point = pickerElasticScrolling.finish(at: point, in: rootLayer)
             endUndoGroup()
             if modifierFlags.contains(.control) {
                 if pendingFilePicker != nil {
@@ -625,6 +633,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             }
             handleRightMouseDown(point: point, clickCount: clickCount)
         case .keyDown(_, let characters, let charactersIgnoringModifiers, let modifierFlags, _):
+            pickerElasticScrolling.reset()
             if pendingFilePicker != nil,
                handleFilePickerKeyDown(characters: characters,
                                        charactersIgnoringModifiers: charactersIgnoringModifiers,
@@ -636,17 +645,21 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                           modifierFlags: modifierFlags)
         case .magnification(_, let amount, let point, _):
             if pendingFilePicker == nil && editorClipLayer.frame.contains(point) { scheduleTextMagnification(amount) }
-        case .scrollWheelEvent(let point, let delta, _, _, _, let precise):
+        case .scrollWheelEvent(let point, let delta, _, let phase, let momentumPhase, let precise):
             let rootPoint = rootLayer.convert(point, to: rootLayer)
-            if pendingFilePicker != nil, pickerMode == "conflict", filePickerPanelFrame.contains(rootPoint) {
-                filePickerScroll = max(0, filePickerScroll - delta.y * (precise ? 1 : 28)); renderFilePicker()
-            } else if pendingFilePicker != nil, pickerMode == "recent", filePickerPanelFrame.contains(rootPoint) {
-                filePickerScroll = min(max(0, filePickerScroll - delta.y * (precise ? 1 : 28)), max(0, CGFloat(recentFiles.count) * 58 - filePickerPanelFrame.height + 70)); renderFilePicker()
-            } else if pendingFilePicker != nil, filePickerListFrame.contains(rootPoint) {
-                setFilePickerScroll(filePickerScroll - delta.y * (precise ? 1 : filePickerRowHeight))
-            } else if editorClipLayer.frame.contains(rootPoint) {
+            if pendingFilePicker != nil, pickerMode == "conflict", (pickerElasticScrolling.isActive(pickerMode) || filePickerPanelFrame.contains(rootPoint)) {
+                filePickerScroll = scrollPicker(delta: delta.y, precise: precise, phase: phase, momentumPhase: momentumPhase); renderFilePicker(); pickerElasticScrolling.present()
+            } else if pendingFilePicker != nil, pickerMode == "recent", (pickerElasticScrolling.isActive(pickerMode) || filePickerPanelFrame.contains(rootPoint)) {
+                filePickerScroll = scrollPicker(delta: delta.y, precise: precise, phase: phase, momentumPhase: momentumPhase); renderFilePicker(); pickerElasticScrolling.present()
+            } else if pendingFilePicker != nil, (pickerElasticScrolling.isActive(pickerMode) || filePickerListFrame.contains(rootPoint)) {
+                setFilePickerScroll(scrollPicker(delta: delta.y, precise: precise, phase: phase, momentumPhase: momentumPhase))
+            } else if editorClipLayer.frame.contains(rootPoint) || elasticScroll.isTracking || elasticScroll.displacement != 0 {
                 if !preferences.wrapLines { horizontalOffset = min(max(0, horizontalOffset - delta.x * (precise ? 1 : 18)), max(0, editorTextWidth() - editorClipLayer.bounds.width + textInsetX * 2)) }
-                scrollOffset = clampedScrollOffset(scrollOffset - delta.y * (precise ? 1 : scrollLineHeight))
+                scrollOffset = elasticScroll.scroll(by: -delta.y * (precise ? 1 : scrollLineHeight), offset: scrollOffset,
+                                                    maximum: max(contentHeight() - editorClipLayer.bounds.height, 0),
+                                                    viewport: editorClipLayer.bounds.height, phase: phase,
+                                                    momentumPhase: momentumPhase, precise: precise, time: CACurrentMediaTime())
+                updateElasticScrollAnimation()
                 updateViewport()
                 updateCursor()
             }
@@ -802,6 +815,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             showStartupPopover = filePath(from: url) == nil && queryValue("draft") == nil
             openDocument(path: filePath(from: url) ?? "", draftID: queryValue("draft"), target: queryValue("target"))
         case .shutdown:
+            pickerElasticScrolling.reset()
+            resetElasticScroll()
             watchTask?.cancel(); watchTask = nil
             flushDrafts()
             retainedSelf = nil
@@ -811,12 +826,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        resetElasticScroll()
         watchTask?.cancel(); watchTask = nil
         flushDrafts()
         retainedSelf = nil
     }
 
     func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        resetElasticScroll()
         scrollOffset = clampedScrollOffset(offset)
         updateViewport()
         updateCursor()
@@ -1254,7 +1271,18 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         return path
     }
 
+    private func scrollPicker(delta: CGFloat, precise: Bool, phase: NSEvent.Phase, momentumPhase: NSEvent.Phase) -> CGFloat {
+        pickerElasticScrolling.scroll(pickerMode, by: -delta * (precise ? 1 : filePickerRowHeight),
+            offset: filePickerScroll, maximum: pickerScrollMaximum, viewport: pickerScrollViewport,
+            phase: phase, momentumPhase: momentumPhase, precise: precise) { [weak self] in
+                self?.pickerScrollLayers ?? []
+            }
+    }
+
     private func renderFilePickerContents(_ picker: PendingFilePicker) {
+        pickerScrollLayers = []
+        pickerScrollMaximum = 0
+        pickerScrollViewport = 0
         filePickerOverlayLayer.isHidden = false
         filePickerOverlayLayer.frame = rootLayer.bounds
         filePickerOverlayLayer.backgroundColor = nil
@@ -1305,6 +1333,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 let preview = makeTextLayer(size: 12, weight: .regular, color: .labelColor); preview.isWrapped = true; preview.truncationMode = .none
                 let content = NSAttributedString(string: column.1, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular), .foregroundColor: resolvedNSColor(.labelColor)])
                 let contentHeight = max(clip.bounds.height, content.boundingRect(with: CGSize(width: clip.bounds.width, height: 1000000), options: [.usesLineFragmentOrigin, .usesFontLeading]).height + 20)
+                pickerScrollLayers.append(clip)
+                pickerScrollViewport = clip.bounds.height
+                pickerScrollMaximum = max(pickerScrollMaximum, contentHeight - clip.bounds.height)
                 preview.string = content; preview.frame = CGRect(x: 0, y: clip.bounds.height - contentHeight + filePickerScroll, width: clip.bounds.width, height: contentHeight); clip.addSublayer(preview)
             }
             let actions = [("Keep my draft", "keep"), ("Save a copy…", "copy"), ("Discard drafts; use saved file", "discard"), ("Replace server with my draft", "replace")]
@@ -1317,13 +1348,20 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if pickerMode == "recent" {
             filePickerNameFieldFrame = .zero; filePickerListFrame = .zero; filePickerOpenFrame = .zero; filePickerCancelFrame = .zero
             filePickerEntryFrames.removeAll(); filePickerBreadcrumbSegmentFrames.removeAll()
+            let recentViewport = CALayer()
+            recentViewport.frame = CGRect(x: 0, y: 12, width: panelWidth, height: max(panelHeight - 70, 1))
+            recentViewport.bounds = recentViewport.frame
+            recentViewport.masksToBounds = true
+            panel.addSublayer(recentViewport)
+            pickerScrollLayers = [recentViewport]
+            pickerScrollViewport = recentViewport.bounds.height
+            pickerScrollMaximum = max(CGFloat(recentFiles.count) * 58 - pickerScrollViewport, 0)
             if recentFiles.isEmpty { let empty = makeTextLayer(size: 13, weight: .regular, color: .secondaryLabelColor); empty.string = "Files you open appear here."; empty.frame = CGRect(x: 18, y: panelHeight - 94, width: panelWidth - 36, height: 20); panel.addSublayer(empty) }
             for (index, recent) in recentFiles.enumerated() {
                 let row = CGRect(x: 16, y: panelHeight - 112 - CGFloat(index) * 58 + filePickerScroll, width: panelWidth - 32, height: 52)
-                guard row.minY >= 12, row.maxY <= panelHeight - 58 else { continue }
-                let name = makeTextLayer(size: 14, weight: .semibold, color: .labelColor); name.string = (recent.path as NSString).lastPathComponent; name.frame = CGRect(x: row.minX, y: row.minY + 25, width: row.width - 40, height: 20); panel.addSublayer(name)
-                let detail = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor); detail.string = (recent.target == "host" ? "" : recent.target + " · ") + recent.path; detail.frame = CGRect(x: row.minX, y: row.minY + 6, width: row.width - 40, height: 17); panel.addSublayer(detail)
-                let remove = makeTextLayer(size: 20, weight: .regular, color: .secondaryLabelColor); remove.string = "×"; remove.frame = CGRect(x: row.maxX - 28, y: row.minY + 12, width: 28, height: 28); panel.addSublayer(remove)
+                let name = makeTextLayer(size: 14, weight: .semibold, color: .labelColor); name.string = (recent.path as NSString).lastPathComponent; name.frame = CGRect(x: row.minX, y: row.minY + 25, width: row.width - 40, height: 20); recentViewport.addSublayer(name)
+                let detail = makeTextLayer(size: 12, weight: .regular, color: .secondaryLabelColor); detail.string = (recent.target == "host" ? "" : recent.target + " · ") + recent.path; detail.frame = CGRect(x: row.minX, y: row.minY + 6, width: row.width - 40, height: 17); recentViewport.addSublayer(detail)
+                let remove = makeTextLayer(size: 20, weight: .regular, color: .secondaryLabelColor); remove.string = "×"; remove.frame = CGRect(x: row.maxX - 28, y: row.minY + 12, width: 28, height: 28); recentViewport.addSublayer(remove)
                 recentFrames.append((row.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY), remove.frame.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY), recent))
             }
             return
@@ -1376,6 +1414,9 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         filePickerStatusLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
 
         filePickerContentHeight = CGFloat(picker.entries.count) * filePickerRowHeight
+        pickerScrollLayers = [filePickerRowsContentLayer]
+        pickerScrollViewport = listFrame.height
+        pickerScrollMaximum = max(filePickerContentHeight - listFrame.height, 0)
         filePickerScroll = min(max(filePickerScroll, 0), max(filePickerContentHeight - listFrame.height, 0))
         if picker.isLoading {
             resetFilePickerRowLayers()
@@ -2352,6 +2393,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func activate(_ doc: PlaintextDocument) {
+        resetElasticScroll()
         endUndoGroup()
         document = doc; reviewedDisk = nil; showingServerVersion = false
         filePath = doc.draft.path; text = doc.draft.contents
@@ -2871,6 +2913,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func layoutText(keepingCursorVisible: Bool = false) {
+        resetElasticScroll()
         guard editorClipLayer.bounds.width > 0, editorClipLayer.bounds.height > 0 else { return }
         let textWidth = editorTextWidth()
         if abs(textWidth - textLayoutWidth) > 0.5 {
@@ -2898,13 +2941,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             let textWidth = editorTextWidth()
             let contentHeight = max(self.contentHeight() - textInsetY * 2, editorClipLayer.bounds.height)
             textContentLayer.frame = CGRect(x: textInsetX - horizontalOffset,
-                                            y: editorClipLayer.bounds.height - textInsetY - contentHeight + scrollOffset,
+                                            y: editorClipLayer.bounds.height - textInsetY - contentHeight + displayedScrollOffset,
                                             width: textWidth,
                                             height: contentHeight)
             textSelectionLayer.frame = CGRect(x: 0, y: 0, width: textWidth, height: contentHeight)
             scrollbarController?.updateLayout(metrics: ScrollbarController.Metrics(viewportSize: editorClipLayer.bounds.size,
                                                                                     contentHeight: self.contentHeight(),
-                                                                                    scrollOffset: scrollOffset))
+                                                                                    scrollOffset: scrollOffset,
+                                                                                    overscroll: elasticScroll.displacement))
 
             let visibleTextRect = visibleTextContentRect()
             if let coverage = fragmentCoverage,
@@ -3058,7 +3102,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func visibleTextContentRect() -> CGRect {
         CGRect(x: 0,
-               y: max(scrollOffset - textInsetY, 0),
+               y: max(displayedScrollOffset - textInsetY, 0),
                width: editorTextWidth(),
                height: editorClipLayer.bounds.height)
     }
@@ -3068,6 +3112,35 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         let minY = max(rect.minY - overscan, 0)
         let maxY = min(max(rect.maxY + overscan, minY + rect.height), contentHeight)
         return CGRect(x: rect.minX, y: minY, width: rect.width, height: max(maxY - minY, rect.height))
+    }
+
+    private func resetElasticScroll() {
+        elasticScroll.reset()
+        if let callbackID = elasticScrollCallbackID {
+            outerframeHost.stopDisplayLinkCallback(callbackID)
+            elasticScrollCallbackID = nil
+        }
+    }
+
+    private func updateElasticScrollAnimation() {
+        guard elasticScroll.displacement != 0 else {
+            if let callbackID = elasticScrollCallbackID {
+                outerframeHost.stopDisplayLinkCallback(callbackID)
+                elasticScrollCallbackID = nil
+            }
+            return
+        }
+        guard elasticScrollCallbackID == nil else { return }
+        elasticScrollCallbackID = outerframeHost.registerDisplayLinkCallback { [weak self] _ in
+            guard let self else { return }
+            let previous = elasticScroll.displacement
+            elasticScroll.advance(to: CACurrentMediaTime())
+            if elasticScroll.displacement != previous {
+                updateViewport()
+                updateCursor()
+            }
+            updateElasticScrollAnimation()
+        }
     }
 
     private func clampedScrollOffset(_ proposed: CGFloat) -> CGFloat {
@@ -3277,6 +3350,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func ensureCursorVisible() {
+        resetElasticScroll()
         guard let rect = caretTopDownRect(for: cursorOffset) else { return }
         if !preferences.wrapLines {
             let width = max(editorClipLayer.bounds.width - textInsetX * 2, 1)
@@ -3543,9 +3617,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         case "moveToEndOfDocumentAndModifySelection":
             move(to: (text as NSString).length, modifySelection: true)
         case "pageUp":
+            resetElasticScroll()
             scrollOffset = clampedScrollOffset(scrollOffset - editorClipLayer.bounds.height)
             updateViewport()
         case "pageDown":
+            resetElasticScroll()
             scrollOffset = clampedScrollOffset(scrollOffset + editorClipLayer.bounds.height)
             updateViewport()
         case "selectAll":
@@ -3936,7 +4012,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private func textOffset(atRootPoint point: CGPoint) -> Int {
         let local = editorClipLayer.convert(rootLayer.convert(point, to: rootLayer), from: rootLayer)
         let topDown = CGPoint(x: local.x - textInsetX,
-                              y: editorClipLayer.bounds.height - local.y + scrollOffset - textInsetY)
+                              y: editorClipLayer.bounds.height - local.y + displayedScrollOffset - textInsetY)
         return textOffset(atTextPoint: topDown)
     }
 
@@ -4204,7 +4280,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
         guard identifier == accessibilityIDs["editor"], pendingFilePicker == nil, !isLoading else { return nil }
         return accessibilityTextLayout.query(query, range: range, point: point, text: text, generation: generation,
-            viewport: editorClipLayer.frame, scrollOffset: scrollOffset, inset: CGSize(width: textInsetX, height: textInsetY))
+            viewport: editorClipLayer.frame, scrollOffset: displayedScrollOffset, inset: CGSize(width: textInsetX, height: textInsetY))
     }
 
     private var accessibilityIDs: [String: UInt32] = [:]

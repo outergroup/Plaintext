@@ -20,12 +20,14 @@ final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
         let contentHeight: CGFloat
         let scrollOffset: CGFloat
         let magnification: CGFloat?
+        let overscroll: CGFloat
 
-        init(viewportSize: CGSize, contentHeight: CGFloat, scrollOffset: CGFloat, magnification: CGFloat? = nil) {
+        init(viewportSize: CGSize, contentHeight: CGFloat, scrollOffset: CGFloat, magnification: CGFloat? = nil, overscroll: CGFloat = 0) {
             self.viewportSize = viewportSize
             self.contentHeight = contentHeight
             self.scrollOffset = scrollOffset
             self.magnification = magnification
+            self.overscroll = overscroll
         }
     }
 
@@ -187,7 +189,7 @@ final class ScrollbarController<Delegate: ScrollbarControllerDelegate> {
 
         let knobProportion = min(max(metrics.viewportSize.height / metrics.contentHeight, 0.05), 1.0)
         let desiredKnobHeight = trackLayer.bounds.height * knobProportion
-        let knobHeight = min(max(desiredKnobHeight, 12), trackLayer.bounds.height)
+        let knobHeight = min(trackLayer.bounds.height, max(6, min(max(desiredKnobHeight, 12), trackLayer.bounds.height) - abs(metrics.overscroll)))
         let knobRange = max(trackLayer.bounds.height - knobHeight, 0)
         let normalizedOffset = normalizedOffset(forScrollOffset: scrollOffset,
                                                 maxOffset: maxOffset)
