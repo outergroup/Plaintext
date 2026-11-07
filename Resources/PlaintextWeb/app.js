@@ -237,8 +237,9 @@ const find=(()=>{
   const style=getComputedStyle(editor);
   overlay.removeAttribute('style');
   for(const name of style)overlay.style.setProperty(name,style.getPropertyValue(name));
-  Object.assign(overlay.style,{display:'block',position:'absolute',left:editor.offsetLeft+'px',top:editor.offsetTop+'px',width:editor.offsetWidth+'px',height:editor.offsetHeight+'px',
-   minHeight:'0',maxHeight:'none',margin:'0',overflow:'hidden',pointerEvents:'none',background:'transparent',color:'transparent',webkitTextFillColor:'transparent',borderColor:'transparent',boxShadow:'none',outline:'none',zIndex:'1',transform:'none'});
+  const bounds=editor.getBoundingClientRect();
+  Object.assign(overlay.style,{display:'block',position:'relative',flex:'none',width:bounds.width+'px',height:bounds.height+'px',
+   minHeight:'0',maxHeight:'none',margin:'0',marginTop:-bounds.height+'px',overflow:'hidden',pointerEvents:'none',background:'transparent',color:'transparent',webkitTextFillColor:'transparent',borderColor:'transparent',boxShadow:'none',outline:'none',zIndex:'1',transform:'none'});
   const text=editor.value,fragment=document.createDocumentFragment();let last=0;
   for(const [index,match] of matches.entries()){
    fragment.append(text.slice(last,match.start));
