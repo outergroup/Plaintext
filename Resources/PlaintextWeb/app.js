@@ -390,7 +390,7 @@ function renderDocument(){
  const onHost=(doc?.target||state.target)==='host';
  $('#location-target').hidden=onHost;$('.location-separator').hidden=onHost;
  $('.document-toolbar').toggleAttribute('data-preparing-document',state.replacing&&!doc);
- if(!doc){$('#pathLabel').textContent='Untitled';$('#path').title='Move / Rename… — Untitled';}
+ if(!doc){$('#pathLabel').textContent='Untitled';$('#path').title='Save…';}
  const saving=!!doc?.pendingSave&&doc.pendingSave.version===doc.version&&!doc.localError&&!doc.networkError&&!doc.conflict;
  $('#dirty').textContent=dirty?'Edited':'';
  $('#save').hidden=!dirty;
@@ -450,7 +450,7 @@ async function renderRecentFiles(){
  $('#recent-empty').hidden=records.length>0;
 }
 function documentURL(doc){return '?'+new URLSearchParams({file:doc.path,target:doc.target,draft:doc.id}).toString().replace(/%2F/gi,'/');}
-function showPath(doc){rememberFile(doc);$('#targetLabel').textContent=targetName(doc.target);const label=$('#pathLabel');label.replaceChildren();const parts=doc.path.split('/').filter(Boolean);const filename=document.createElement('strong');filename.textContent=parts.pop()||'Untitled';if(parts.length||doc.path.startsWith('/')){const parent=document.createElement('span');parent.className='parent-path';parent.textContent=(doc.path.startsWith('/')?'/':'')+(parts.length?parts.join('/')+'/':'');label.append(parent)}label.append(filename);$('#path').title='Move / Rename… — '+(doc.path||'Untitled');if(new URLSearchParams(location.search).get('draft')===doc.id)history.replaceState(null,'',documentURL(doc));}
+function showPath(doc){rememberFile(doc);$('#targetLabel').textContent=targetName(doc.target);const label=$('#pathLabel');label.replaceChildren();const parts=doc.path.split('/').filter(Boolean);const filename=document.createElement('strong');filename.textContent=parts.pop()||'Untitled';if(parts.length||doc.path.startsWith('/')){const parent=document.createElement('span');parent.className='parent-path';parent.textContent=(doc.path.startsWith('/')?'/':'')+(parts.length?parts.join('/')+'/':'');label.append(parent)}label.append(filename);$('#path').title='Move, rename, or duplicate… — '+(doc.path||'Untitled');if(new URLSearchParams(location.search).get('draft')===doc.id)history.replaceState(null,'',documentURL(doc));}
 let fileNotifications=null;
 function updateFileNotifications(restart=false){
  const doc=state.active;
@@ -642,7 +642,7 @@ new ResizeObserver(scheduleStartPosition).observe($('.document-toolbar'));
 function showStartOverlay(duringNavigation=false){
  const overlay=$('#start-overlay');
  if(overlay.open||(!duringNavigation&&state.replacing))return;
- movingDocument=null;overlay.dataset.mode='open';overlay.setAttribute('aria-label','Open files');$('#move-fields').hidden=true;$('#choose').textContent='Open file';$('#picker').setAttribute('aria-labelledby','start-open');
+ movingDocument=null;overlay.dataset.mode='open';overlay.setAttribute('aria-label','Open files');$('#move-fields').hidden=$('#name-row').hidden=$('#duplicate').hidden=true;$('#choose').textContent='Open file';$('#picker').setAttribute('aria-labelledby','start-open');
  $('#document-menu').open=false;$('#document-info').open=false;
  selectStartTab('recent');$('#start-overlay-status').textContent='';$('#start-overlay-content').insertBefore($('#start-screen'),$('#start-overlay-status'));$('#start-screen').hidden=false;
  overlay.show();$('#home').setAttribute('aria-expanded','true');positionStartOverlay();void renderRecentFiles();
@@ -666,9 +666,9 @@ async function moveDocument(){
  if($('#start-overlay').open&&movingDocument){$('#start-overlay').close();return;}
  if(!doc.path){await save(doc);return;}
  if(doc.dirty||doc.pendingSave){status('Save this file and wait for confirmation before moving it.');return;}
- showStartOverlay();movingDocument=doc;$('#move-heading').textContent='Move or rename file';$('#start-overlay').dataset.mode='move';$('#start-overlay').setAttribute('aria-label','Move or rename file');
+ showStartOverlay();movingDocument=doc;$('#move-heading').textContent='Move or duplicate';$('#start-overlay').dataset.mode='move';$('#start-overlay').setAttribute('aria-label','Move or duplicate file');
  $('#home').setAttribute('aria-expanded','false');$('#path').setAttribute('aria-expanded','true');
- $('#move-fields').hidden=false;$('#move-name').value=doc.path.split('/').pop();$('#choose').textContent='Move';
+ $('#move-fields').hidden=$('#name-row').hidden=$('#duplicate').hidden=false;$('#move-name').value=doc.path.split('/').pop();$('#choose').textContent='Move';
  $('#picker').setAttribute('aria-labelledby','move-heading');selectStartTab('open');
  state.target=doc.target;positionStartOverlay();
  void pickerLoad(doc.path.slice(0,doc.path.lastIndexOf('/'))||'/');
@@ -677,7 +677,7 @@ function showSavePicker(doc=state.active,copy=false){
  if(!doc)return;
  showStartOverlay();movingDocument=doc;
  const overlay=$('#start-overlay');overlay.dataset.mode=copy?'copy':'save';overlay.setAttribute('aria-label',copy?'Save a copy':'Save text file');
- $('#move-heading').textContent=copy?'Save a copy':'Save text file';$('#move-fields').hidden=false;
+ $('#move-heading').textContent=copy?'Save a copy':'Save text file';$('#move-fields').hidden=$('#name-row').hidden=false;$('#duplicate').hidden=true;
  $('#move-name').value=copy?(doc.path.split('/').pop()||'Untitled.txt')+'.copy':doc.path.split('/').pop()||'Untitled.txt';
  $('#choose').textContent='Save';$('#picker').setAttribute('aria-labelledby','move-heading');
  $('#home').setAttribute('aria-expanded','false');$('#path').setAttribute('aria-expanded','true');
@@ -687,7 +687,7 @@ function showSavePicker(doc=state.active,copy=false){
 function updatePickerAction(){
  if(!movingDocument){$('#choose').disabled=!state.pickerSelected||state.pickerSelected.directory;return;}
  const name=$('#move-name').value;
- $('#choose').disabled=state.replacing||!state.pickerReady||!name.trim()||name==='.'||name==='..'||name.includes('/')||name.includes('\0');
+ $('#choose').disabled=$('#duplicate').disabled=state.replacing||!state.pickerReady||!name.trim()||name==='.'||name==='..'||name.includes('/')||name.includes('\0');
 }
 async function confirmMove(){
  const doc=movingDocument;if(!doc||$('#choose').disabled)return;
@@ -711,6 +711,27 @@ async function confirmMove(){
  }catch(e){$('#start-overlay-status').textContent=e.message;}
  finally{state.replacing=false;$('#move-name').disabled=false;renderDocument();updatePickerAction();}
 }
+function duplicateName(name,taken){
+ const dot=name.lastIndexOf('.'),base=dot>0?name.slice(0,dot):name,extension=dot>0?name.slice(dot):'';
+ for(let index=1;;index++){const candidate=base+(index===1?' copy':' copy '+index)+extension;if(!taken.has(candidate))return candidate;}
+}
+async function duplicateDocument(){
+ const doc=movingDocument;if(!doc||$('#duplicate').disabled)return;
+ if(doc!==state.active||doc.dirty||doc.pendingSave){$('#start-overlay-status').textContent='Save this file before duplicating it.';return;}
+ const folder=state.pickerPath.replace(/\/$/,''),target=state.target;
+ state.replacing=true;renderDocument();updatePickerAction();$('#move-name').disabled=true;
+ try{
+  const listing=await api('list',{path:state.pickerPath},doc);
+  const taken=new Set(listing.entries.map(entry=>entry.name));
+  let name=$('#move-name').value;
+  if(folder+'/'+name===doc.path)name=duplicateName(name,taken);
+  else if(taken.has(name))throw Error('“'+name+'” already exists in this folder.');
+  if(!await doc.saveTo(folder+'/'+name,target,true))throw Error(doc.localError||'Could not duplicate this file.');
+  $('#start-overlay').close();
+ }catch(e){$('#start-overlay-status').textContent=e.message;}
+ finally{state.replacing=false;$('#move-name').disabled=false;renderDocument();updatePickerAction();}
+}
+$('#duplicate').onclick=e=>{e.preventDefault();void duplicateDocument();};
 $('#move-name').addEventListener('input',updatePickerAction);
 $('#move-name').addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();void confirmMove();}});
 $('#move').onclick=()=>{$('#document-info').open=false;void moveDocument();};$('#path').onclick=moveDocument;

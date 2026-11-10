@@ -480,6 +480,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var filePickerNameFieldFrame = CGRect.zero
     private var filePickerCancelFrame = CGRect.zero
     private var filePickerOpenFrame = CGRect.zero
+    private var filePickerDuplicateFrame = CGRect.zero
     private var filePickerBreadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
     private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntryRecord, index: Int)] = []
     private var filePickerVisibleRowLayers: [Int: CALayer] = [:]
@@ -1286,6 +1287,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func renderFilePickerContents(_ picker: PendingFilePicker) {
+        filePickerDuplicateFrame = .zero
         pickerScrollLayers = []
         pickerScrollMaximum = 0
         pickerScrollViewport = 0
@@ -1374,7 +1376,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
 
         let title = makeTextLayer(size: 15, weight: .semibold, color: .labelColor)
-        title.string = pickerMode == "move" ? "Move or rename file" : pickerMode == "copy" ? "Save a copy" : "Save text file"
+        title.string = pickerMode == "move" ? "Move or duplicate" : pickerMode == "copy" ? "Save a copy" : "Save text file"
         title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
         if pickerMode != "open" { panel.addSublayer(title) }
 
@@ -1464,6 +1466,14 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         open.frame = openLocal
         open.opacity = picker.isLoading || !picker.error.isEmpty ? 0.4 : 1
         panel.addSublayer(open)
+        if pickerMode == "move" {
+            let duplicateLocal = CGRect(x: openLocal.minX - 94, y: openLocal.minY, width: 86, height: openLocal.height)
+            filePickerDuplicateFrame = duplicateLocal.offsetBy(dx: panelFrame.minX, dy: panelFrame.minY)
+            let duplicate = makeButtonLayer(title: "Duplicate", emphasized: false)
+            duplicate.frame = duplicateLocal
+            duplicate.opacity = open.opacity
+            panel.addSublayer(duplicate)
+        }
     }
 
     private func setFilePickerOverlayOpacity(_ opacity: Float) {
@@ -1892,6 +1902,59 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         } else { dismissFilePickerForNavigation(); openDocument(path: path, target: pickerTarget) }
     }
 
+    private func duplicateFromFilePicker() {
+        guard pickerMode == "move", let picker = pendingFilePicker, !picker.isLoading, picker.error.isEmpty,
+              let document, let session = urlSession, let endpoint = environmentEndpoint else { return }
+        let name = filePickerNameInputController.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else { NSSound.beep(); return }
+        guard !document.draft.dirty, document.draft.pending == nil else {
+            statusText = "Save this file before duplicating it"; renderHeader(); return
+        }
+        let directory = picker.directory, target = document.draft.target
+        Task {
+            do {
+                let taken = try await Self.directoryEntryNames(session: session, endpoint: endpoint, target: target, path: directory)
+                var copyName = name
+                if (directory as NSString).appendingPathComponent(name) == document.draft.path {
+                    copyName = Self.duplicateName(for: name, taken: taken)
+                } else if taken.contains(name) {
+                    statusText = "“\(name)” already exists in this folder"; renderHeader(); return
+                }
+                guard pendingFilePicker != nil, self.document === document else { return }
+                dismissFilePicker()
+                await document.saveTo(path: (directory as NSString).appendingPathComponent(copyName), target: target, copy: true)
+            } catch {
+                statusText = error.localizedDescription; renderHeader()
+            }
+        }
+    }
+
+    private static func duplicateName(for name: String, taken: Set<String>) -> String {
+        let ext = (name as NSString).pathExtension
+        let base = ext.isEmpty ? name : (name as NSString).deletingPathExtension
+        let suffix = ext.isEmpty ? "" : "." + ext
+        var index = 1
+        while true {
+            let candidate = base + (index == 1 ? " copy" : " copy \(index)") + suffix
+            if !taken.contains(candidate) { return candidate }
+            index += 1
+        }
+    }
+
+    private static func directoryEntryNames(session: URLSession, endpoint: URL, target: String, path: String) async throws -> Set<String> {
+        var request = URLRequest(url: endpoint); request.httpMethod = "POST"
+        request.setValue("1", forHTTPHeaderField: "X-Environment-Request")
+        request.httpBody = try PlaintextEnvironment.encode(1, target: target, path: path)
+        let (data, _) = try await session.data(for: request)
+        let envelope = BinaryPayloadReader(data: data)
+        if try envelope.uint32(at: 12) != 0 { throw PlaintextDocumentError.message(try envelope.stringRef(at: 32)) }
+        let metadata = try envelope.child(at: 16), count = Int(try metadata.uint32(at: 20))
+        guard count <= 100_000 else { throw PlaintextDocumentError.message("Directory is too large") }
+        var names = Set<String>()
+        for index in 0..<count { names.insert(try metadata.stringRef(at: 64 + index * 48)) }
+        return names
+    }
+
     private func moveFilePickerSelection(delta: Int) {
         guard let entries = pendingFilePicker?.entries, !entries.isEmpty else { return }
         let nextIndex = min(max((filePickerSelectedIndex ?? (delta > 0 ? -1 : entries.count)) + delta, 0), entries.count - 1)
@@ -1969,6 +2032,10 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
         if filePickerOpenFrame.contains(rootPoint) {
             openFilePickerTypedPath()
+            return true
+        }
+        if filePickerDuplicateFrame.contains(rootPoint) {
+            duplicateFromFilePicker()
             return true
         }
         if filePickerNameFieldFrame.contains(rootPoint) {
@@ -4505,8 +4572,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 if action == .setValue { owner.filePickerNameInputController.setText(value) }
             })
             }
+            if pickerMode == "move" {
+                children.append(axNode("duplicate", .button, filePickerDuplicateFrame, "Duplicate", actions: [.press], enabled: !picker.isLoading && picker.error.isEmpty) { owner, _, _ in owner.duplicateFromFilePicker() })
+            }
             children.append(axNode("open", .button, filePickerOpenFrame, pickerMode == "move" ? "Move" : pickerMode == "open" ? "Open file" : "Save", actions: [.press], enabled: !picker.isLoading && picker.error.isEmpty) { owner, _, _ in owner.openFilePickerTypedPath() })
-            return OuterframeAccessibilitySnapshot(rootNodes: [axNode("picker", .dialog, filePickerPanelFrame, pickerMode == "move" ? "Move or rename file" : pickerMode == "save" ? "Save text file" : pickerMode == "copy" ? "Save a copy" : "Open files", children: children)])
+            return OuterframeAccessibilitySnapshot(rootNodes: [axNode("picker", .dialog, filePickerPanelFrame, pickerMode == "move" ? "Move or duplicate" : pickerMode == "save" ? "Save text file" : pickerMode == "copy" ? "Save a copy" : "Open files", children: children)])
         }
         if let mode = pathPromptMode {
             children.append(axNode("path-prompt", .textField, headerLayer.convert(pathControlFrame, to: rootLayer), "\(mode.label) path",
@@ -4520,7 +4590,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                 }
             })
         } else {
-            children.append(axNode("file-actions", .button, headerLayer.convert(pathControlFrame, to: rootLayer), "Move or rename file",
+            children.append(axNode("file-actions", .button, headerLayer.convert(pathControlFrame, to: rootLayer), "Move or duplicate file",
                                    value: documentDisplayName(), actions: [.press, .showMenu]) { owner, _, _ in
                 let frame = owner.headerLayer.convert(owner.pathControlFrame, to: owner.rootLayer)
                 _ = frame; owner.showMoveRenamePrompt()
