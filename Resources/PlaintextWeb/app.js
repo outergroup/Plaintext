@@ -170,7 +170,7 @@ function configureTextSize(){
   if(!touchPinch&&!gesturePinch)return;event.preventDefault();
   if(gesturePinch){gesturePinch=null;end();}
  },{passive:false});
- window.addEventListener('pagehide',()=>{flush();persist();});
+ window.addEventListener('pagehide',()=>{rememberDocumentView();flush();persist();});
  apply(scale);
 }
 configureTextSize();
@@ -499,7 +499,23 @@ async function createDocument(record, forkIfLocked=true){
  await doc.persist();
  return doc;
 }
-function activate(doc){delete doc.recentFileKey;state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;find.close();$('#editor').value=doc.contents;window.scrollTo(0,0);documentChanged(doc);doc.resume();}
+const documentViewsKey='plaintext.document-views';
+function documentViewKey(doc){return JSON.stringify(doc.path?[storageUser,doc.target,doc.path]:[storageUser,'draft',doc.id]);}
+function readDocumentViews(){try{const views=JSON.parse(localStorage.getItem(documentViewsKey)||'[]');return Array.isArray(views)?views:[];}catch{return [];}}
+function rememberDocumentView(doc=state.active){
+ if(!doc||state.active!==doc||updateFrozen)return;
+ const editor=$('#editor'),key=documentViewKey(doc);
+ const view={key,start:editor.selectionStart,end:editor.selectionEnd,direction:editor.selectionDirection,x:window.scrollX,y:window.scrollY,left:editor.scrollLeft};
+ try{localStorage.setItem(documentViewsKey,JSON.stringify([view,...readDocumentViews().filter(v=>v?.key!==key)].slice(0,200)));}catch{}
+}
+function restoreDocumentView(doc){
+ const editor=$('#editor'),view=readDocumentViews().find(v=>v?.key===documentViewKey(doc));
+ if(!view){editor.setSelectionRange(0,0);window.scrollTo(0,0);return;}
+ const length=editor.value.length;
+ editor.setSelectionRange(Math.min(view.start,length),Math.min(view.end,length),view.direction);
+ editor.scrollLeft=view.left;window.scrollTo(view.x,view.y);
+}
+function activate(doc){delete doc.recentFileKey;state.active?.setWatching(false);state.active=doc;doc.setWatching(!document.hidden);state.target=doc.target;find.close();$('#editor').value=doc.contents;restoreDocumentView(doc);documentChanged(doc);doc.resume();}
 let navigationVersion=0,navigationTask=Promise.resolve();
 function currentRoute(){
  const parameters=new URLSearchParams(location.search);
@@ -512,6 +528,7 @@ function navigateRoute(route,mode=state.active?'push':'replace'){
   if(version!==navigationVersion)return;
   state.replacing=true;renderDocument();
   try{
+   rememberDocumentView();
    if(state.active&&!(await state.active.persist()))throw Error(state.active.message);
    if(route?.path||route?.draftID)status('Opening…');
    const doc=route?await resolveDocument(route):null;
@@ -848,9 +865,9 @@ for(const id of ['document-menu','document-info']){
 window.addEventListener('beforeunload',e=>{if([...documents.values()].some(doc=>doc.localError||doc.localVersion<doc.version)){e.preventDefault();e.returnValue='';}});
 window.addEventListener('focus',()=>{if($('#start-overlay').open)void renderRecentFiles();});
 window.addEventListener('online',()=>{if(updateFrozen)return;updateFileNotifications(true);for(const doc of documents.values())doc.resume();void discover();});
-document.addEventListener('visibilitychange',()=>{if(updateFrozen)return;for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});
+document.addEventListener('visibilitychange',()=>{if(updateFrozen)return;if(document.hidden)rememberDocumentView();for(const doc of documents.values()){doc.setWatching(doc===state.active&&!document.hidden);void doc.persist();if(!document.hidden)doc.resume();}updateFileNotifications();});
 window.addEventListener('focus',()=>{if(!updateFrozen&&!document.hidden){updateFileNotifications(true);state.active?.resume();}});
-window.addEventListener('pagehide',()=>{fileNotifications?.stream.stop();fileNotifications=null;for(const doc of documents.values()){void doc.persist();doc.stop();}});
+window.addEventListener('pagehide',()=>{rememberDocumentView();fileNotifications?.stream.stop();fileNotifications=null;for(const doc of documents.values()){void doc.persist();doc.stop();}});
 window.addEventListener('pageshow',event=>{if(event.persisted){state.replacing=false;renderDocument();updateFileNotifications(true);for(const doc of documents.values())doc.resume();if(!state.active)void renderRecentFiles();}});
 let shellUpdates=null,updateFrozen=false,updateEpoch=0,bootFinished=false,lastInteraction=0,activeRequests=0;
 let updateView=null;

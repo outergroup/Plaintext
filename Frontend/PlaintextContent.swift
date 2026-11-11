@@ -170,6 +170,12 @@ private struct NativeRecentFile: Codable {
     var path: String
     var target: String
 }
+private struct NativeDocumentView: Codable {
+    var cursorOffset: Int
+    var selectionAnchor: Int?
+    var scrollOffset: CGFloat
+    var horizontalOffset: CGFloat
+}
 private struct NativePreferences: Codable {
     var textScale: CGFloat = 1
     var wrapLines = true
@@ -367,6 +373,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     private var recentFilesTask: Task<Void, Never>?
     private var preferences = NativePreferences()
     private var preferencesWriteTask: Task<Void, Never>?
+    private var documentViews: [String: NativeDocumentView] = [:]
     private var watchTask: Task<Void, Never>?
     private var watchedKey = ""
     private var pickerMode = "open"
@@ -825,6 +832,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             pickerElasticScrolling.reset()
             resetElasticScroll()
             watchTask?.cancel(); watchTask = nil
+            rememberDocumentView()
             flushDrafts()
             retainedSelf = nil
         default:
@@ -835,6 +843,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
         resetElasticScroll()
         watchTask?.cancel(); watchTask = nil
+        rememberDocumentView()
         flushDrafts()
         retainedSelf = nil
     }
@@ -2558,12 +2567,41 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         return doc
     }
 
-    private func activate(_ doc: PlaintextDocument) {
+    private func documentViewKey(_ draft: PlaintextDraft) -> String {
+        draft.path.isEmpty ? "view:draft:" + draft.id : "view:" + draft.target + ":" + draft.path
+    }
+
+    private func rememberDocumentView() {
+        guard let document else { return }
+        let key = documentViewKey(document.draft)
+        let view = NativeDocumentView(cursorOffset: cursorOffset, selectionAnchor: selectionAnchor,
+                                      scrollOffset: scrollOffset, horizontalOffset: horizontalOffset)
+        documentViews[key] = view
+        guard let store = draftStore, let data = try? JSONEncoder().encode(view) else { return }
+        Task { try? await store.putSetting(key, value: data) }
+    }
+
+    private func savedDocumentView(_ draft: PlaintextDraft) async -> NativeDocumentView? {
+        let key = documentViewKey(draft)
+        if let view = documentViews[key] { return view }
+        guard let data = try? await draftStore?.setting(key) else { return nil }
+        return try? JSONDecoder().decode(NativeDocumentView.self, from: data)
+    }
+
+    private func activate(_ doc: PlaintextDocument, view: NativeDocumentView?) {
         resetElasticScroll()
         endUndoGroup()
         document = doc; reviewedDisk = nil; showingServerVersion = false
         filePath = doc.draft.path; text = doc.draft.contents
         cursorOffset = 0; selectionAnchor = nil; scrollOffset = 0; horizontalOffset = 0
+        if let view {
+            let length = text.utf16.count
+            cursorOffset = min(max(view.cursorOffset, 0), length)
+            selectionAnchor = view.selectionAnchor.map { min(max($0, 0), length) }
+            if selectionAnchor == cursorOffset { selectionAnchor = nil }
+            scrollOffset = view.scrollOffset
+            horizontalOffset = preferences.wrapLines ? 0 : max(0, view.horizontalOffset)
+        }
         clearMarkedTextState()
         doc.changed?(); updateTextContent(force: true); layout()
         rememberRecent(); startWatching(); doc.resume()
@@ -2572,6 +2610,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
 
     private func openDocument(path: String, draftID: String? = nil, new: Bool = false, target requestedTarget: String? = nil) {
         guard !isLoading, let store = draftStore, let session = urlSession, let endpoint = environmentEndpoint else { return }
+        rememberDocumentView()
         isLoading = true; statusText = "Opening…"; renderHeader()
         let target = requestedTarget ?? document?.draft.target ?? queryValue("target") ?? "host"
         Task {
@@ -2585,7 +2624,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                     records = []
                 }
                 var record = (new || (path.isEmpty && draftID == nil)) ? nil : records.first { draftID != nil ? $0.id == draftID : $0.path == path && $0.target == target }
-                if let record, let existing = documents[record.id] { activate(existing); return }
+                if let record, let existing = documents[record.id] { activate(existing, view: await savedDocumentView(existing.draft)); return }
                 if record == nil {
                     var fresh = PlaintextDraft(); fresh.target = target; fresh.path = path
                     if !path.isEmpty {
@@ -2608,7 +2647,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
                     selectedStore = PlaintextDraftStore(directory: nil, unavailableReason: error.localizedDescription)
                 }
                 guard let doc = makeDocument(selected, storage: selectedStore) else { return }
-                _ = await doc.persist(); activate(doc)
+                _ = await doc.persist(); activate(doc, view: await savedDocumentView(doc.draft))
                 if !didRestoreQueue {
                     didRestoreQueue = true
                     for record in records where record.pending != nil && !record.conflict && documents[record.id] == nil {
