@@ -101,6 +101,13 @@ page checks the current revision to catch missed events. There is no periodic fi
 polling; blank stream heartbeats only keep the connection alive. Container watches
 use the helper’s `watch PATH` command and require an updated helper in the container.
 
+A file that no longer exists reads as revision `missing` with empty contents
+instead of failing. When an open document's file is moved or deleted elsewhere,
+both editors keep its text, mark it **Not on disk**, and **Save** creates the
+file again, including missing parent folders. Recent files on the host that no
+longer exist are pruned from the list; container recents are not checked. Container
+targets need an updated helper for this.
+
 The HTML client uses `state`, `publish`, and `commit` operations. Each shared draft
 has a content revision separate from the saved file revision. Publish and commit
 compare both revisions under a per-document filesystem lock; commit only removes

@@ -85,7 +85,11 @@ static bool save_file(const char *path, Bytes body, const char *expected) {
         fail("document exceeds the 4 MiB limit");
         return false;
     }
-    char dest[PATH_MAX];
+    char dest[PATH_MAX], directory[PATH_MAX];
+    parent_path(path, directory);
+    struct stat parent_stat;
+    if (!strcmp(expected, "missing") && stat(directory, &parent_stat) && errno == ENOENT && !mkdirs(directory))
+        return false;
     if (!save_destination(path, dest) || !check_revision(dest, expected))
         return false;
     struct stat old;
@@ -274,8 +278,14 @@ BinaryReply local_binary_operation(const Request *request, Bytes body) {
             fail("invalid file size limit");
             break;
         }
+        errno = 0;
         r.body = read_file(path, (size_t)request->limit, true);
-        if (r.body.data) {
+        if (!r.body.data && (errno == ENOENT || errno == ENOTDIR)) {
+            failure[0] = 0;
+            r = response_create(op, 0, 0);
+            binary_string(&r.metadata, 48, path);
+            binary_string(&r.metadata, 56, "missing");
+        } else if (r.body.data) {
             Bytes data = r.body;
             r = response_create(op, 0, 0);
             r.body = data;

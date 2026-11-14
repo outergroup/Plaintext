@@ -46,10 +46,18 @@ const PlaintextDrafts = (() => {
             this.watching = false; this.refreshEpoch = 0; this.refreshNeeded = false;
         }
         notify() { this.changed(this); }
+        get missing() { return !!this.path && this.revision === 'missing' && !this.pendingSave; }
+        fileVanished(current) {
+            this.revision = 'missing'; this.draftRevision = current.draftRevision;
+            if (current.dirty) this.contents = current.contents;
+            this.dirty = true; this.version++; this.updatedAt = Date.now();
+            if (current.dirty) this.remoteVersion = this.version;
+        }
         get message() {
             if (this.localError) return 'Not saved on this device: '+this.localError+'. Keep this page open or download a copy.';
             if (this.conflict) return 'Changes were made on another device. Review changes before continuing.';
             if (this.networkError) return (this.pendingSave?'Save queued. ':'')+this.networkError;
+            if (this.missing) return 'This file is not on disk. It may have been moved or deleted. Save to create it again.';
             return '';
         }
         edit(contents) {
@@ -109,6 +117,13 @@ const PlaintextDrafts = (() => {
                     this.target !== target || this.user !== user || this.remoteVersion < this.version || this.pendingSave ||
                     this.conflict || this.composing) return;
                 if (disk.revision === revision && disk.draftRevision === this.draftRevision && disk.dirty === this.dirty && !!disk.draftConflict === this.conflict) return;
+                if (disk.revision === 'missing' && revision !== 'missing') {
+                    this.fileVanished(disk);
+                    this.notify();
+                    await this.persist();
+                    void this.sync();
+                    return;
+                }
                 this.contents = disk.contents; this.revision = disk.revision; this.draftRevision = disk.draftRevision;
                 this.dirty = disk.dirty; this.conflict = !!disk.draftConflict;
                 this.version++; this.remoteVersion = this.version; this.updatedAt = Date.now();
@@ -158,7 +173,12 @@ const PlaintextDrafts = (() => {
                         let disk;
                         try { disk = await this.api('disk', {path:saved.path}, this); }
                         catch { throw error; }
-                        if (disk.contents === saved.contents) { result = {...disk, draftRevision:'missing'}; this.refreshNeeded = true; }
+                        if (disk.revision === 'missing' && saved.revision !== 'missing' && !error.conflict) {
+                            const current = await this.api('state', {path:saved.path}, this);
+                            if (current.revision !== 'missing') throw error;
+                            if (this.path === saved.path) { this.revision = 'missing'; this.draftRevision = current.draftRevision; }
+                            result = await this.api('commit', {...saved, revision:'missing', draftRevision:current.draftRevision}, this);
+                        } else if (disk.contents === saved.contents) { result = {...disk, draftRevision:'missing'}; this.refreshNeeded = true; }
                         else if (disk.revision !== saved.revision) {
                             this.conflict = true; this.networkError = ''; await this.persist(); return;
                         } else throw error;
@@ -174,6 +194,12 @@ const PlaintextDrafts = (() => {
                         try { current = await this.api('state', {path:published.path}, this); }
                         catch { throw error; }
                         if (current.contents === published.contents && current.revision === published.revision && !current.draftConflict) result = current;
+                        else if (current.revision === 'missing' && published.revision !== 'missing' && current.draftRevision === published.draftRevision) {
+                            if (this.path === published.path) this.revision = 'missing';
+                            if (this.pendingSave?.path === published.path && this.pendingSave.revision === published.revision) this.pendingSave.revision = 'missing';
+                            published.revision = 'missing';
+                            result = await this.api('publish', published, this);
+                        }
                         else if (current.draftRevision !== published.draftRevision) throw Object.assign(Error('The shared draft changed on another device.'), {conflict:true});
                         else throw error;
                     }

@@ -1130,8 +1130,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             openIconLayer.tintColor = resolvedNSColor(.secondaryLabelColor)
             menuControlFrame = CGRect(x: max(0, currentSize.width - 52), y: 7, width: 42, height: 44)
             saveControlFrame = CGRect(x: menuControlFrame.minX - 68, y: 7, width: 64, height: 44)
-            let dirty = document?.draft.dirty == true || document?.draft.pending != nil
-            saveButtonLayer.isHidden = !dirty
+            saveButtonLayer.isHidden = !canSave
             for layer in [saveButtonLayer, menuButtonLayer] { layer.font = NSFont.systemFont(ofSize: 15); layer.fontSize = 15; layer.alignmentMode = .center; layer.contentsScale = rootLayer.contentsScale }
             saveButtonLayer.string = isSaving ? "Saving…" : "Save"
             saveButtonLayer.foregroundColor = resolvedCGColor(.controlAccentColor)
@@ -1148,7 +1147,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
             containerTitleLayer.foregroundColor = resolvedCGColor(.labelColor); containerTitleLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2; containerTitleLayer.truncationMode = .middle
             containerTitleLayer.frame = CGRect(x: 9, y: 8, width: max(1, containerWidth - 18), height: 18)
             let pathX: CGFloat = target == "host" ? 62 : containerControlFrame.maxX + 12
-            let pathWidth = max(40, (dirty ? saveControlFrame.minX : menuControlFrame.minX) - pathX - 12)
+            let pathWidth = max(40, (canSave ? saveControlFrame.minX : menuControlFrame.minX) - pathX - 12)
             let textY: CGFloat = statusText.isEmpty ? 19 : 27
             pathLayer.frame = CGRect(x: pathX, y: textY, width: pathWidth, height: 20)
             pathControlFrame = pathLayer.frame.insetBy(dx: -4, dy: -7)
@@ -2667,6 +2666,11 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         document?.edit(text)
     }
 
+    private var canSave: Bool {
+        guard let document else { return false }
+        return document.draft.dirty || document.draft.pending != nil || document.isMissing
+    }
+
     private func saveNow() {
         endUndoGroup()
         guard let document, !isLoading, !showingServerVersion else { return }
@@ -3989,7 +3993,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         if openControlFrame.contains(headerPoint) { showHomePopover(); return }
         if containerControlFrame.contains(headerPoint), document?.draft.target != "host" { showContainerPicker(); return }
         if menuControlFrame.contains(headerPoint) { showPathMenu(at: point); return }
-        if saveControlFrame.contains(headerPoint), document?.draft.dirty == true || document?.draft.pending != nil { saveNow(); return }
+        if saveControlFrame.contains(headerPoint), canSave { saveNow(); return }
         if pathControlFrame.contains(headerPoint) {
             if pathPromptMode != nil {
                 setPathPromptCursor(atToolbarX: headerPoint.x)
@@ -4641,7 +4645,7 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
         }
         children.append(axNode("open-files", .button, headerLayer.convert(openControlFrame, to: rootLayer), "Open files", actions: [.press]) { owner, _, _ in owner.showHomePopover() })
         children.append(axNode("document-actions", .button, headerLayer.convert(menuControlFrame, to: rootLayer), "Document actions", actions: [.press, .showMenu]) { owner, _, _ in owner.showPathMenu(at: owner.headerLayer.convert(owner.menuControlFrame.origin, to: owner.rootLayer)) })
-        if document?.draft.dirty == true || document?.draft.pending != nil { children.append(axNode("save-file", .button, headerLayer.convert(saveControlFrame, to: rootLayer), isSaving ? "Saving" : "Save", actions: [.press]) { owner, _, _ in owner.saveNow() }) }
+        if canSave { children.append(axNode("save-file", .button, headerLayer.convert(saveControlFrame, to: rootLayer), isSaving ? "Saving" : "Save", actions: [.press]) { owner, _, _ in owner.saveNow() }) }
         if let status = statusLayer.string as? String, !status.isEmpty {
             children.append(axNode("status", .staticText, headerLayer.convert(statusLayer.frame, to: rootLayer), "Status", value: status))
         }

@@ -76,6 +76,11 @@ static bool restore_draft(const char *path, BinaryReply *reply, uint32_t *flags)
     if (ok && !strcmp(current, revision) && reply->body.size == strlen(contents) &&
         (!reply->body.size || !memcmp(reply->body.data, contents, reply->body.size))) {
         *flags = 0;
+    } else if (ok && !strcmp(current, "missing")) {
+        *flags = 1;
+        bytes_free(&reply->body);
+        reply->body = (Bytes){(unsigned char *)contents, strlen(contents)};
+        contents = NULL;
     } else if (ok) {
         *flags = 1 | (strcmp(current, revision) ? 2 : 0);
         bytes_free(&reply->body);
@@ -236,7 +241,8 @@ Bytes dispatch_binary(Bytes input, const char *method) {
         digest(reply.body.data, reply.body.size, hash);
         char *resolved = binary_read_string(reply.metadata, 48, get_u32(reply.metadata.data + 32), PATH_MAX - 1);
         char *revision = binary_read_string(reply.metadata, 56, get_u32(reply.metadata.data + 32), 64);
-        if (!resolved || !*resolved || !revision || strcmp(hash, revision) || !utf8(reply.body.data, reply.body.size))
+        bool missing = revision && !strcmp(revision, "missing") && !reply.body.size;
+        if (!resolved || !*resolved || !revision || (strcmp(hash, revision) && !missing) || !utf8(reply.body.data, reply.body.size))
             fail("invalid UTF-8 file or helper read response");
         if (!failure[0] && !draft) draft = draft_path(target, user, resolved);
         if (revision) snprintf(disk_revision, sizeof(disk_revision), "%s", revision);

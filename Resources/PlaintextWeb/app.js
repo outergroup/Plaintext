@@ -386,14 +386,14 @@ function renderDocument(){
  $('#start-screen').hidden=!$('#start-overlay')?.open;
  for(const id of ['start-new','start-open','start-recent'])$('#'+id).disabled=state.replacing;
  for(const button of document.querySelectorAll('.recent-file,.recent-remove'))button.disabled=state.replacing;
- const doc=state.active,dirty=!!(doc?.dirty||doc?.pendingSave);
+ const doc=state.active,dirty=!!(doc?.dirty||doc?.pendingSave),missing=!!doc?.missing;
  const onHost=(doc?.target||state.target)==='host';
  $('#location-target').hidden=onHost;$('.location-separator').hidden=onHost;
  $('.document-toolbar').toggleAttribute('data-preparing-document',state.replacing&&!doc);
  if(!doc){$('#pathLabel').textContent='Untitled';$('#path').title='Save…';}
  const saving=!!doc?.pendingSave&&doc.pendingSave.version===doc.version&&!doc.localError&&!doc.networkError&&!doc.conflict;
- $('#dirty').textContent=dirty?'Edited':'';
- $('#save').hidden=!dirty;
+ $('#dirty').textContent=missing?'Not on disk':dirty?'Edited':'';
+ $('#save').hidden=!dirty&&!missing;
  $('#save').textContent=saving?'Saving…':'Save';
  $('#save').setAttribute('aria-label',saving?'Saving…':'Save');$('#save').title=saving?'Saving…':'Save';
  $('#info-name').textContent=doc?.path.split('/').pop()||'Untitled';
@@ -404,7 +404,7 @@ function renderDocument(){
  document.documentElement.toggleAttribute('data-edited',dirty);
  $('#review').hidden=!state.active?.conflict;
  $('#editor').disabled=!state.active||state.replacing;
- $('#save').disabled=!doc||state.replacing||saving||(!dirty&&!!doc.path);$('#move').disabled=!state.active?.path||state.replacing;
+ $('#save').disabled=!doc||state.replacing||saving||(!dirty&&!missing&&!!doc.path);$('#move').disabled=!state.active?.path||state.replacing;
  for(const id of ['home','overflow-home','mobile-location','path','location-target'])$('#'+id).disabled=state.replacing;
  $('#download').disabled=!state.active;
  $('#find-command').disabled=!state.active||state.replacing;

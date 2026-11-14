@@ -59,7 +59,16 @@ static BinaryReply recent_files_operation(uint32_t operation, const char *target
             }
         }
     }
-    if (operation != CLIENT_RECENTS) {
+    size_t present = 0;
+    for (size_t i = 0; i < count; i++) {
+        struct stat st;
+        if (!strcmp(records[i].target, "host") && stat(records[i].path, &st) && (errno == ENOENT || errno == ENOTDIR)) {
+            free(records[i].target); free(records[i].path);
+        } else records[present++] = records[i];
+    }
+    bool pruned = present != count;
+    count = present;
+    if (operation != CLIENT_RECENTS || pruned) {
         size_t kept = 0, position = 0;
         bool found = false;
         for (size_t i = 0; i < count; i++) {

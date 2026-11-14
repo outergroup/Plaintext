@@ -277,8 +277,10 @@ final class PlaintextDocument {
         if let localError { return "Not saved on this device: \(localError) · Copy or export your draft" }
         if draft.conflict { return "Changes were made on another device. Review changes in the … menu." }
         if let networkError { return networkError }
+        if isMissing { return "This file is not on disk. It may have been moved or deleted. Save to create it again." }
         return ""
     }
+    var isMissing: Bool { !draft.path.isEmpty && draft.revision == "missing" && draft.pending == nil }
 
     init(draft: PlaintextDraft, store: PlaintextDraftStore, api: @escaping API) {
         self.draft = draft; self.store = store; self.api = api
@@ -356,7 +358,14 @@ final class PlaintextDocument {
                         let disk: PlaintextReply
                         do { disk = try await api(10, draft.target, saved.path, "", "", "") }
                         catch { throw original }
-                        if disk.contents.utf16.elementsEqual(saved.contents.utf16) { result = disk }
+                        var conflicted = false
+                        if case PlaintextDocumentError.conflict = original { conflicted = true }
+                        if disk.revision == "missing", saved.revision != "missing", !conflicted {
+                            let shared = try await api(11, draft.target, saved.path, "", "", "")
+                            guard shared.revision == "missing" else { throw original }
+                            if draft.path == saved.path { draft.revision = "missing"; draft.draftRevision = shared.draftRevision }
+                            result = try await api(13, draft.target, saved.path, "missing", shared.draftRevision, saved.contents)
+                        } else if disk.contents.utf16.elementsEqual(saved.contents.utf16) { result = disk }
                         else if disk.revision != saved.revision {
                             draft.conflict = true; networkError = nil; _ = await persist(); return
                         } else { throw original }
@@ -378,8 +387,14 @@ final class PlaintextDocument {
                         let original = error
                         let shared: PlaintextReply
                         do { shared = try await sharedState() } catch { throw original }
-                        guard shared.revision == draft.revision, shared.contents.utf16.elementsEqual(contents.utf16) else { throw original }
-                        result = shared
+                        if shared.revision == "missing", draft.revision != "missing", shared.draftRevision == token {
+                            if draft.pending?.revision == draft.revision { draft.pending?.revision = "missing" }
+                            draft.revision = "missing"
+                            result = try await api(12, draft.target, draft.path, "missing", token, contents)
+                        } else {
+                            guard shared.revision == draft.revision, shared.contents.utf16.elementsEqual(contents.utf16) else { throw original }
+                            result = shared
+                        }
                     }
                     draft.draftRevision = result.draftRevision
                     if draft.pending?.draftRevision == token { draft.pending?.draftRevision = result.draftRevision }
@@ -429,9 +444,24 @@ final class PlaintextDocument {
             let result = try await sharedState()
             guard !composing, worker == nil, draft.version == version, draft.path == path, !draft.conflict, draft.pending == nil else { return }
             guard result.revision != draft.revision || result.draftRevision != draft.draftRevision || result.dirty != draft.dirty || result.conflict != draft.conflict else { return }
+            if result.revision == "missing" && draft.revision != "missing" {
+                fileVanished(result)
+                _ = await persist()
+                resume()
+                return
+            }
             adopt(result)
             _ = await persist()
         } catch {}
+    }
+
+    private func fileVanished(_ result: PlaintextReply) {
+        draft.revision = "missing"; draft.draftRevision = result.draftRevision
+        if result.dirty && !result.contents.utf16.elementsEqual(draft.contents.utf16) { draft.contents = result.contents; undoHistory.reset() }
+        draft.savedContents = nil; draft.dirty = true
+        draft.version += 1; draft.updated = Date()
+        if result.dirty { remoteVersion = draft.version; draft.remoteVersion = remoteVersion }
+        networkError = nil; changed?()
     }
 
     private func adopt(_ result: PlaintextReply) {
