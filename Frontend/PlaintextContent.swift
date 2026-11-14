@@ -2997,7 +2997,8 @@ private final class PlaintextHandler: NSObject, OuterframeHostDelegate, Scrollba
     }
 
     private func updateTextContent(force: Bool = false, keepingCursorVisible: Bool = false) {
-        let displayText = text.isEmpty ? " " : text
+        let endsWithLineBreak = text.utf16.last.map { $0 == 10 || $0 == 13 } ?? true
+        let displayText = endsWithLineBreak ? text + " " : text
         let textChanged = displayText != attributedText.string
         guard force || textChanged else { return }
 
