@@ -240,6 +240,14 @@ const find=(()=>{
   const bounds=editor.getBoundingClientRect();
   Object.assign(overlay.style,{display:'block',position:'relative',flex:'none',width:bounds.width+'px',height:bounds.height+'px',
    minHeight:'0',maxHeight:'none',margin:'0',marginTop:-bounds.height+'px',overflow:'hidden',pointerEvents:'none',background:'transparent',color:'transparent',webkitTextFillColor:'transparent',borderColor:'transparent',boxShadow:'none',outline:'none',zIndex:'1',transform:'none'});
+  for(const name of ['font-size','line-height']){
+   const wanted=parseFloat(style.getPropertyValue(name));
+   for(let attempt=0;attempt<2;attempt++){
+    const actual=parseFloat(getComputedStyle(overlay).getPropertyValue(name)),specified=parseFloat(overlay.style.getPropertyValue(name));
+    if(!(wanted>0&&actual>0&&specified>0)||Math.abs(actual-wanted)<0.01)break;
+    overlay.style.setProperty(name,specified*wanted/actual+'px');
+   }
+  }
   const text=editor.value,fragment=document.createDocumentFragment();let last=0;
   for(const [index,match] of matches.entries()){
    fragment.append(text.slice(last,match.start));
